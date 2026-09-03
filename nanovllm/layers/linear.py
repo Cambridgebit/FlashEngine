@@ -3,6 +3,8 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
+from nanovllm.backends import get_backend
+
 
 def divide(numerator, denominator):
     assert numerator % denominator == 0
@@ -19,6 +21,7 @@ class LinearBase(nn.Module):
         tp_dim: int | None = None,
     ):
         super().__init__()
+        self.backend = get_backend()
         self.tp_dim = tp_dim
         self.tp_rank = dist.get_rank()
         self.tp_size = dist.get_world_size()
@@ -152,5 +155,5 @@ class RowParallelLinear(LinearBase):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:
-            dist.all_reduce(y)
+            self.backend.all_reduce(y)
         return y
