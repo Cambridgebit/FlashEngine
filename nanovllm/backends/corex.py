@@ -65,6 +65,12 @@ class CoreXBackend(BackendBase):
             block_table=context.block_tables,
         )
 
+    def graph_slot_mapping_dtype(self):
+        # CUDA Graph 的 static slot_mapping buffer 直接用 int64，
+        # 让 reshape_and_cache_flash 在 capture 区间内不需要 dtype 转换
+        # （dtype 转换发生在 graph.replay() 之前的 runtime → static copy）。
+        return torch.long
+
     def decode_attention(
         self,
         q,
@@ -82,6 +88,7 @@ class CoreXBackend(BackendBase):
             max_context_len=context.max_context_len,
             softmax_scale=scale,
             causal=True,
+            use_cuda_graph=context.use_cuda_graph,
         )
 
     def get_kv_cache_shape(

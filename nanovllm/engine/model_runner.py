@@ -203,22 +203,44 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+        # FULL_DECODE_ONLY：prefill 永远 eager；只有 decode 走 CUDA Graph。
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
-        else:
-            bs = input_ids.size(0)
-            context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
-            graph_vars = self.graph_vars
-            graph_vars["input_ids"][:bs] = input_ids
-            graph_vars["positions"][:bs] = positions
-            graph_vars["slot_mapping"].fill_(-1)
-            graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            graph_vars["context_lens"].zero_()
-            graph_vars["context_lens"][:bs] = context.context_lens
-            graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
-            graph.replay()
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
+
+        bs = input_ids.size(0)
+        context = get_context()
+        gv = self.graph_vars
+
+        # 真实 bs 向上取到最近的 graph bucket（bs=3 → graph 4）。
+        graph_bs = next((x for x in self.graph_bs if x >= bs), None)
+        if graph_bs is None:
+            return self.model.compute_logits(self.model(input_ids, positions))
+
+        # runtime block_tables 列数不能超过 capture 宽度
+        # （nano-vLLM 公开 bug 防御：capture 时已按 max_model_len + 1 留余量）。
+        cols = context.block_tables.size(1)
+        if cols > gv["block_tables"].size(1):
+            return self.model.compute_logits(self.model(input_ids, positions))
+
+        # CUDA Graph 捕获的是 tensor 地址，不是 python 变量：
+        # 只能 copy_ 进 static buffer，绝不能重新赋值。
+        gv["input_ids"][:bs].copy_(input_ids)
+        gv["positions"][:bs].copy_(positions)
+
+        # padding 行必须复位：slot_mapping=-1，context_lens=0，block_tables=-1。
+        # 不清空 block_tables 会残留上一请求的物理 KV block（正确性 bug）。
+        gv["slot_mapping"].fill_(-1)
+        gv["context_lens"].zero_()
+        gv["block_tables"].fill_(-1)
+
+        # runtime（int32）→ graph static buffer：
+        # dtype 转换发生在 replay 之前的 copy 里，capture 内不做转换。
+        gv["slot_mapping"][:bs].copy_(context.slot_mapping)
+        gv["context_lens"][:bs].copy_(context.context_lens)
+        gv["block_tables"][:bs, :cols].copy_(context.block_tables)
+
+        self.graphs[graph_bs].replay()
+        return self.model.compute_logits(gv["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
@@ -233,22 +255,36 @@ class ModelRunner:
         config = self.config
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)
-        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        # + 1：runtime block_tables 宽度可能比 capture 时更宽
+        # （nano-vLLM 公开 bug），static buffer 直接留出余量。
+        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size + 1
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
-        slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
+        slot_mapping = torch.full((max_bs,), -1, dtype=self.backend.graph_slot_mapping_dtype())
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
-        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
-        outputs = torch.zeros(max_bs, hf_config.hidden_size)
+        block_tables = torch.full((max_bs, max_num_blocks), -1, dtype=torch.int32)
+        outputs = torch.zeros(max_bs, hf_config.hidden_size, dtype=hf_config.dtype)
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
         self.graph_pool = None
 
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            # Graph Context 必须静态：max_context_len 用 config.max_model_len，
+            # 不要用 context_lens.max().item()（capture 后不可变 python 整数）。
+            set_context(
+                False,
+                slot_mapping=slot_mapping[:bs],
+                context_lens=context_lens[:bs],
+                block_tables=block_tables[:bs],
+                max_context_len=config.max_model_len,
+                use_cuda_graph=True,
+            )
+            # Warmup：IXFormer kernel lazy init / workspace / runtime 初始化
+            # 必须在正式 capture 前完成。
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
-            with torch.cuda.graph(graph, self.graph_pool):
+            torch.cuda.synchronize()
+            with torch.cuda.graph(graph, pool=self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()

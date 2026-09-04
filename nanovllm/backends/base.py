@@ -59,6 +59,12 @@ class BackendBase(ABC):
             head_dim,
         )
 
+    def graph_slot_mapping_dtype(self):
+        # CUDA Graph 的 static slot_mapping buffer dtype。
+        # 默认 int32（CUDA triton store kernel 的约定 dtype，-1 padding 跳过）；
+        # 若 vendor kernel 要求 int64，由 backend override（见 CoreXBackend）。
+        return torch.int32
+
     def all_reduce(self, tensor):
         import torch.distributed as dist
 
