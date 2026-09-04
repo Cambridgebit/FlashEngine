@@ -487,6 +487,8 @@ def main():
     parser.add_argument("--backend", default="auto", choices=["auto", "cuda", "corex"])
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--max-num-seqs", type=int, default=None)
+    parser.add_argument("--block-size", type=int, default=None,
+                        help="KV block size（2 的幂，越小 prefix cache 粒度越细，需 CoreX kernel 支持）")
     parser.add_argument("--temperature", type=float, default=0.7)
     args = parser.parse_args()
 
@@ -502,6 +504,8 @@ def main():
     )
     if args.max_num_seqs is not None:
         kwargs["max_num_seqs"] = args.max_num_seqs
+    if args.block_size is not None:
+        kwargs["kvcache_block_size"] = args.block_size
 
     print(f"loading model {args.model} ...", flush=True)
     engine = LLM(**kwargs)

@@ -1,19 +1,13 @@
-"""Eager vs CUDA Graph 推理性能与正确性基准（真实对话）。
+"""Nano-vLLM 性能验证：CUDA Graph 与 Prefix Cache。
 
-对比两种引擎模式（同一模型、同一批真实对话 prompt）：
-- enforce_eager=True   → eager
-- enforce_eager=False  → CUDA Graph（FULL_DECODE_ONLY）
-
-指标：
-- TTFT：每个请求从加入调度队列到产出第一个输出 token 的时间（含 prefill）
-- TPS ：总输出 token 数 / 总墙钟时间
-- 正确性：温度取 1e-6（近 greedy）保证 eager / graph 采样可比，
-  逐 token 比对两条输出序列，并打印完整回答便于人工核对。
+子命令 graph  ：不同 batch size 下 eager vs CUDA Graph 的 TPS/TTFT 对比 + token 级正确性
+子命令 prefix ：长共享 system prompt 下 prefix cache 冷/热 TTFT 与 wall 时间对比
 
 用法：
-    python scripts/benchmark.py /path/to/Qwen3-1.7B [--max-tokens 128]
-                  [--mode both|eager|graph] [--backend auto|cuda|corex]
-                  [--repeat 1] [--max-model-len 4096] [--max-num-seqs 64]
+    python3.10 -m scripts.benchmark graph  /path/to/Qwen3-1.7B [--batch 1 2 4 8] [--backend corex]
+                  [--max-tokens 128] [--block-size 256] [--max-model-len 4096]
+    python3.10 -m scripts.benchmark prefix /path/to/Qwen3-1.7B [--backend corex]
+                  [--sys-tokens 1200] [--max-tokens 8] [--block-size 64] [--max-model-len 8192]
 """
 import argparse
 import atexit
@@ -21,206 +15,186 @@ import gc
 import time
 
 import torch
+from transformers import AutoTokenizer
 
 from nanovllm import LLM, SamplingParams
 from nanovllm.engine.sequence import Sequence
 
 
-# 近 greedy：保证 eager / graph 的输出可比（Gumbel-max 在近 one-hot 下确定）
 TEMPERATURE = 1e-6
-
-CONVERSATIONS = [
-    [
-        {"role": "system", "content": "你是一个有用的中文助手。"},
-        {"role": "user", "content": "请用三句话解释什么是大语言模型。"},
-    ],
-    [
-        {"role": "user", "content": "What is the capital of France? Answer in one sentence."},
-    ],
-    [
-        {"role": "system", "content": "You are a concise assistant."},
-        {"role": "user", "content": "Explain quantum computing in plain words."},
-    ],
-    [
-        {"role": "user", "content": "写一段 80 字左右的介绍，关于人工智能在医疗领域的应用。"},
-    ],
-    [
-        {"role": "user", "content": "把这句话翻译成英文：今天天气很好，我们去公园散步吧。"},
-    ],
-    [
-        {"role": "user", "content": "用 Python 写一个快速排序函数。"},
-    ],
-    [
-        {"role": "user", "content": "列出深度学习常用的 5 个优化器并简要说明。"},
-    ],
-    [
-        {"role": "user", "content": "Summarize the benefits of CUDA Graphs for LLM inference in 3 bullet points."},
-    ],
-]
+PROMPT = "请用三句话解释什么是大语言模型。"
+TOOL_UNIT = (
+    "search_web(url, query): 在互联网搜索并返回结果; "
+    "call_api(endpoint, payload): 调用 REST API; "
+    "read_file(path): 读取本地文件; "
+    "run_shell(cmd): 执行 shell 命令; "
+    "write_file(path, content): 写入文件; "
+    "analyze(data): 分析结构化数据; "
+)
+Q1 = "帮我查一下今天的天气并给出穿衣建议。"
+Q2 = "总结一下当前目录下的文件结构。"
 
 
-def _add_req(llm, prompt_ids, max_tokens):
-    seq = Sequence(prompt_ids, SamplingParams(temperature=TEMPERATURE, max_tokens=max_tokens))
-    llm.scheduler.add(seq)
-    return seq
+def new_engine(model, eager, backend, max_model_len, max_num_seqs, block_size):
+    llm = None
+    try:
+        llm = LLM(model, enforce_eager=eager, tensor_parallel_size=1, backend=backend,
+                  max_model_len=max_model_len, max_num_seqs=max_num_seqs,
+                  kvcache_block_size=block_size)
+        warm = Sequence(llm.tokenizer.encode("hi"),
+                        SamplingParams(temperature=TEMPERATURE, max_tokens=1, ignore_eos=True))
+        llm.scheduler.add(warm)
+        while not llm.is_finished():
+            llm.step()
+        llm.scheduler.block_manager.reset_prefix_stats()
+        return llm
+    except BaseException:
+        if llm is not None:
+            llm.exit()
+        raise
 
 
-def _drive(llm, seqs, max_tokens):
-    """驱动引擎直到全部 seq 结束，采集 TTFT / token 计数 / 文本。"""
+def close_engine(llm):
+    atexit.unregister(llm.exit)
+    llm.exit()
+    del llm
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def run_seqs(llm, seqs):
+    """驱动到全部结束，返回 (每 seq 输出 token 列表, TTFT 列表, wall 秒)。"""
     eos = llm.scheduler.eos
-    first, counts, n_seen = {}, {}, {}
-    for seq in seqs:
-        first[seq.seq_id] = None
-        counts[seq.seq_id] = []
-        n_seen[seq.seq_id] = 0
-
+    first, seen = {}, {}
+    for s in seqs:
+        first[s.seq_id], seen[s.seq_id] = None, 0
     t0 = time.perf_counter()
     while not llm.is_finished():
         llm.step()
         now = time.perf_counter()
-        for seq in seqs:
-            comp = seq.completion_token_ids
-            seen = n_seen[seq.seq_id]
-            if len(comp) > seen:
-                new = comp[seen:]
-                if first[seq.seq_id] is None and new:
-                    first[seq.seq_id] = now - t0
-                counts[seq.seq_id].extend(t for t in new if t != eos)
-                n_seen[seq.seq_id] = len(comp)
+        for s in seqs:
+            if len(s.completion_token_ids) > seen[s.seq_id]:
+                if first[s.seq_id] is None:
+                    first[s.seq_id] = now - t0
+                seen[s.seq_id] = len(s.completion_token_ids)
     wall = time.perf_counter() - t0
-
-    total = sum(len(v) for v in counts.values())
-    ttfts = [v for v in first.values() if v is not None]
-    return {
-        "seqs": seqs,
-        "first": first,
-        "counts": counts,
-        "wall": wall,
-        "total": total,
-        "ttft_avg": sum(ttfts) / len(ttfts) if ttfts else 0.0,
-        "ttft_max": max(ttfts) if ttfts else 0.0,
-        "tps": total / wall if wall > 0 else 0.0,
-        "prompts": [
-            llm.tokenizer.decode(seq.prompt_token_ids, skip_special_tokens=True)
-            for seq in seqs
-        ],
-        "texts": {
-            seq.seq_id: llm.tokenizer.decode(counts[seq.seq_id], skip_special_tokens=True)
-            for seq in seqs
-        },
-    }
+    tokens = [[t for t in s.completion_token_ids if t != eos] for s in seqs]
+    return tokens, [first[s.seq_id] for s in seqs], wall
 
 
-def _report(mode, res):
-    print(f"wall time      : {res['wall']:.3f} s")
-    print(f"output tokens  : {res['total']}")
-    print(f"TPS            : {res['tps']:.2f} tok/s")
-    print(f"TTFT avg       : {res['ttft_avg'] * 1000:.1f} ms")
-    print(f"TTFT max       : {res['ttft_max'] * 1000:.1f} ms")
-    print(f"requests       : {len(res['seqs'])}")
-    print("-" * 70)
-    for i, seq in enumerate(res["seqs"]):
-        print(f"[req {i}] TTFT {res['first'][seq.seq_id] * 1000:7.1f} ms | "
-              f"tokens {len(res['counts'][seq.seq_id])}")
-        print(f"    prompt: {res['prompts'][i][:100]}")
-        print(f"    answer: {res['texts'][seq.seq_id]}")
-    print()
+def cmd_graph(args):
+    results = {}
+    for mode, eager in (("eager", True), ("graph", False)):
+        print(f"\n===== {mode.upper()} =====")
+        print(f"{'batch':>6}{'TPS':>10}{'TTFT avg(ms)':>14}{'TTFT max(ms)':>14}")
+        results[mode] = {}
+        for bs in args.batch:
+            llm = new_engine(args.model, eager, args.backend,
+                             args.max_model_len, bs, args.block_size)
+            try:
+                prompt = llm.tokenizer.apply_chat_template(
+                    [{"role": "user", "content": PROMPT}], tokenize=True,
+                    add_generation_prompt=True)
+                seqs = [Sequence(prompt, SamplingParams(
+                    temperature=TEMPERATURE, max_tokens=args.max_tokens, ignore_eos=True))
+                    for _ in range(bs)]
+                for s in seqs:
+                    llm.scheduler.add(s)
+                tokens, ttft, wall = run_seqs(llm, seqs)
+                total = sum(len(t) for t in tokens)
+                tps = total / wall
+                results[mode][bs] = (tokens, tps, sum(ttft) / len(ttft), max(ttft))
+                print(f"{bs:>6}{tps:>10.1f}{sum(ttft) / len(ttft) * 1000:>14.1f}"
+                      f"{max(ttft) * 1000:>14.1f}", flush=True)
+            finally:
+                close_engine(llm)
+
+    print(f"\n===== GRAPH vs EAGER (block_size={args.block_size}, max_tokens={args.max_tokens}) =====")
+    print(f"{'batch':>6}{'TPS x':>10}{'TTFT x':>10}{'correct':>10}")
+    for bs in args.batch:
+        te, tg = results["eager"][bs], results["graph"][bs]
+        ok = all(a == b for a, b in zip(te[0], tg[0]))
+        print(f"{bs:>6}{tg[1] / te[1]:>10.2f}{tg[3] / te[3]:>10.2f}"
+              f"{'PASS' if ok else 'FAIL':>10}")
 
 
-def _run_mode(model, mode, args):
-    kwargs = dict(
-        model=model,
-        enforce_eager=(mode == "eager"),
-        tensor_parallel_size=1,
-        backend=args.backend,
-        max_model_len=args.max_model_len,
-    )
-    if args.max_num_seqs is not None:
-        kwargs["max_num_seqs"] = args.max_num_seqs
-
-    tag = "CUDA Graph" if mode == "graph" else "eager"
-    print(f"\n===== {mode.upper()} ({tag}) =====", flush=True)
-
-    llm = None
-    try:
-        llm = LLM(**kwargs)
-
-        # warmup：触发 kernel lazy init / workspace，避免污染首请求计时
-        warm_ids = llm.tokenizer.apply_chat_template(
-            [{"role": "user", "content": "hello"}], tokenize=True, add_generation_prompt=True)
-        warm = _add_req(llm, warm_ids, 4)
-        while not llm.is_finished():
-            llm.step()
-
-        seqs = []
-        for _ in range(args.repeat):
-            for conv in CONVERSATIONS:
-                prompt_ids = llm.tokenizer.apply_chat_template(
-                    conv, tokenize=True, add_generation_prompt=True)
-                seqs.append(_add_req(llm, prompt_ids, args.max_tokens))
-        res = _drive(llm, seqs, args.max_tokens)
-        _report(mode, res)
-        return res
-    finally:
-        if llm is not None:
-            atexit.unregister(llm.exit)
-            llm.exit()
-            del llm
-            gc.collect()
-            torch.cuda.empty_cache()
+def _build_system(tokenizer, target):
+    n = 1
+    while len(tokenizer.encode(TOOL_UNIT)) * n < target:
+        n += 1
+    return TOOL_UNIT * n
 
 
-def _compare(results):
-    eager, graph = results["eager"], results["graph"]
-    n = min(len(eager["seqs"]), len(graph["seqs"]))
-    ok_count = 0
-    print("\n===== CORRECTNESS (eager vs cuda graph, token-level) =====")
-    for i in range(n):
-        te = eager["counts"][eager["seqs"][i].seq_id]
-        tg = graph["counts"][graph["seqs"][i].seq_id]
-        ok = te == tg
-        ok_count += ok
-        print(f"[req {i}] {'PASS' if ok else 'FAIL'}  "
-              f"eager={len(te)} tok / graph={len(tg)} tok")
-        if not ok:
-            print(f"    eager: {eager['texts'][eager['seqs'][i].seq_id]}")
-            print(f"    graph: {graph['texts'][graph['seqs'][i].seq_id]}")
-    print(f"Overall: {ok_count}/{n} PASS")
-    return ok_count == n
+def cmd_prefix(args):
+    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
+    sys_text = _build_system(tokenizer, args.sys_tokens)
+    sys_len = len(tokenizer.encode(sys_text))
 
+    def chat(q):
+        return tokenizer.apply_chat_template(
+            [{"role": "system", "content": sys_text}, {"role": "user", "content": q}],
+            tokenize=True, add_generation_prompt=True)
 
-def _summary(results):
-    print("\n===== PERFORMANCE SUMMARY =====")
-    print(f"{'mode':<12}{'TPS(tok/s)':>14}{'TTFT avg(ms)':>16}{'TTFT max(ms)':>16}")
-    for mode, res in results.items():
-        print(f"{mode:<12}{res['tps']:>14.2f}"
-              f"{res['ttft_avg'] * 1000:>16.1f}{res['ttft_max'] * 1000:>16.1f}")
-    print()
+    p1, p2 = chat(Q1), chat(Q2)
+    print(f"sys={sys_len} tok | p1={len(p1)} | p2={len(p2)} | "
+          f"block_size={args.block_size} | max_tokens={args.max_tokens}\n")
+
+    for mode, eager in (("EAGER", True), ("CUDA GRAPH", False)):
+        llm = new_engine(args.model, eager, args.backend,
+                         args.max_model_len, 1, args.block_size)
+        try:
+            _, ttft_cold, wall_cold = run_seqs(llm, [
+                Sequence(p2, SamplingParams(
+                    temperature=TEMPERATURE, max_tokens=args.max_tokens, ignore_eos=True))])
+        finally:
+            close_engine(llm)
+
+        llm = new_engine(args.model, eager, args.backend,
+                         args.max_model_len, 1, args.block_size)
+        try:
+            run_seqs(llm, [Sequence(p1, SamplingParams(
+                temperature=TEMPERATURE, max_tokens=args.max_tokens, ignore_eos=True))])
+            _, ttft_warm, wall_warm = run_seqs(llm, [
+                Sequence(p2, SamplingParams(
+                    temperature=TEMPERATURE, max_tokens=args.max_tokens, ignore_eos=True))])
+            stats = llm.scheduler.block_manager.get_prefix_stats()
+        finally:
+            close_engine(llm)
+
+        print(f"--- {mode} ---")
+        print(f"p2 cold: TTFT={ttft_cold * 1000:7.1f} ms  wall={wall_cold * 1000:7.1f} ms")
+        print(f"p2 warm: TTFT={ttft_warm * 1000:7.1f} ms  wall={wall_warm * 1000:7.1f} ms")
+        print(f"TTFT speedup = {ttft_cold / ttft_warm:.2f}x   wall speedup = {wall_cold / wall_warm:.2f}x")
+        print(f"prefix cache: requests={stats['requests']} hits={stats['prefix_hits']} "
+              f"cached={stats['cached_blocks']} new={stats['new_blocks']} "
+              f"(hit_rate={stats['hit_rate'] * 100:.0f}%)")
+        print()
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="nano-vLLM eager vs CUDA Graph benchmark (real conversations)")
-    parser.add_argument("model", help="model directory path")
-    parser.add_argument("--mode", choices=["both", "eager", "graph"], default="both",
-                        help="要跑的引擎模式（默认 both：两个都跑并对比）")
-    parser.add_argument("--backend", default="auto", choices=["auto", "cuda", "corex"])
-    parser.add_argument("--max-model-len", type=int, default=4096)
-    parser.add_argument("--max-num-seqs", type=int, default=None)
-    parser.add_argument("--max-tokens", type=int, default=128,
-                        help="每个请求的最大输出 token 数")
-    parser.add_argument("--repeat", type=int, default=1,
-                        help="重复对话集次数，增加并发负载")
-    args = parser.parse_args()
+    parser = argparse.ArgumentParser(description="nano-vLLM 性能验证 (CUDA Graph / Prefix Cache)")
+    sub = parser.add_subparsers(dest="cmd", required=True)
 
-    modes = ["eager", "graph"] if args.mode == "both" else [args.mode]
-    results = {}
-    for mode in modes:
-        results[mode] = _run_mode(args.model, mode, args)
-    if args.mode == "both":
-        ok = _compare(results)
-        _summary(results)
-        raise SystemExit(0 if ok else 1)
+    g = sub.add_parser("graph", help="batch size 下 eager vs CUDA Graph TPS/TTFT")
+    g.add_argument("model")
+    g.add_argument("--batch", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32])
+    g.add_argument("--backend", default="auto", choices=["auto", "cuda", "corex"])
+    g.add_argument("--max-tokens", type=int, default=128)
+    g.add_argument("--max-model-len", type=int, default=4096)
+    g.add_argument("--block-size", type=int, default=256)
+    g.set_defaults(fn=cmd_graph)
+
+    p = sub.add_parser("prefix", help="prefix cache 冷/热 TTFT 对比")
+    p.add_argument("model")
+    p.add_argument("--backend", default="auto", choices=["auto", "cuda", "corex"])
+    p.add_argument("--sys-tokens", type=int, default=1200, help="共享 system prompt 目标 token 数")
+    p.add_argument("--max-tokens", type=int, default=8)
+    p.add_argument("--max-model-len", type=int, default=8192)
+    p.add_argument("--block-size", type=int, default=256)
+    p.set_defaults(fn=cmd_prefix)
+
+    args = parser.parse_args()
+    args.fn(args)
 
 
 if __name__ == "__main__":

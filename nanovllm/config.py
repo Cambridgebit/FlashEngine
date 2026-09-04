@@ -22,7 +22,10 @@ class Config:
         if self.backend != "auto":
             os.environ["NANOVLLM_BACKEND"] = self.backend
         assert os.path.isdir(self.model)
-        assert self.kvcache_block_size % 256 == 0
+        # block_size 越小，prefix cache 粒度越细（每步最多重 prefill 一个 block）。
+        # 限制为 2 的幂；CoreX/IXFormer paged kernel 支持的最小值需实测确认。
+        assert self.kvcache_block_size >= 16
+        assert self.kvcache_block_size & (self.kvcache_block_size - 1) == 0
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)

@@ -31,6 +31,12 @@ class BlockManager:
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
+        self.stats = {
+            "requests": 0,
+            "prefix_hits": 0,
+            "cached_blocks": 0,
+            "new_blocks": 0,
+        }
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
@@ -91,6 +97,12 @@ class BlockManager:
             seq.block_table.append(self._allocate_block())
         seq.num_cached_tokens = num_cached_blocks * self.block_size
 
+        self.stats["requests"] += 1
+        self.stats["cached_blocks"] += num_cached_blocks
+        self.stats["new_blocks"] += seq.num_blocks - num_cached_blocks
+        if num_cached_blocks > 0:
+            self.stats["prefix_hits"] += 1
+
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
             block = self.blocks[block_id]
@@ -118,3 +130,15 @@ class BlockManager:
             h = self.compute_hash(token_ids, h)
             block.update(h, token_ids)
             self.hash_to_block_id[h] = block.block_id
+
+    def get_prefix_stats(self):
+        stats = dict(self.stats)
+        stats["hit_rate"] = (
+            stats["prefix_hits"] / stats["requests"]
+            if stats["requests"] else 0.0
+        )
+        return stats
+
+    def reset_prefix_stats(self):
+        for key in self.stats:
+            self.stats[key] = 0
