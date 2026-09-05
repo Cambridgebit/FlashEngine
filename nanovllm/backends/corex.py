@@ -14,6 +14,11 @@ from .base import BackendBase
 class CoreXBackend(BackendBase):
 
     name = "corex"
+    # 厂商 torch 提供 NCCL 兼容层，V1.3 实测路径。
+    dist_name = "nccl"
+    # spec 图捕获能否成功待实机验证（ixformer varlen 的捕获安全性未知）；
+    # 尝试失败自动降级 eager spec 轮（见 capture_spec_cudagraph 的 except）。
+    supports_spec_graph = True
 
     def store_kvcache(
         self,

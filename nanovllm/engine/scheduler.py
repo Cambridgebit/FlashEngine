@@ -98,6 +98,10 @@ class Scheduler:
         self.running.extend(active)
         return active
 
+    def _maybe_finish(self, seq: Sequence, token_id: int) -> bool:
+        """完成判定（commit_spec / postprocess 共用）：命中 eos 或补全长度达 max_tokens。"""
+        return (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens >= seq.max_tokens
+
     def commit_spec(self, seqs: list[Sequence], tokens_list: list[list[int]]) -> list[Sequence]:
         """投机解码轮提交：逐 token 追加（遇 eos / max_tokens 提前截断并结束序列）。
 
@@ -109,7 +113,7 @@ class Scheduler:
             for token_id in tokens:
                 seq.append_token(token_id)
                 seq.num_cached_tokens = seq.num_tokens
-                if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens >= seq.max_tokens:
+                if self._maybe_finish(seq, token_id):
                     seq.status = SequenceStatus.FINISHED
                     self.block_manager.deallocate(seq)
                     self.running.remove(seq)
@@ -125,7 +129,7 @@ class Scheduler:
             if is_prefill and seq.num_cached_tokens < seq.num_tokens:
                 continue
             seq.append_token(token_id)
-            if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+            if self._maybe_finish(seq, token_id):
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)

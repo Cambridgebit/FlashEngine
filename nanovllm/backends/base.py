@@ -6,6 +6,11 @@ import torch
 class BackendBase(ABC):
 
     name = "base"
+    # TP 初始化的分布式后端名（CoreX 走厂商 torch 的 NCCL 兼容路径，V1.3 实证）。
+    dist_name = "nccl"
+    # 是否尝试 spec 单图整轮 CUDA Graph 捕获；失败由 capture 的 try/except 自动
+    # 降级 eager spec 轮（多硬件方法论 = 直接尝试 + 优雅降级，见 V1.3）。
+    supports_spec_graph = False
 
     @abstractmethod
     def store_kvcache(

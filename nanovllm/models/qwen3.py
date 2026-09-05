@@ -79,7 +79,6 @@ class Qwen3Attention(nn.Module):
     # CoreX Inductor 在 qkv 切片/rope/attention 这一簇的跨边界融合会产出错误结果，
     # 且 qkv/o_proj 是单 GEMM，不参与编译几乎无损；编译收益集中在 MLP 与 RMSNorm。
     @torch.compiler.disable
-
     def forward(
         self,
         positions: torch.Tensor,

@@ -43,6 +43,8 @@ def store_kvcache_kernel(
 class CUDABackend(BackendBase):
 
     name = "cuda"
+    # flash-attn/图内采样捕获已在 CUDA 实证。
+    supports_spec_graph = True
 
     def store_kvcache(
         self,

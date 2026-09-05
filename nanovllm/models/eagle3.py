@@ -178,6 +178,10 @@ class Eagle3DraftModel(nn.Module):
         embeds = self.embed_tokens(token_ids)
         return self.midlayer(positions, seed, embeds)
 
+    def project_aux(self, aux: torch.Tensor) -> torch.Tensor:
+        """fc(3H->H) 投影：3 个 aux 隐层拼接映射回 draft 隐层空间。"""
+        return F.linear(aux, self.fc.weight)
+
     def map_to_target_ids(self, draft_ids: torch.Tensor) -> torch.Tensor:
         return draft_ids + self.d2t[draft_ids]
 

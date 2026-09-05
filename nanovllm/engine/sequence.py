@@ -14,9 +14,6 @@ class SequenceStatus(Enum):
 class Sequence:
     block_size = 256
     counter = count()
-    # spec 解码冷启动标记：prefill 完成置 True，首个投机轮（走 eager 补 carry）后清除。
-    # 仅 rank 0（spec 仅 TP=1）使用，不进 pickle。
-    spec_cold = True
 
     def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
         self.seq_id = next(Sequence.counter)
@@ -28,6 +25,8 @@ class Sequence:
         self.num_cached_tokens = 0
         self.num_scheduled_tokens = 0
         self.is_prefill = True
+        # 投机解码冷启动标记
+        self.spec_cold = True
         self.block_table = []
         self.temperature = sampling_params.temperature
         self.top_p = sampling_params.top_p
