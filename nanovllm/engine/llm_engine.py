@@ -35,6 +35,13 @@ class LLMEngine:
         atexit.register(self.exit)
 
     def exit(self):
+        # 幂等：atexit 会再次调用；init 未完成（如 kv 预算不足抛错）时
+        # model_runner 不存在，仅拆除可能已建立的 NCCL 组。
+        if not hasattr(self, "model_runner"):
+            import torch.distributed as dist
+            if dist.is_initialized():
+                dist.destroy_process_group()
+            return
         self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
@@ -47,12 +54,45 @@ class LLMEngine:
         self.scheduler.add(seq)
 
     def step(self):
+        if self.model_runner.spec_enabled:
+            return self.step_spec()
         seqs, is_prefill = self.scheduler.schedule()
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens
+
+    def step_spec(self):
+        """EAGLE3 投机解码引擎步（仅 TP=1）。
+
+        prefill 步与普通路径一致（额外执行 draft prefill 并记录 h_seed）；
+        decode 步为一整轮投机：预分配容量 → draft 起草 → target 验证 → 多 token 提交。
+        """
+        seqs, is_prefill = self.scheduler.schedule()
+        if is_prefill:
+            num_tokens = sum(seq.num_scheduled_tokens for seq in seqs)
+            token_ids = self.model_runner.call("run_prefill_spec", seqs)
+            self.scheduler.postprocess(seqs, token_ids, True)
+            self._drop_finished_spec_state(seqs)
+            return self._collect_outputs(seqs), num_tokens
+        num_draft = self.model_runner.config.spec_num_tokens
+        active = self.scheduler.prepare_spec_round(num_draft)
+        if not active:
+            return [], 0
+        committed = self.model_runner.call("spec_round", active)
+        finished = self.scheduler.commit_spec(active, committed)
+        self._drop_finished_spec_state(finished)
+        num_tokens = -sum(len(tokens) for tokens in committed)
+        return self._collect_outputs(active), num_tokens
+
+    def _drop_finished_spec_state(self, seqs):
+        for seq in seqs:
+            if seq.is_finished:
+                self.model_runner.call("drop_spec_state", seq.seq_id)
+
+    def _collect_outputs(self, seqs):
+        return [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
 
     def is_finished(self):
         return self.scheduler.is_finished()

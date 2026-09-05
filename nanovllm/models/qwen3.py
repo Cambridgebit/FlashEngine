@@ -24,6 +24,8 @@ class Qwen3Attention(nn.Module):
         qkv_bias: bool = False,
         rope_theta: float = 10000,
         rope_scaling: dict | None = None,
+        qkv_input_size: int | None = None,
+        qk_norm: bool | None = None,
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
@@ -38,9 +40,13 @@ class Qwen3Attention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
         self.qkv_bias = qkv_bias
+        # EAGLE3 draft：qkv 输入维度为 2*hidden（[input_layernorm(embed), hidden_norm(x)] 拼接），
+        # 与 hidden_size 解耦；qk_norm 默认跟随 qkv_bias（llama 风格 draft 无 q/k norm）。
+        if qk_norm is None:
+            qk_norm = not qkv_bias
 
         self.qkv_proj = QKVParallelLinear(
-            hidden_size,
+            qkv_input_size or hidden_size,
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
@@ -65,9 +71,14 @@ class Qwen3Attention(nn.Module):
             self.scaling,
             self.num_kv_heads,
         )
-        if not self.qkv_bias:
+        if qk_norm:
             self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
             self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+
+    # torch.compile 时整块保持 eager（graph-break）：对齐 vLLM PIECEWISE 思路。
+    # CoreX Inductor 在 qkv 切片/rope/attention 这一簇的跨边界融合会产出错误结果，
+    # 且 qkv/o_proj 是单 GEMM，不参与编译几乎无损；编译收益集中在 MLP 与 RMSNorm。
+    @torch.compiler.disable
 
     def forward(
         self,
@@ -75,11 +86,13 @@ class Qwen3Attention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q = qkv[..., :self.q_size]
+        k = qkv[..., self.q_size:self.q_size + self.kv_size]
+        v = qkv[..., self.q_size + self.kv_size:]
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
-        if not self.qkv_bias:
+        if hasattr(self, "q_norm"):
             q = self.q_norm(q)
             k = self.k_norm(k)
         q, k = self.rotary_emb(positions, q, k)
@@ -169,17 +182,29 @@ class Qwen3Model(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # EAGLE3 aux 隐层捕获索引（层输入序号），由引擎在启用 spec 解码时设置；
+        # 空元组 = 普通路径，forward 返回单个 hidden。
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        capture = bool(self.aux_hidden_state_layers)
+        aux_states = [] if capture else None
         hidden_states = self.embed_tokens(input_ids)
         residual = None
-        for layer in self.layers:
+        for idx, layer in enumerate(self.layers):
+            # 与官方 EAGLE 仓库 / vLLM 一致：在指定层运行前捕获层输入隐状态
+            # （含残差的完整隐层，未过 final norm）。
+            if capture and idx in self.aux_hidden_state_layers:
+                aux_states.append(hidden_states if residual is None else hidden_states + residual)
             hidden_states, residual = layer(positions, hidden_states, residual)
         hidden_states, _ = self.norm(hidden_states, residual)
+        if capture:
+            # 拼接顺序 [low, mid, high]，与 draft fc 权重的训练顺序一致。
+            return hidden_states, torch.cat(aux_states, dim=-1)
         return hidden_states
 
 

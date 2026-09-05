@@ -119,6 +119,19 @@ class BlockManager:
         if len(seq) % self.block_size == 1:
             seq.block_table.append(self._allocate_block())
 
+    def ensure_capacity(self, seq: Sequence, target_num_tokens: int) -> bool:
+        """保证 block_table 能容纳 target_num_tokens 个 token（投机解码轮预分配）。
+
+        预分配的容量在拒绝回滚后不回收：空槽中的旧 KV 会被后续写入覆盖，
+        注意力永远只读 context_len 范围内的槽位，因此残留值无害。
+        返回 False 表示空闲块不足（调用方应抢占该序列）。
+        """
+        while len(seq.block_table) * self.block_size < target_num_tokens:
+            if not self.free_block_ids:
+                return False
+            seq.block_table.append(self._allocate_block())
+        return True
+
     def hash_blocks(self, seq: Sequence):
         start = seq.num_cached_tokens // self.block_size
         end = (seq.num_cached_tokens + seq.num_scheduled_tokens) // self.block_size

@@ -25,6 +25,10 @@ class Attention(nn.Module):
 
         self.backend = get_backend()
 
+    # torch.compile 时保持 eager（graph-break）：对齐 vLLM PIECEWISE 思路，
+    # IXFormer/flash-attn 自定义算子在 dynamo 下只作 fallback，不参与编译融合。
+    @torch.compiler.disable
+
     def forward(
         self,
         q: torch.Tensor,

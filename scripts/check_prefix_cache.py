@@ -82,7 +82,8 @@ def _run_engine(model, backend, eager, block_size, prompts, max_tokens, max_mode
         # 引擎级 warmup：kernel lazy init / workspace 分配不计入任何计时，
         # 否则冷缓存请求的 TTFT 会被进程级初始化污染。
         warm_ids = llm.tokenizer.apply_chat_template(
-            [{"role": "user", "content": "hi"}], tokenize=True, add_generation_prompt=True)
+            [{"role": "user", "content": "hi"}], tokenize=True,
+            add_generation_prompt=True)["input_ids"]
         _run_seq(llm, warm_ids, 4)
         llm.scheduler.block_manager.reset_prefix_stats()
         outs = [_run_seq(llm, p, max_tokens) for p in prompts]
@@ -132,7 +133,7 @@ def main():
     def chat(q):
         return tokenizer.apply_chat_template(
             [{"role": "system", "content": sys_text}, {"role": "user", "content": q}],
-            tokenize=True, add_generation_prompt=True)
+            tokenize=True, add_generation_prompt=True)["input_ids"]
 
     p1, p2 = chat(Q1), chat(Q2)
     p1_len, p2_len = len(p1), len(p2)

@@ -211,7 +211,7 @@ def _chat_prompt_ids(messages):
             content = ""
         normalized.append({"role": role, "content": content})
     return _tokenizer.apply_chat_template(
-        normalized, tokenize=True, add_generation_prompt=True)
+        normalized, tokenize=True, add_generation_prompt=True)["input_ids"]
 
 
 def _completion_prompt_ids(body):
@@ -379,7 +379,13 @@ class Handler(BaseHTTPRequestHandler):
         temperature = body.get("temperature")
         if temperature is None:
             temperature = _default_temperature
-        temperature = max(float(temperature), 1e-6)    # nano 禁止 0：等效 greedy
+        temperature = max(float(temperature), 0.0)    # 0 = greedy（引擎已支持）
+        top_p = body.get("top_p")
+        if top_p is None:
+            top_p = 1.0
+        top_p = min(max(float(top_p), 1e-6), 1.0)
+        top_k = body.get("top_k")
+        top_k = max(int(top_k), 0) if top_k is not None else 0
         stop = body.get("stop")
         if isinstance(stop, str):
             stop = [stop]
@@ -402,7 +408,7 @@ class Handler(BaseHTTPRequestHandler):
         req_id = f"chatcmpl-{time.time_ns()}" if mode == "chat" else f"cmpl-{time.time_ns()}"
 
         seq = Sequence(prompt_ids, SamplingParams(
-            temperature=temperature, max_tokens=max_tokens))
+            temperature=temperature, max_tokens=max_tokens, top_p=top_p, top_k=top_k))
         with engine_lock:
             engine.scheduler.add(seq)
             st = _Request(seq, max_tokens)
@@ -484,6 +490,8 @@ def main():
     parser.add_argument("--api-key", default=None)
     parser.add_argument("--eager", action="store_true",
                         help="enforce_eager=True（跳过 CUDA Graph capture，启动更快）")
+    parser.add_argument("--compile", action="store_true",
+                        help="torch.compile 编译模型（CoreX 上约 8% prefill 提速）")
     parser.add_argument("--backend", default="auto", choices=["auto", "cuda", "corex"])
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--max-num-seqs", type=int, default=None)
@@ -498,6 +506,7 @@ def main():
     kwargs = dict(
         model=args.model,
         enforce_eager=args.eager,
+        compile=args.compile,
         tensor_parallel_size=1,       # server 只支持 TP=1（引擎同进程驱动）
         max_model_len=args.max_model_len,
         backend=args.backend,

@@ -1,6 +1,11 @@
 import torch
 from torch import nn
 
+# RMSNorm 按 (rank, batch) 累积编译版本（decode 2D 各 batch + prefill 3D 等），
+# 默认 recompile_limit=8 很快用尽，之后的新 shape 回退 eager 执行——浮点运算
+# 顺序与已编译 kernel 不同，会造成跨引擎 token 级结果分歧。调高规避。
+torch._dynamo.config.recompile_limit = 256
+
 
 class RMSNorm(nn.Module):
 

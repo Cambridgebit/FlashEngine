@@ -21,8 +21,10 @@ from nanovllm import LLM, SamplingParams
 from nanovllm.engine.sequence import Sequence
 
 
-TEMPERATURE = 1e-6
+TEMPERATURE = 0
 PROMPT = "请用三句话解释什么是大语言模型。"
+WARM_TOKENS = 1300
+WARM_TEXT = "你好，这是用于初始化长序列 prefill kernel 的预热文本。"
 TOOL_UNIT = (
     "search_web(url, query): 在互联网搜索并返回结果; "
     "call_api(endpoint, payload): 调用 REST API; "
@@ -35,13 +37,21 @@ Q1 = "帮我查一下今天的天气并给出穿衣建议。"
 Q2 = "总结一下当前目录下的文件结构。"
 
 
-def new_engine(model, eager, backend, max_model_len, max_num_seqs, block_size):
+def new_engine(model, eager, backend, max_model_len, max_num_seqs, block_size, compile=False):
     llm = None
     try:
         llm = LLM(model, enforce_eager=eager, tensor_parallel_size=1, backend=backend,
                   max_model_len=max_model_len, max_num_seqs=max_num_seqs,
-                  kvcache_block_size=block_size)
+                  kvcache_block_size=block_size, compile=compile)
         warm = Sequence(llm.tokenizer.encode("hi"),
+                        SamplingParams(temperature=TEMPERATURE, max_tokens=1, ignore_eos=True))
+        llm.scheduler.add(warm)
+        while not llm.is_finished():
+            llm.step()
+        ids = []
+        while len(ids) < WARM_TOKENS:
+            ids.extend(llm.tokenizer.encode(WARM_TEXT))
+        warm = Sequence(ids[:WARM_TOKENS],
                         SamplingParams(temperature=TEMPERATURE, max_tokens=1, ignore_eos=True))
         llm.scheduler.add(warm)
         while not llm.is_finished():
@@ -63,7 +73,9 @@ def close_engine(llm):
 
 
 def run_seqs(llm, seqs):
-    """驱动到全部结束，返回 (每 seq 输出 token 列表, TTFT 列表, wall 秒)。"""
+    """入队并驱动到全部结束，返回 (每 seq 输出 token 列表, TTFT 列表, wall 秒)。"""
+    for s in seqs:
+        llm.scheduler.add(s)
     eos = llm.scheduler.eos
     first, seen = {}, {}
     for s in seqs:
@@ -90,16 +102,14 @@ def cmd_graph(args):
         results[mode] = {}
         for bs in args.batch:
             llm = new_engine(args.model, eager, args.backend,
-                             args.max_model_len, bs, args.block_size)
+                             args.max_model_len, bs, args.block_size, args.compile)
             try:
                 prompt = llm.tokenizer.apply_chat_template(
                     [{"role": "user", "content": PROMPT}], tokenize=True,
-                    add_generation_prompt=True)
+                    add_generation_prompt=True)["input_ids"]
                 seqs = [Sequence(prompt, SamplingParams(
                     temperature=TEMPERATURE, max_tokens=args.max_tokens, ignore_eos=True))
                     for _ in range(bs)]
-                for s in seqs:
-                    llm.scheduler.add(s)
                 tokens, ttft, wall = run_seqs(llm, seqs)
                 total = sum(len(t) for t in tokens)
                 tps = total / wall
@@ -133,7 +143,7 @@ def cmd_prefix(args):
     def chat(q):
         return tokenizer.apply_chat_template(
             [{"role": "system", "content": sys_text}, {"role": "user", "content": q}],
-            tokenize=True, add_generation_prompt=True)
+            tokenize=True, add_generation_prompt=True)["input_ids"]
 
     p1, p2 = chat(Q1), chat(Q2)
     print(f"sys={sys_len} tok | p1={len(p1)} | p2={len(p2)} | "
@@ -141,22 +151,24 @@ def cmd_prefix(args):
 
     for mode, eager in (("EAGER", True), ("CUDA GRAPH", False)):
         llm = new_engine(args.model, eager, args.backend,
-                         args.max_model_len, 1, args.block_size)
+                         args.max_model_len, 1, args.block_size, args.compile)
         try:
-            _, ttft_cold, wall_cold = run_seqs(llm, [
+            _, ttfts, wall_cold = run_seqs(llm, [
                 Sequence(p2, SamplingParams(
                     temperature=TEMPERATURE, max_tokens=args.max_tokens, ignore_eos=True))])
+            ttft_cold = ttfts[0]
         finally:
             close_engine(llm)
 
         llm = new_engine(args.model, eager, args.backend,
-                         args.max_model_len, 1, args.block_size)
+                         args.max_model_len, 1, args.block_size, args.compile)
         try:
             run_seqs(llm, [Sequence(p1, SamplingParams(
                 temperature=TEMPERATURE, max_tokens=args.max_tokens, ignore_eos=True))])
-            _, ttft_warm, wall_warm = run_seqs(llm, [
+            _, ttfts, wall_warm = run_seqs(llm, [
                 Sequence(p2, SamplingParams(
                     temperature=TEMPERATURE, max_tokens=args.max_tokens, ignore_eos=True))])
+            ttft_warm = ttfts[0]
             stats = llm.scheduler.block_manager.get_prefix_stats()
         finally:
             close_engine(llm)
@@ -179,6 +191,8 @@ def main():
     g.add_argument("model")
     g.add_argument("--batch", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32])
     g.add_argument("--backend", default="auto", choices=["auto", "cuda", "corex"])
+    g.add_argument("--compile", action="store_true",
+                   help="torch.compile 编译模型（CoreX 上约 8% prefill 提速）")
     g.add_argument("--max-tokens", type=int, default=128)
     g.add_argument("--max-model-len", type=int, default=4096)
     g.add_argument("--block-size", type=int, default=256)
@@ -187,6 +201,8 @@ def main():
     p = sub.add_parser("prefix", help="prefix cache 冷/热 TTFT 对比")
     p.add_argument("model")
     p.add_argument("--backend", default="auto", choices=["auto", "cuda", "corex"])
+    p.add_argument("--compile", action="store_true",
+                   help="torch.compile 编译模型（CoreX 上约 8% prefill 提速）")
     p.add_argument("--sys-tokens", type=int, default=1200, help="共享 system prompt 目标 token 数")
     p.add_argument("--max-tokens", type=int, default=8)
     p.add_argument("--max-model-len", type=int, default=8192)

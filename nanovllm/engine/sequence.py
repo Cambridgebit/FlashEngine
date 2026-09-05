@@ -14,6 +14,9 @@ class SequenceStatus(Enum):
 class Sequence:
     block_size = 256
     counter = count()
+    # spec 解码冷启动标记：prefill 完成置 True，首个投机轮（走 eager 补 carry）后清除。
+    # 仅 rank 0（spec 仅 TP=1）使用，不进 pickle。
+    spec_cold = True
 
     def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
         self.seq_id = next(Sequence.counter)
@@ -27,6 +30,8 @@ class Sequence:
         self.is_prefill = True
         self.block_table = []
         self.temperature = sampling_params.temperature
+        self.top_p = sampling_params.top_p
+        self.top_k = sampling_params.top_k
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
 
@@ -71,10 +76,12 @@ class Sequence:
 
     def __getstate__(self):
         last_state = self.last_token if not self.is_prefill else self.token_ids
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state)
+        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens,
+                self.block_table, self.temperature, self.top_p, self.top_k, last_state)
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state = state
+        (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens,
+         self.block_table, self.temperature, self.top_p, self.top_k, last_state) = state
         if isinstance(last_state, list):
             self.token_ids = last_state
             self.last_token = self.token_ids[-1]

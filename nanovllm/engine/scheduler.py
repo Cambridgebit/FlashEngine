@@ -22,7 +22,7 @@ class Scheduler:
     def add(self, seq: Sequence):
         self.waiting.append(seq)
 
-    def schedule(self) -> tuple[list[Sequence], bool]:
+    def schedule(self, spec_decode: bool = False) -> tuple[list[Sequence], bool]:
         scheduled_seqs = []
         num_batched_tokens = 0
 
@@ -55,6 +55,10 @@ class Scheduler:
             return scheduled_seqs, True
 
         # decode
+        # 投机解码：block 容量由 prepare_spec_round 预分配，此处不做 can_append/may_append。
+        if spec_decode:
+            assert self.running
+            return list(self.running), False
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
             while not self.block_manager.can_append(seq):
@@ -77,6 +81,41 @@ class Scheduler:
         seq.is_prefill = True
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
+
+    def prepare_spec_round(self, num_draft_tokens: int) -> list[Sequence]:
+        """投机解码轮准备：为每个 running 序列预分配 len+k 的 block 容量。
+
+        容量不足时抢占该序列（丢弃 KV，退回 waiting 等待重 prefill）。
+        """
+        active = []
+        while self.running:
+            seq = self.running.popleft()
+            # +1：draft 流最深写槽 = len+k-3，verify 覆盖到 len+k-1，留 1 余量。
+            if self.block_manager.ensure_capacity(seq, len(seq) + num_draft_tokens + 1):
+                active.append(seq)
+            else:
+                self.preempt(seq)
+        self.running.extend(active)
+        return active
+
+    def commit_spec(self, seqs: list[Sequence], tokens_list: list[list[int]]) -> list[Sequence]:
+        """投机解码轮提交：逐 token 追加（遇 eos / max_tokens 提前截断并结束序列）。
+
+        投机解码产生的 token 不做 block hash（前缀缓存仅覆盖 prefill 阶段，
+        避免被拒绝的 draft token 污染哈希表）。
+        """
+        finished = []
+        for seq, tokens in zip(seqs, tokens_list):
+            for token_id in tokens:
+                seq.append_token(token_id)
+                seq.num_cached_tokens = seq.num_tokens
+                if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens >= seq.max_tokens:
+                    seq.status = SequenceStatus.FINISHED
+                    self.block_manager.deallocate(seq)
+                    self.running.remove(seq)
+                    finished.append(seq)
+                    break
+        return finished
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
         for seq, token_id in zip(seqs, token_ids):
