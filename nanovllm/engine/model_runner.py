@@ -1020,10 +1020,14 @@ class ModelRunner:
             max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size + 1
             # 同 dtype 的输入合并为一块连续 buffer，prepare 阶段可单次 H2D 直写。
             io = torch.zeros(2 * max_bs, dtype=torch.int64)
-            sc = torch.zeros(2 * max_bs, dtype=self.backend.graph_slot_mapping_dtype())
-            sc[:max_bs].fill_(-1)
+            sc = torch.zeros(max_bs, dtype=self.backend.graph_slot_mapping_dtype())
+            sc.fill_(-1)
+            # context_lens 必须独立 int32：ixformer paged_attention 硬性检查
+            # Int && contiguous && cuda，不能跟随 slot 的图 dtype（CoreX=int64）。
+            # 旧两段式共 buffer 在 CUDA 上靠 slot 恰好同为 int32 掩盖。
+            ctx = torch.zeros(max_bs, dtype=torch.int32)
             input_ids, positions = io[:max_bs], io[max_bs:]
-            slot_mapping, context_lens = sc[:max_bs], sc[max_bs:]
+            slot_mapping, context_lens = sc, ctx
             block_tables = torch.full((max_bs, max_num_blocks), -1, dtype=torch.int32)
             outputs = torch.zeros(max_bs, hf_config.hidden_size, dtype=self.dtype)
             temperatures = torch.ones(max_bs, dtype=torch.float32)

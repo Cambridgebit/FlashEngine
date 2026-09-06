@@ -10,6 +10,8 @@
 # ② 运行环境需已安装 ixformer（CoreX 后端依赖，pyproject 未声明，仅 Iluvatar 硬件可用）；
 # ③ 步骤判读：第 4 步启动时若打印「spec CUDA Graph 捕获失败，降级为 eager」= CoreX 上不可捕获，
 #    该步与第 3 步等价；若无告警则 spec 图生效，对比两步的 E / TPS 即为图收益。
+# ④ 各步统一传 --gpu-mem-util 0.85：空板卡（无桌面占用）KV 池按 util 贴地吃满，
+#    图捕获/运行峰值无余量（32GB 卡实测 KV 后仅剩 ~112MB，大桶图内采样需 ~600MB）。
 
 set -o pipefail
 
@@ -56,25 +58,25 @@ echo "target=$TARGET draft=$DRAFT questions=$QUESTIONS out=$OUT PY=$PY"
 
 # 步骤 1/5：decode CUDA Graph 回归 —— V1.3 已实证的路径 + 本次新增的图内采样内容
 echo "---- 步骤 1/5: decode CUDA Graph 回归 ----"
-$PY -m scripts.check_prefix_cache "$TARGET" --backend corex --graph 2>&1 | tee "$OUT/prefix_graph.log"
+$PY -m scripts.check_prefix_cache "$TARGET" --backend corex --graph --max-num-seqs 8 --gpu-mem-util 0.85 2>&1 | tee "$OUT/prefix_graph.log"
 
 # 步骤 2/5：图内采样对照 —— NANOVLLM_GRAPH_SAMPLE=0 关掉 exponential_ 图内采样再跑一遍，隔离其捕获风险
 echo "---- 步骤 2/5: 图内采样对照（NANOVLLM_GRAPH_SAMPLE=0）----"
-NANOVLLM_GRAPH_SAMPLE=0 $PY -m scripts.check_prefix_cache "$TARGET" --backend corex --graph 2>&1 | tee "$OUT/prefix_graph_nosample.log"
+NANOVLLM_GRAPH_SAMPLE=0 $PY -m scripts.check_prefix_cache "$TARGET" --backend corex --graph --max-num-seqs 8 --gpu-mem-util 0.85 2>&1 | tee "$OUT/prefix_graph_nosample.log"
 
 # check_eagle3.py 无 --backend 参数，CoreX 后端由上方 export 的 NANOVLLM_BACKEND 指定
 # 步骤 3/5：spec eager 轮 —— 显式禁用 spec 图，与 CUDA 基线 E=2.095 对照
 echo "---- 步骤 3/5: spec eager 轮（NANOVLLM_SPEC_GRAPH=0）----"
-NANOVLLM_SPEC_GRAPH=0 $PY -m scripts.check_eagle3 "$TARGET" --draft "$DRAFT" --tag corex_eager_spec 2>&1 | tee "$OUT/eager_spec.log"
+NANOVLLM_SPEC_GRAPH=0 $PY -m scripts.check_eagle3 "$TARGET" --draft "$DRAFT" --tag corex_eager_spec --gpu-mem-util 0.85 2>&1 | tee "$OUT/eager_spec.log"
 
 # 步骤 4/5：spec 图捕获尝试 —— 默认放行捕获（supports_spec_graph=True）；
 # 若启动打印「spec CUDA Graph 捕获失败，降级为 eager」= 不可捕获，与第 3 步等价；
 # 若无告警则图生效，对比两步 E / TPS。
 echo "---- 步骤 4/5: spec 图捕获尝试 ----"
-$PY -m scripts.check_eagle3 "$TARGET" --draft "$DRAFT" --tag corex_spec_graph 2>&1 | tee "$OUT/spec_graph.log"
+$PY -m scripts.check_eagle3 "$TARGET" --draft "$DRAFT" --tag corex_spec_graph --gpu-mem-util 0.85 2>&1 | tee "$OUT/spec_graph.log"
 
 # 步骤 5/5：TPS sweep —— decode 吞吐随 batch 扫描（1/2/4/8）
 echo "---- 步骤 5/5: TPS sweep ----"
-$PY -m scripts.benchmark graph "$TARGET" --batch 1 2 4 8 --backend corex 2>&1 | tee "$OUT/bench_sweep.log"
+$PY -m scripts.benchmark graph "$TARGET" --batch 1 2 4 8 --backend corex --gpu-mem-util 0.85 2>&1 | tee "$OUT/bench_sweep.log"
 
 echo "==== 五步验证完成，日志与结果输出目录: $OUT ===="

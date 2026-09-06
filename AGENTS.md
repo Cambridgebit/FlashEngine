@@ -18,6 +18,7 @@ Nano-vLLM：从零实现的极简 vLLM（研究/学习用代码库，非生产�
 - 脚本只跑 GPU 且对数值敏感：计时前先预热引擎，结果逐 token 对比；`check_prefix_cache` 失败时退出码非零。
 - `--eager` / `enforce_eager=True` 关闭 CUDA Graph 捕获（小显存卡推荐）；CUDA Graph 需按 batch 形状逐桶捕获，遇到未捕获形状首轮会失败。
 - `tqdm` 被引擎导入但 **pyproject.toml 未声明**，全新安装后需手动装。
+- 空板卡（无桌面占用显存）跑任何脚本建议传 `--gpu-mem-util 0.85`：KV 池按 util 贴地分配，图捕获/大桶采样峰值需余量（32GB CoreX 卡实测贴地后仅剩 ~112MB，图内采样 OOM）；`check_prefix_cache` 另有 `--max-num-seqs`（默认 8）。
 
 ## 测试环境与已知的坑（WSL2 + 4070 Laptop 8GB）
 
@@ -33,7 +34,7 @@ Nano-vLLM：从零实现的极简 vLLM（研究/学习用代码库，非生产�
 
 - `nanovllm/backends/` 抽象 attention/kvcache 算子。选择方式：`backend=` 参数、`NANOVLLM_BACKEND` 环境变量、或自动探测（`torch.corex` 标记 → corex，否则 cuda）。
 - `corex` 面向 Iluvatar（天数智芯）GPU，导入外部 `ixformer` 包（`ixformer.inference.functions`、`ixformer.contrib.vllm_flash_attn`），**pyproject 未声明**，只能在 Iluvatar 硬件上运行。
-- 两后端差异：KV 布局（`get_kv_cache_shape`，CUDA = `[2, layers, blocks, block_size, kv_heads, head_dim]`；CoreX = HND `[2, layers, blocks, kv_heads, block_size, head_dim]`）与 **slot_mapping dtype**（`graph_slot_mapping_dtype`，CUDA int32 / CoreX int64）。`cu_seqlens`/`context_lens`/`block_tables` 两后端统一 int32。改 kvcache/attention 代码时不要假设单一布局。
+- 两后端差异：KV 布局（`get_kv_cache_shape`，CUDA = `[2, layers, blocks, block_size, kv_heads, head_dim]`；CoreX = HND `[2, layers, blocks, kv_heads, block_size, head_dim]`）与 **slot_mapping dtype**（`graph_slot_mapping_dtype`，CUDA int32 / CoreX int64）。`cu_seqlens`/`context_lens`/`block_tables` 两后端统一 int32（CoreX 硬约束：ixformer paged_attention 硬性检查 context_lens 为 Int&&contiguous&&cuda——图捕获静态 buffer 不得与 slot 共块）。改 kvcache/attention 代码时不要假设单一布局。
 - **spec 路径的硬件依赖已全部参数化**：槽位类 buffer（chain_slots/v_slots/eager 路径 slots）统一走 `backend.graph_slot_mapping_dtype()`；meta blob 统一存 int64，图内 `copy_` 自动转型。
 - **spec CUDA Graph 捕获失败会优雅降级**：`capture_spec_cudagraph` 捕获异常时打印警告、释放图池、回落到同构 eager spec 轮（为 CoreX 上 ixformer kernel 可能不可捕获而设计）。
 - **桶表覆盖 max_bs**：`_graph_buckets` 在标准模式（[1,2,4,8]+16 步进）未覆盖 max_num_seqs 时追加尾桶并一次性告警（非 2 幂 max_num_seqs 不再静默降级 eager）；graph padding 复位时 cu_k 尾段置零长窗口（`cu_k[n+1:] = cu_k[n]`，cu 单调不降）。
@@ -102,11 +103,26 @@ Nano-vLLM：从零实现的极简 vLLM（研究/学习用代码库，非生产�
 - 口径：ours 用 check_eagle3 同款 kwargs（max_model_len 4096 / max_num_seqs 8 / kvcache_block_size 256，E 直方图 monkey-patch spec_round）；initial 同构（其 SamplingParams 不支持 temp0，用 1e-9 近似 greedy）；vLLM 用 `LLM(max_model_len=2048, max_num_seqs=8, gpu_memory_utilization=0.85)`（graphs 默认 FULL_AND_PIECEWISE），vllm-spec 加 `speculative_config={'method':'eagle3','model':<draft>,'num_speculative_tokens':3}`（离线 LLM 传 dict；serve CLI 传 JSON 字符串）。
 - spec 结构收益两引擎一致：ours 108.7/66.2 = 1.64×，vllm 125.6/69.5 = 1.81×；E=2.095 与历史锚点完全一致。ours decode 距 initial 0.97（66.2 vs 68.2，采样修复后从 0.92 收窄）、距 vllm decode 0.95（66.2 vs 69.5）——残差 ~3-5% 与流式配对口径一致（GEMM 异常已复检排除，见流式节），不是 spec 路径特有的。
 
-## CoreX（Iluvatar）移植状态
+### vllm bench serve 在线口径 vs benchmark jsonl（可比性约定，2026-09）
 
-- 代码层已就绪：spec 路径硬件依赖已参数化到 backend；图捕获失败自动降级 eager。
-- **待实机验证**（本机无法测）：ixformer `flash_attn_varlen_func` 在虚构窗口/verify 路径的正确性；pinned memory + non_blocking H2D 行为。spec 图捕获现在会默认尝试（`supports_spec_graph=True`），成败由 `scripts/verify_corex.sh` 第 4 步实测（失败自动降级 eager spec，收益打折）。
-- CoreX 上收益预期需重估：verify 摊薄权重读取的结构性收益不变，但 ixformer kernel host 开销若偏大，chain/refill 占比上升，净收益可能低于 CUDA。
+- **TPS 数字同构可直接同表**：vllm bench 的 Output token throughput = Σ输出 token / 总墙钟（含 prefill、串行、temp0、warmup 同构）≈ jsonl 的 AGG TPS 口径。
+- **四前提**：① vLLM server 显式开 spec——bench 只是 client，未配 `--speculative-config '{"method":"eagle3","model":<draft>,"num_speculative_tokens":3}'` 测的就是纯 decode；② prompt 口径——completions 发 raw 文本（无 chat template），jsonl 是 chat template（enable_thinking=False）：decode TPS 对内容不敏感大致可比，**spec TPS 强依赖 E 不可直接比**；③ TTFT 为 client 端口径（含 HTTP 往返），比进程内高几 ms 只比趋势；④ 确认 vLLM server 与引擎同硬件（跨机对比只是参考）。
+- **自查**：逐条 output len 对照 jsonl log 的 tok 列（明显不同 = prompt 不同源）；server 日志 SpecDecoding accept length 指标确认 spec 已生效。
+- **最干净对法**：同一 vllm bench client 打两个 server（vLLM server vs 本引擎 openai_server——后者 completions 对 raw prompt 直接 encode，与 vLLM completions 行为一致，协议税一致）。benchmark jsonl 三配置（CoreX 实测 8.1/76.5/104.1）是引擎直调口径，**两套口径不混表**。
+
+## CoreX（Iluvatar）移植状态——实机验证通过（2026-09，32GB 板卡 / corex-4.4.0 / Python 3.10 / transformers 4.57.6）
+
+- **五步清单全过，spec 单图整轮一次捕获成功**（无需降级）：decode 图 wall 551ms vs eager 3980ms（7.2×，逐 token 位等）；spec 图 E=2.050 / TPS **103.7**（≈4070 的 108.7 同量级）；spec eager 仅 11.3 tok/s——与 CUDA 侧「spec 必须有图」结论互证。
+- **图是 CoreX 刚需**：eager decode 仅 7.8 tok/s（kernel launch 税被 CoreX torch 放大），图后 bs=1 72.9 / bs=8 415.8（TPS sweep **9.3×**，远超 4070 的 +23%）——图收益主要来自消除 launch 税；eager 模式在 CoreX 上近乎不可用级别地慢。
+- **离线三配置基准**（spec_bench coding 前 10 条，串行 bs=1，temp0，k=3，`benchmark jsonl --gpu-mem-util 0.85`；2026-09 实机）：EAGER **8.1** → Graph **76.5**（9.4×）→ Spec+Graph **104.1**（+36%，vs eager **12.9×**）；TTFT 三组 130-136ms 持平（prefill 主导，预热热命中偏差可忽略，median≈avg）。③ 与 verify 步骤 4 的 check_eagle3 103.7 交叉一致 ±0.4%（两口径互证）。与 4070 同口径对照：decode 76.5 vs 66.2（**+15%**）、spec 104.1 vs 108.7（-4%）——spec 收益比 1.36× 低于 4070 的 1.64×（图已抬高基线，launch 税红利被吃掉）。
+- **板卡高温**：连续高负载触发 XID 8 温度告警（实测 96°C）——bench 间留冷却间隔；告警后数据点可能受降频影响，采集时标注温度条件。
+- **实机修出的三个坑（均已入仓）**：
+  1. `context_lens` 必须独立 int32 buffer——ixformer `paged_attention` 硬性检查 Int&&contiguous&&cuda；图捕获静态 buffer 曾与 slot 共块跟随 `graph_slot_mapping_dtype()` 变 int64 而炸（CUDA 上 slot 恰好同为 int32 掩盖，见 `capture_cudagraph`）。
+  2. 空板卡 KV 池按 util 贴地吃满（32GB 卡 KV 后仅剩 ~112MB），图捕获/大桶图内采样（bs=512 桶 argsort ~600MB）必 OOM——verify 五步统一 `--gpu-mem-util 0.85`；`check_prefix_cache` 补 `--max-num-seqs`（默认 8，对齐 openai_server 结论；脚本默认值未动不伤 4070 基线）。
+  3. 旧版 transformers `apply_chat_template(tokenize=True)` 返回 list 而非 dict（4.57.6 实测仍如此）——4 个脚本共 7 处调用点已加 `isinstance(out, (list, tuple))` 兼容。
+- **判读口径**：`benchmark graph` 的 correct 列在 CoreX 仅作参考——temp0 greedy 门下图内 lm_head 与 eager 的 GEMV kernel 选择不同，ULP 级 logit 差可致 argmax 翻转（实测 bs=1/2 FAIL、bs=4/8 PASS；同机 check_prefix_cache 位等门 PASS）。主判据 = 同配置图 vs 图、eager vs eager（两项全 PASS）。
+- `check_eagle3` 的「histogram 提交数 != completion 总数」警告 = EOS 截断正常效应（spec 轮多 token 被 commit_spec 提前截断），非 bug。
+- 收益预期修正（vs 上版文档）：spec 图收益远高于保守预期；ixformer varlen（虚构窗口/verify/refill）实测正确；此前「ixformer host 开销偏大致净收益低于 CUDA」的预测不成立（图内无 launch 税后反超）。
 - Ascend 310P：已实现并注册为第三后端（见下节；auto-detect 分支在 backends/__init__.py）；多硬件方案全文见 .omo/plans/multi-hardware.md。
 
 ## Ascend 310P（Atlas 300I Duo / 200I Pro）适配状态

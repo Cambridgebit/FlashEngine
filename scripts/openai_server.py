@@ -246,8 +246,10 @@ def _chat_prompt_ids(messages):
         if content is None:
             content = ""
         normalized.append({"role": role, "content": content})
-    return _tokenizer.apply_chat_template(
-        normalized, tokenize=True, add_generation_prompt=True)["input_ids"]
+    out = _tokenizer.apply_chat_template(
+        normalized, tokenize=True, add_generation_prompt=True)
+    # 兼容旧 transformers（<4.44 return_dict=False 直接返回 list）
+    return out if isinstance(out, (list, tuple)) else out["input_ids"]
 
 
 def _completion_prompt_ids(body):
@@ -538,6 +540,9 @@ def main():
     parser.add_argument("--spec-num-tokens", type=int, default=4,
                         help="每轮起草 token 数 k（draft depth）")
     parser.add_argument("--temperature", type=float, default=0.7)
+    # KV 池按 (total*util - used) 贴地分配；空板卡（无桌面占用）需调低 util
+    # 给图捕获/运行峰值留余量（32GB CoreX 卡贴地后仅剩 ~112MB，spec 图捕获必 OOM 降级）。
+    parser.add_argument("--gpu-mem-util", type=float, default=0.9)
     args = parser.parse_args()
 
     _api_key = args.api_key
@@ -552,6 +557,7 @@ def main():
         backend=args.backend,
         spec_model=args.spec_model,
         spec_num_tokens=args.spec_num_tokens,
+        gpu_memory_utilization=args.gpu_mem_util,
     )
     if args.max_num_seqs is not None:
         kwargs["max_num_seqs"] = args.max_num_seqs

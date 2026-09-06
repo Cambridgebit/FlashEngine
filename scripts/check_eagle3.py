@@ -53,9 +53,11 @@ def load_prompts(questions, category, num):
 
 def build_prompt_ids(llm, q):
     # 与回归基线口径一致：enable_thinking=False
-    return llm.tokenizer.apply_chat_template(
+    out = llm.tokenizer.apply_chat_template(
         [{'role': 'user', 'content': q}], tokenize=True,
-        add_generation_prompt=True, enable_thinking=False)['input_ids']
+        add_generation_prompt=True, enable_thinking=False)
+    # 兼容旧 transformers（<4.44 return_dict=False 直接返回 list）
+    return out if isinstance(out, (list, tuple)) else out["input_ids"]
 
 
 def main():
@@ -69,6 +71,8 @@ def main():
     ap.add_argument('--category', default='coding', help='spec_bench 类别过滤（默认 coding）')
     ap.add_argument('--num-prompts', type=int, default=100, help='prompt 数（默认 100）')
     ap.add_argument('--max-tokens', type=int, default=512, help='每条最大生成 token 数（默认 512）')
+    ap.add_argument('--gpu-mem-util', type=float, default=0.9,
+                    help='gpu_memory_utilization（默认 0.9；空板卡 KV 贴地需给图/运行峰值留余量时可调低）')
     ap.add_argument('--tag', default='run', help='指标打印 tag（默认 run）')
     ap.add_argument('--save-out', default='',
                     help='JSON 输出路径（缺省只打印指标；给出时写同 schema JSON，'
@@ -84,7 +88,8 @@ def main():
 
     engine_kwargs = dict(
         tensor_parallel_size=1, spec_model=args.draft, spec_num_tokens=3,
-        max_model_len=4096, max_num_seqs=8, kvcache_block_size=256)
+        max_model_len=4096, max_num_seqs=8, kvcache_block_size=256,
+        gpu_memory_utilization=args.gpu_mem_util)
     llm = LLM(args.target, **engine_kwargs)
     try:
         sp = SamplingParams(temperature=0, max_tokens=args.max_tokens)

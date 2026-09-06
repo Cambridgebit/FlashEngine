@@ -1,7 +1,3 @@
-<p align="center">
-<img width="300" src="assets/logo.png">
-</p>
-
 # Nano-vLLM（EAGLE3 fork）
 
 从零实现的轻量级推理引擎（上游 nano-vllm ≈1200 行 + EAGLE3 ≈1200 行）。在上游 prefix caching / Tensor Parallel / torch.compile / chunked prefill 之上新增：
@@ -36,8 +32,8 @@ OpenAI 兼容 server 与基准（必须从仓库根目录以 `-m` 方式运行�
 python3 -m scripts.openai_server /path/to/Qwen3-1.7B --port 8000 --max-model-len 2048
 #   投机解码：--spec-model /path/to/Qwen3-1.7B-EAGLE3 --spec-num-tokens 3
 #   默认 max_num_seqs=8（8GB 卡实测宽桶拖慢单步回放；需高并发显式传 --max-num-seqs）
-python3 -m scripts.stream_bench --service ours=http://127.0.0.1:8000/v1 --rounds 2   # 流式基准
 python3 -m scripts.benchmark graph /path/to/Qwen3-1.7B --batch 1 2 4 8               # 吞吐基准
+python3 -m scripts.benchmark jsonl /path/to/Qwen3-1.7B --spec-model /path/to/Qwen3-1.7B-EAGLE3   # 真实问题集 TPS/TTFT
 python3 -m scripts.check_eagle3 /path/to/Qwen3-1.7B --draft /path/to/Qwen3-1.7B-EAGLE3   # 验收
 ```
 
@@ -61,10 +57,9 @@ nanovllm/
 ├── backends/               # base 接口 ← cuda / corex / ascend310p
 └── utils/                  # context 全局上下文 + 权重加载
 scripts/
-├── benchmark.py            # graph / prefix 吞吐基准
+├── benchmark.py            # graph / prefix / jsonl 吞吐与 TTFT 基准
 ├── check_eagle3.py         # EAGLE3 验收（E / 逐位接受率 / 直方图 / TPS，--save-out 可回归比对）
 ├── check_prefix_cache.py   # prefix cache 数值回归门（退出码非零 = FAIL）
-├── stream_bench.py         # Cherry 式流式基准（TTFB / usage 断言 / median 表 / 自测）
 ├── openai_server.py        # OpenAI 兼容 server
 ├── verify_corex.sh         # CoreX 实机五步验证清单
 └── verify_ascend310p.sh    # Ascend 310P 实机验证清单（环境预检+载荷算子探测+四步）
@@ -147,12 +142,17 @@ decode 图失败 → 全 eager 前向——任何失败只降速，不崩溃。
 | KV 布局 | 连续 [2,L,B,S,H,D] | HND [2,L,B,H,S,D] | 同 CUDA |
 | 图 slot dtype | int32 | int64 | int32 |
 | KV 写入 / attention | triton + flash-attn | ixformer（vendor .so） | torch_npu（`_npu_reshape_and_cache` + TND prefill / BNSD decode） |
-| spec 图捕获 | 已实证 | 尝试 + 失败自动降级 | ❌ 引擎层拒绝（paged-TND 待后续） |
+| spec 图捕获 | 已实证 | **已实证**（失败自动降级兜底） | ❌ 引擎层拒绝（paged-TND 待后续） |
 | TP `dist_name` | nccl | nccl（厂商兼容层） | hccl |
 
-- **CoreX 状态**：代码就绪、硬件差异已参数化，**待实机验证**——
-  `bash scripts/verify_corex.sh <target> <draft>` 五步清单（decode 图回归 → graph_sample 对照 →
-  spec eager E → spec 图捕获尝试 → TPS sweep）。
+- **CoreX 状态**：**实机验证通过**（2026-09，32GB 板卡 / corex-4.4.0 / transformers 4.57.6）——
+  `bash scripts/verify_corex.sh <target> <draft>` 五步全过，spec 单图整轮一次捕获成功：
+  decode 图收益 **9.3×**（eager 7.8 → 图 72.9 tok/s @bs=1；launch 税为 CoreX 主要瓶颈，图是刚需），
+  spec 图 E=2.050 / **103.7 tok/s**（≈4070 的 108.7 同量级），spec eager 11.3 无收益（与 CUDA「spec 必须有图」互证）。
+  jsonl 三配置（coding 前 10 条，串行 temp0）：eager 8.1 → graph 76.5 → **spec+graph 104.1**（+36%，vs eager 12.9×）。
+  实机修复：图捕获 `context_lens` 独立 int32（ixformer 硬检查）、空板卡 KV 贴地需 `--gpu-mem-util 0.85`、
+  旧版 transformers `apply_chat_template` 返回 list 兼容（7 处）。
+  判读：`benchmark graph` 的 correct 列仅参考（temp0 下图内/图外 lm_head 的 ULP 发散；主判据 = 同配置位等，全 PASS）。
 - **Ascend 310P 状态**：代码就绪（torch_npu 懒加载+承重算子守卫、设备代理 `torch.npu.*`、NPUGraph 图工厂、NPU 融合算子），**待实机验证**——`bash scripts/verify_ascend310p.sh <target> <draft>`。已知限制：prefix 命中 prefill 的 k/v=整池 4D 切片，TND 算子不消费（与参考实现同款，需 paged-TND 后续适配）——spec 全路径因此被引擎层拒绝（`supports_spec=False`）。
 
 ## 环境变量

@@ -69,21 +69,26 @@ def _run_seq(llm, prompt_ids, max_tokens):
     return tokens, first_t, time.perf_counter() - t0
 
 
-def _run_engine(model, backend, eager, block_size, prompts, max_tokens, max_model_len):
+def _run_engine(model, backend, eager, block_size, prompts, max_tokens, max_model_len,
+                max_num_seqs, gpu_mem_util):
     llm = LLM(
         model,
         enforce_eager=eager,
         tensor_parallel_size=1,
         backend=backend,
         max_model_len=max_model_len,
+        max_num_seqs=max_num_seqs,
+        gpu_memory_utilization=gpu_mem_util,
         kvcache_block_size=block_size,
     )
     try:
         # 引擎级 warmup：kernel lazy init / workspace 分配不计入任何计时，
         # 否则冷缓存请求的 TTFT 会被进程级初始化污染。
-        warm_ids = llm.tokenizer.apply_chat_template(
+        warm_out = llm.tokenizer.apply_chat_template(
             [{"role": "user", "content": "hi"}], tokenize=True,
-            add_generation_prompt=True)["input_ids"]
+            add_generation_prompt=True)
+        # 兼容旧 transformers（<4.44 return_dict=False 直接返回 list）
+        warm_ids = warm_out if isinstance(warm_out, (list, tuple)) else warm_out["input_ids"]
         _run_seq(llm, warm_ids, 4)
         llm.scheduler.block_manager.reset_prefix_stats()
         outs = [_run_seq(llm, p, max_tokens) for p in prompts]
@@ -127,6 +132,12 @@ def main():
     parser.add_argument("--sys-tokens", type=int, default=1200, help="system prompt 目标 token 数")
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--max-model-len", type=int, default=8192)
+    # 默认 8（对齐 openai_server 的 ms=8 实测结论）：大 ms 放大图桶表与图内采样
+    # 峰值显存（bs=512 桶的 argsort 需 ~600MB），空板卡 KV 贴地后必 OOM。
+    parser.add_argument("--max-num-seqs", type=int, default=8)
+    # KV 池按 (total*util - used) 贴地分配；空板卡（无桌面占用）需调低 util
+    # 给图捕获/运行峰值留余量（verify 脚本统一传 0.85）。
+    parser.add_argument("--gpu-mem-util", type=float, default=0.9)
     args = parser.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
@@ -134,9 +145,11 @@ def main():
     sys_len = len(tokenizer.encode(sys_text))
 
     def chat(q):
-        return tokenizer.apply_chat_template(
+        out = tokenizer.apply_chat_template(
             [{"role": "system", "content": sys_text}, {"role": "user", "content": q}],
-            tokenize=True, add_generation_prompt=True)["input_ids"]
+            tokenize=True, add_generation_prompt=True)
+        # 兼容旧 transformers（<4.44 return_dict=False 直接返回 list）
+        return out if isinstance(out, (list, tuple)) else out["input_ids"]
 
     p1, p2 = chat(Q1), chat(Q2)
     p1_len, p2_len = len(p1), len(p2)
@@ -148,11 +161,11 @@ def main():
     # 引擎 A：R1 冷 + R2 热（共享 system 前缀）
     warm_outs, warm_stats = _run_engine(
         args.model, args.backend, True, args.block_size, [p1, p2],
-        args.max_tokens, args.max_model_len)
+        args.max_tokens, args.max_model_len, args.max_num_seqs, args.gpu_mem_util)
     # 引擎 B（全新引擎）：R2 冷
     cold_outs, cold_stats = _run_engine(
         args.model, args.backend, True, args.block_size, [p2],
-        args.max_tokens, args.max_model_len)
+        args.max_tokens, args.max_model_len, args.max_num_seqs, args.gpu_mem_util)
     _report("EAGER", warm_outs, warm_stats, sys_len, p1_len, p2_len)
 
     ok &= _assert("eager warm-R2 == cold-R2 (KV 复用无污染)",
@@ -170,10 +183,10 @@ def main():
     if args.graph:
         gwarm_outs, gwarm_stats = _run_engine(
             args.model, args.backend, False, args.block_size, [p1, p2],
-            args.max_tokens, args.max_model_len)
+            args.max_tokens, args.max_model_len, args.max_num_seqs, args.gpu_mem_util)
         gcold_outs, gcold_stats = _run_engine(
             args.model, args.backend, False, args.block_size, [p2],
-            args.max_tokens, args.max_model_len)
+            args.max_tokens, args.max_model_len, args.max_num_seqs, args.gpu_mem_util)
         _report("CUDA GRAPH", gwarm_outs, gwarm_stats, sys_len, p1_len, p2_len)
 
         ok &= _assert("graph warm-R2 == graph cold-R2", gwarm_outs[1][0] == gcold_outs[0][0])
