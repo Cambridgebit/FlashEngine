@@ -11,7 +11,7 @@ Nano-vLLM：从零实现的极简 vLLM（研究/学习用代码库，非生产�
 ~/vllm-env/bin/python3 -m scripts.benchmark prefix  /path/to/Qwen3-1.7B [--backend corex]
 ~/vllm-env/bin/python3 -m scripts.check_prefix_cache /path/to/Qwen3-1.7B [--graph] [--backend corex]
 ~/vllm-env/bin/python3 -m scripts.check_eagle3 /path/to/Qwen3-1.7B --draft /path/to/Qwen3-1.7B-EAGLE3 [--num-prompts 10]
-~/vllm-env/bin/python3 scripts/openai_server.py /path/to/Qwen3-1.7B [--port 8000] [--eager]
+~/vllm-env/bin/python3 -m scripts.openai_server /path/to/Qwen3-1.7B [--port 8000] [--eager] [--spec-model <draft 目录>] [--spec-num-tokens k]
 ```
 
 - 必须以模块方式从仓库根目录运行（`-m scripts.X`），不能 `python scripts/X.py`（本机 shell 有 ROS 的 PYTHONPATH，`scripts/__init__.py` 用于避免包遮蔽）。
@@ -27,6 +27,7 @@ Nano-vLLM：从零实现的极简 vLLM（研究/学习用代码库，非生产�
 - EAGLE3 draft checkpoint 的 config.json **没有** aux 层字段 / fc_norm / norm_before_fc；aux 层用引擎默认 (2, n//2, n-3)。
 - spec_bench 验收脚本已晋升为 `scripts/check_eagle3.py`（E/逐位置接受率/直方图/TPS；`--save-out`/`--tag` 输出与回归 compare 流程同 schema）；测试工件在 `~/vllm-lab/benchdata/nv_regression/`。
 - 数值确定性：bf16 下目标模型自身就随 batch 形状漂移（逐个 vs 批量跑同一批 prompt 有 3/10 输出分歧）——"投机 vs 非投机逐 token 一致"只在无分歧翻转的负载上成立。
+- Cherry 式流式对比以 stream_bench 为准；spec 开关对低 E 负载可能负收益，对比时须同时报告 E。
 
 ## 后端与硬件
 
@@ -70,6 +71,36 @@ Nano-vLLM：从零实现的极简 vLLM（研究/学习用代码库，非生产�
 - 重构后（C1-C6，2026-09）最终 E=2.095、TPS 112-114 与重构前一致；输出位级不变贯穿全程，但 C1-C3 阶段逐轮接受统计有漂移（链步 1 embed 断裂，评审发现），C4 起恢复与基线逐项一致。
 - 与 vLLM 的剩余 ~14% 差距：~7% 是每轮 host 耗时（vLLM 有异步调度重叠，我们没有），~6% 是两边生成文本数值漂移导致的接受率统计差（结构已完全对齐）。
 - 短问答负载（接受率低）的参考值：spec k=2 ≈ 81 tok/s，base graph ≈ 67 tok/s。
+
+### OpenAI server 流式基线（stream_bench：3 条中文散文提示词，temp0.7，串行 bs=1；2026-09-06 采样瘦身会话，ms=8 统一默认后）
+
+| 服务 | TPS 中位 | 平均 TTFT |
+|---|---|---|
+| vLLM 0.26（无 spec，ms=8） | 66.7 | 34ms |
+| vLLM 0.26（eagle3 spec k=3，ms=8） | 64.4 | 34ms |
+| nanovllm-initial（变体 server） | 70.1 | 53ms |
+| 本引擎 spec-off（ms=8 统一默认） | 61.7 | 54ms |
+| 本引擎 spec-on(k=3) | 59.7 | 70ms |
+
+- **ms=8 统一默认**（openai_server 对 nospec/spec 都默认 max_num_seqs=8）：宽桶/宽 buffer 拖慢单步回放，实测 nospec 512→8 = 59.0→66.8 tok/s（+13%）；需要更高并发的用户显式传 `--max-num-seqs`。
+- **sampler 瘦身**（top_p≥1 走 top-k 掩码+Gumbel-argmax，图安全无分支）：temp0 位等门 ×2 PASS（spec_bench 10 条逐 token 与基线完全一致）、E=2.095 带守恒、离线 decode 绝对值 60.1→64.1-66.6（+7-10%）、spec TPS 新高 108.7-109.6。top_p<1 保留 legacy 原路（fast_top_p=False 回退）。
+- 该负载 E 仅 ~1.15-1.19（spec_bench coding 为 2.095；vLLM 自报 SpecDecoding metrics acceptance length 1.14-1.17）：低接受负载下 spec 两边都负收益（本引擎 61.7→59.7，vLLM 66.7→64.4——跨引擎互证）。**低接受负载勿开 --spec-model**；高接受负载（coding/temp0）收益 +64% 以上（离线 108.7 vs 66.2，见下节）。
+- decode 残差现状：采样机器已修复（绝对值 +7-10%）；**GEMM 同 kernel 异常已复检排除**——采样修复后 back-to-back 重剖析（16 稳态步），128x2 GEMM ours 167.6 vs initial 167.7 ms（±0.002%）、128x1 ours 反而快 2.1%：pre-fix 的 +21-23% 是会话时钟漂移的测量伪影，非引擎固有。在线配对 A/B（v3，背靠背）：ours-nospec 68.1（TTFT 52ms）vs initial 70.2（53ms）= **0.97**，decode 基本速度与 initial 对齐（≥0.95 门通过）；残差 ~3% 与离线口径一致（66.2 vs 68.2 = 0.97）。
+- server 路径税实测仅 ~1ms/轮（~4%）：temp0/GIL 切片/增量 detok/子进程隔离四个正交干预全部无效——瓶颈是负载 E 不是 host 路径。子进程化补丁（+167 LOC，串行零收益未采用）存于 .omo/drafts/subprocess-server.patch，未来测高并发 SSE 可捡回。
+- 数据来源：~/vllm-lab/benchdata/stream_cmp/*-v2.json 与 offline_cmp/*-v2.json（2026-09-06 采样瘦身会话）；离线探针 /tmp/probe_offline*.py（会话级，未入库）。
+
+### 离线横向对比（spec_bench coding 前 10 条，串行 bs=1，temp0，k=3，max_num_seqs=8；2026-09-06 采样瘦身会话）
+
+| 配置 | AGG TPS（含 prefill，保守） | E |
+|---|---|---|
+| ours-decode | 66.2 | — |
+| ours-spec(k=3) | 108.7 | 2.095 |
+| initial-decode | 68.2 | — |
+| vllm-decode | 69.5 | — |
+| vllm-spec(eagle3) | 125.6 | — |
+
+- 口径：ours 用 check_eagle3 同款 kwargs（max_model_len 4096 / max_num_seqs 8 / kvcache_block_size 256，E 直方图 monkey-patch spec_round）；initial 同构（其 SamplingParams 不支持 temp0，用 1e-9 近似 greedy）；vLLM 用 `LLM(max_model_len=2048, max_num_seqs=8, gpu_memory_utilization=0.85)`（graphs 默认 FULL_AND_PIECEWISE），vllm-spec 加 `speculative_config={'method':'eagle3','model':<draft>,'num_speculative_tokens':3}`（离线 LLM 传 dict；serve CLI 传 JSON 字符串）。
+- spec 结构收益两引擎一致：ours 108.7/66.2 = 1.64×，vllm 125.6/69.5 = 1.81×；E=2.095 与历史锚点完全一致。ours decode 距 initial 0.97（66.2 vs 68.2，采样修复后从 0.92 收窄）、距 vllm decode 0.95（66.2 vs 69.5）——残差 ~3-5% 与流式配对口径一致（GEMM 异常已复检排除，见流式节），不是 spec 路径特有的。
 
 ## CoreX（Iluvatar）移植状态
 

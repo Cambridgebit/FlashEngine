@@ -7,12 +7,12 @@
 - 真逐 token SSE 流式：每 decode step 后取新增 token，decode 后按文本 diff
   推送（兼容 CJK 多字节切分）。
 - 标准 OpenAI 端点：/v1/models、/v1/chat/completions、/v1/completions、/health。
-- 参数：max_tokens / temperature / top_p（忽略）/ stop（文本级截断并中止生成）/
+- 参数：max_tokens / temperature / top_p（转发给 SamplingParams）/ stop（文本级截断并中止生成）/
   n=1 / stream / stream_options.include_usage。
 - 只使用 nano-vLLM 公开 API（LLM、Sequence、SamplingParams、scheduler），不修改库文件。
 
-用法：
-    python3 scripts/openai_server.py /path/to/Qwen3-1.7B [--port 8000]
+用法（必须从仓库根目录以 -m 方式运行，直跑 scripts/X.py 会 ModuleNotFoundError）：
+    python3 -m scripts.openai_server /path/to/Qwen3-1.7B [--port 8000]
                   [--api-key xxx] [--eager] [--max-model-len 4096]
                   [--temperature 0.7] [--backend auto]
 
@@ -95,40 +95,47 @@ def _abort(seq):
 def _engine_loop():
     """循环调用 engine.step()，把新增 token / 结束事件分发给各请求。"""
     while not _shutdown.is_set():
-        _wakeup.wait(timeout=0.05)
-        _wakeup.clear()
         with engine_lock:
-            if not _active or engine.is_finished():
-                continue
-            try:
-                engine.step()
-            except Exception as exc:    # 引擎异常：让所有存活请求报错退出
+            if _active and not engine.is_finished():
+                try:
+                    engine.step()   # 活跃期连续步进：不等待 _wakeup（旧的 50ms 等待门
+                                    # 会让每个 decode 步白等 50ms，流式 TPS 被压到 ~14）
+                except Exception as exc:    # 引擎异常：让所有存活请求报错退出
+                    for st in list(_active.values()):
+                        _abort(st.seq)
+                        st.error = str(exc)
+                        st.finished = True
+                        st.event.set()
+                    _active.clear()
+                    continue
+                done = []
                 for st in list(_active.values()):
-                    _abort(st.seq)
-                    st.error = str(exc)
-                    st.finished = True
-                    st.event.set()
-                _active.clear()
+                    seq = st.seq
+                    comp = seq.completion_token_ids
+                    if len(comp) > st.n_seen:
+                        for tok in comp[st.n_seen:]:
+                            if tok != _eos:
+                                st.tokens.append(tok)
+                        st.n_seen = len(comp)
+                    if seq.is_finished:
+                        st.finish_reason = (
+                            "length" if seq.num_completion_tokens >= st.max_tokens
+                            else "stop"
+                        )
+                        st.finished = True
+                        st.event.set()
+                        done.append(seq.seq_id)
+                for seq_id in done:
+                    _active.pop(seq_id, None)
                 continue
-            done = []
-            for st in list(_active.values()):
-                seq = st.seq
-                comp = seq.completion_token_ids
-                if len(comp) > st.n_seen:
-                    for tok in comp[st.n_seen:]:
-                        if tok != _eos:
-                            st.tokens.append(tok)
-                    st.n_seen = len(comp)
-                if seq.is_finished:
-                    st.finish_reason = (
-                        "length" if seq.num_completion_tokens >= st.max_tokens
-                        else "stop"
-                    )
-                    st.finished = True
-                    st.event.set()
-                    done.append(seq.seq_id)
+            # 空转前清扫残留：stop 命中 / 客户端断连等路径会把 seq 置为 FINISHED，
+            # 但不经过上面的 fanout 分支（调度器已空时 is_finished() 恒真，分支不再
+            # 进入），残留的 _active 条目会造成 20Hz 空转轮询与小泄漏——统一在此清理。
+            done = [seq_id for seq_id, st in _active.items() if st.seq.is_finished]
             for seq_id in done:
                 _active.pop(seq_id, None)
+        _wakeup.wait(timeout=0.05)   # 仅空转时等待唤醒
+        _wakeup.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -152,8 +159,16 @@ def _run_llm(st, stop, emit):
 
     emit(delta_text) 在流式下逐 delta 调用；None 表示非流式。
     客户端断连（emit 抛 IOError）后继续跑完请求但不推送。
+    增量 detokenization：每次唤醒只解码新增 token 中能完整落在 UTF-8 字符
+    边界上的前缀（pending 携带跨字节残留），不再对全量 token 列表重解码
+    （旧实现每次唤醒 decode 整个 gen，O(n²)/请求，且在引擎线程释放窗口内
+    长时间持有 GIL）。finish 时仍做一次全量解码兜底，保证最终文本与旧
+    实现逐字节一致。
     """
+    if emit is None:    # 非流式：吞掉增量推送，只累积最终文本
+        emit = lambda _delta: None
     gen = []
+    pending = []        # 尚不能安全解码的 token 尾部（UTF-8 多字节边界残留）
     prev_text = ""
     final = ""
     reason = "stop"
@@ -178,9 +193,30 @@ def _run_llm(st, stop, emit):
             break
         if st.event.wait(timeout=0.05):
             st.event.clear()
-        gen.extend(_drain(st.tokens))
-        raw = _tokenizer.decode(gen, skip_special_tokens=True)
-        final, hit = _apply_stop(raw, stop)
+        new = _drain(st.tokens)
+        if not new:
+            continue    # 无新 token：跳过解码（上一轮文本已推送）
+        gen.extend(new)
+        pending.extend(new)
+        # 边界回退策略：整段 pending 解码若以替换符 \ufffd 结尾，说明末尾
+        # token 可能只覆盖了某个多字节字符的前半部分 —— 从尾部回退一个
+        # token 再试；单 token 仍不完整时整体留到下次唤醒（finish 全量
+        # 解码兜底）。字节级 BPE 下，安全边界两侧的 decode 结果与全量
+        # decode 逐字节一致（utf-8 自同步，errors=replace 只在非法边界生效）。
+        piece = ""
+        keep = len(pending)
+        while keep > 0:
+            text = _tokenizer.decode(pending[:keep], skip_special_tokens=True)
+            if text.endswith("\ufffd"):
+                keep -= 1    # 末尾 token 疑似跨字节字符的前半，回退
+                continue
+            piece = text
+            break
+        if not piece:
+            continue    # 全部残留：本轮无可安全推送的文本
+        del pending[:keep]
+        full = prev_text + piece
+        final, hit = _apply_stop(full, stop)
         if hit:
             _abort(st.seq)
             st.finished = True
@@ -497,6 +533,10 @@ def main():
     parser.add_argument("--max-num-seqs", type=int, default=None)
     parser.add_argument("--block-size", type=int, default=None,
                         help="KV block size（2 的幂，越小 prefix cache 粒度越细，需 CoreX kernel 支持）")
+    parser.add_argument("--spec-model", default="",
+                        help="EAGLE3 draft 模型目录（启用投机解码，需与 target 同词表的官方权重）")
+    parser.add_argument("--spec-num-tokens", type=int, default=4,
+                        help="每轮起草 token 数 k（draft depth）")
     parser.add_argument("--temperature", type=float, default=0.7)
     args = parser.parse_args()
 
@@ -510,9 +550,16 @@ def main():
         tensor_parallel_size=1,       # server 只支持 TP=1（引擎同进程驱动）
         max_model_len=args.max_model_len,
         backend=args.backend,
+        spec_model=args.spec_model,
+        spec_num_tokens=args.spec_num_tokens,
     )
     if args.max_num_seqs is not None:
         kwargs["max_num_seqs"] = args.max_num_seqs
+    else:
+        # 8GB 卡上大 max_num_seqs 的宽桶/宽 buffer 拖慢单步回放，实测 nospec
+        # 512→8 = 59.0→66.8 tok/s；需要更高并发的用户显式传 --max-num-seqs。
+        # spec 模式此前已默认 8（捕获池随 max_bs 增长），现统一。
+        kwargs["max_num_seqs"] = 8
     if args.block_size is not None:
         kwargs["kvcache_block_size"] = args.block_size
 
@@ -523,7 +570,9 @@ def main():
     _max_model_len = engine.model_runner.config.max_model_len
     _model_name = args.model.rstrip("/").rsplit("/", 1)[-1]
     print(f"model '{_model_name}' ready", flush=True)
-    print(f"eos={_eos} | eager={args.eager} | max_model_len={_max_model_len}", flush=True)
+    spec_info = f"ON(k={args.spec_num_tokens}, {args.spec_model.rstrip('/').rsplit('/', 1)[-1]})" if args.spec_model else "OFF"
+    ms_info = args.max_num_seqs if args.max_num_seqs is not None else 8
+    print(f"eos={_eos} | eager={args.eager} | spec={spec_info} | max_model_len={_max_model_len} | max_num_seqs={ms_info}", flush=True)
 
     threading.Thread(target=_engine_loop, daemon=True).start()
 
