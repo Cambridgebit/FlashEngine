@@ -16,6 +16,8 @@ class Config:
     # Qwen3Attention 整块保持 eager，实测仅约 8% 提速）。
     compile: bool = False
     backend: str = "auto"
+    # TP 初始化端口（init_method 的 tcp 端口；Ascend hccl 与 CUDA nccl 共用）。
+    hccl_port: int = 28000
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256

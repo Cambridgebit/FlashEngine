@@ -107,7 +107,16 @@ Nano-vLLM：从零实现的极简 vLLM（研究/学习用代码库，非生产�
 - 代码层已就绪：spec 路径硬件依赖已参数化到 backend；图捕获失败自动降级 eager。
 - **待实机验证**（本机无法测）：ixformer `flash_attn_varlen_func` 在虚构窗口/verify 路径的正确性；pinned memory + non_blocking H2D 行为。spec 图捕获现在会默认尝试（`supports_spec_graph=True`），成败由 `scripts/verify_corex.sh` 第 4 步实测（失败自动降级 eager spec，收益打折）。
 - CoreX 上收益预期需重估：verify 摊薄权重读取的结构性收益不变，但 ixformer kernel host 开销若偏大，chain/refill 占比上升，净收益可能低于 CUDA。
-- Ascend 预留：Tier-2 设备适配层接口位已就绪（backend.device 代理 / graph API 工厂 / pin 策略 / dist_name），接入新硬件时实现；多硬件方案全文见 .omo/plans/multi-hardware.md。
+- Ascend 310P：已实现并注册为第三后端（见下节；auto-detect 分支在 backends/__init__.py）；多硬件方案全文见 .omo/plans/multi-hardware.md。
+
+## Ascend 310P（Atlas 300I Duo / 200I Pro）适配状态
+
+- 代码层已就绪（tri-backend-fusion）：`backends/ascend.py`（Ascend310PBackend）+ 设备代理/图 API 工厂全后端收口（engine/layers 内 `torch.cuda.*`/`.cuda()` 零直呼）。技术来源：nanovllm-ascend 的 torch_npu 对接形态 + vllm-ascend 的 310P 硬件事实。
+- **能力矩阵**：decode 图 = NPUGraph 尝试+降级（310P 仅支持 decode-only 级捕获）；**spec 全路径 = ❌ 引擎层拒绝**（`supports_spec=False`：verify 恒传 block_tables → attention 层走整池 4D 分支，TND 算子不消费，首个 spec 轮即硬崩——出现 spec_model 配置时干净报错；paged-TND 适配后再开，vllm-ascend A2 已证 v2 算子支持 TND+block_table）；算子融合 = `npu_rms_norm`/`npu_add_rms_norm`/`npu_swiglu` 级（npu_swiglu 已入承重清单；Npugraph_ex 在 310P 不可用，融合只能做在算子层）；graph_sample 默认 False（NPU RNG 图安全性未验证，`NANOVLLM_GRAPH_SAMPLE=1` 可实验性强制；spec 图门默认同时要求 graph_sample_default）。三后端 × 两图种的完整真值表见 `backends/base.py` 头部注释。
+- **硬件硬规矩**：仅 fp16（ATB 算子不支持 bf16，引擎按 `default_dtype` 强制 + 加载时隐式转换）；不支持 triton（本引擎 ascend 路径不依赖 triton）；prefill causal mask 按 max_model_len 全量构建有 OOM 风险——勿依赖 max-model-len 自动探测；TP=1 目标形态（多卡受 event-id 限制，且 spec 本就 TP=1）。
+- **已知限制**：prefix cache 命中的 prefill 会把 k/v 换成整池 4D 切片（attention 层 prefix-hit 分支），TND 算子不消费该形态——与 nanovllm-ascend 参考实现同款；310P 上前缀命中负载（如 check_prefix_cache 的 warm 轮）预期在此崩溃，需 paged-TND 适配后解锁，勿当回归报。同分支也命中 spec verify（block_tables 恒传）——spec 全路径被引擎层拒绝的根因即此（见能力矩阵）。
+- **待实机验证**（本机无法测）：`bash scripts/verify_ascend310p.sh <target> <draft>` 环境预检 + 四步（eager prefix 回归[R1 cold 判据，warm 轮预期命中已知限制] → decode 图捕获 → spec 拒绝守卫 → TPS sweep）；步骤 0 探测四个载荷算子（`_npu_reshape_and_cache`/`npu_fused_infer_attention_score_v2`/`npu_add_rms_norm`/`npu_swiglu`）与 pinned allocator。
+- 环境钉（vllm-ascend 口径）：torch-npu==2.10.0.post4 / CANN 9.1.0 / 310p 专用镜像。
 
 ## 约定
 

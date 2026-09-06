@@ -66,10 +66,13 @@ def new_engine(model, eager, backend, max_model_len, max_num_seqs, block_size, c
 
 def close_engine(llm):
     atexit.unregister(llm.exit)
+    # 显存回收走 backend 代理（scripts 零硬件直呼：NPU-only 主机上
+    # torch.cuda.empty_cache() 会因 CUDA 初始化失败而崩）。
+    backend = llm.model_runner.backend
     llm.exit()
     del llm
     gc.collect()
-    torch.cuda.empty_cache()
+    backend.empty_cache()
 
 
 def run_seqs(llm, seqs):
@@ -190,7 +193,7 @@ def main():
     g = sub.add_parser("graph", help="batch size 下 eager vs CUDA Graph TPS/TTFT")
     g.add_argument("model")
     g.add_argument("--batch", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32])
-    g.add_argument("--backend", default="auto", choices=["auto", "cuda", "corex"])
+    g.add_argument("--backend", default="auto", choices=["auto", "cuda", "corex", "ascend310p"])
     g.add_argument("--compile", action="store_true",
                    help="torch.compile 编译模型（CoreX 上约 8% prefill 提速）")
     g.add_argument("--max-tokens", type=int, default=128)
@@ -200,7 +203,7 @@ def main():
 
     p = sub.add_parser("prefix", help="prefix cache 冷/热 TTFT 对比")
     p.add_argument("model")
-    p.add_argument("--backend", default="auto", choices=["auto", "cuda", "corex"])
+    p.add_argument("--backend", default="auto", choices=["auto", "cuda", "corex", "ascend310p"])
     p.add_argument("--compile", action="store_true",
                    help="torch.compile 编译模型（CoreX 上约 8% prefill 提速）")
     p.add_argument("--sys-tokens", type=int, default=1200, help="共享 system prompt 目标 token 数")

@@ -1,6 +1,7 @@
 import os
 import pickle
 import time
+import traceback
 from itertools import accumulate
 
 import torch
@@ -150,21 +151,35 @@ class ModelRunner:
         self.rank = rank
         self.event = event
         self.backend = get_backend()
+        # 设备语义串与 dtype 解析：后端强制 dtype（如 310P 仅 fp16）优先于 hf_config。
+        self.device = self.backend.device_name
+        self.dtype = self.backend.default_dtype or hf_config.dtype
         # EAGLE3 投机解码（仅 TP=1，见 config 断言）。
         self.spec_enabled = bool(config.spec_model)
+        if self.spec_enabled and not self.backend.supports_spec:
+            # spec 全路径不可用的后端在此干净拒绝（能力位裁决，不做 name 字符串
+            # 判断）：310P 上 verify 恒传 block_tables → attention 层走整池 4D
+            # 分支，TND 算子不消费——否则首个 spec 轮即硬崩，违背「只降速不崩溃」。
+            raise RuntimeError(
+                f'{self.backend.name} 后端暂不支持 spec：verify 的 paged KV 路径 '
+                f'TND 算子不消费（需 paged-TND 适配后再开，勿当回归报）——'
+                f'请去掉 spec_model 配置')
         # 每序列的 draft 种子隐层：fc(cat3 aux) 的输入，维度 [1, 3*hidden]。
         self.spec_hidden: dict[int, torch.Tensor] = {}
         # 每序列的 draft 流 carry：(row k 隐层, 首提案 token)。
         # 按 seq_id 存取（batch 顺序每轮可变，位置索引不安全）；冷启动轮由
         # eager 路径补齐。
         self.spec_carry: dict[int, tuple[torch.Tensor, int]] = {}
-        # 端到端 graph 采样：lm_head + sampler 捕获进 decode graph，replay 后
+        # 端到端 graph 采样：lm_head + sampler 捕获进 decode 图，replay 后
         # 直接读 token id（省每步图外 1 次 GEMV launch + 5 个 full-vocab kernel）。
-        # TP>1 时 lm_head 的 gather 不可捕获，自动退回图外；排障可用
-        # NANOVLLM_GRAPH_SAMPLE=0 关闭。
+        # 开关优先级：env 显式设置 > 后端默认（graph_sample_default，Ascend 起步
+        # 为 False——NPU RNG 图安全性未验证）；TP>1 时 lm_head 的 gather 不可
+        # 捕获，world_size==1 守卫无条件保留（env=1 不得绕过）。
+        _env_sample = os.environ.get("NANOVLLM_GRAPH_SAMPLE")
         self.graph_sample = (
             self.world_size == 1
-            and os.environ.get("NANOVLLM_GRAPH_SAMPLE", "1") != "0"
+            and (self.backend.graph_sample_default if _env_sample is None
+                 else _env_sample != "0")
         )
         # graph static buffer 的 padding 状态跟踪（仅 bs，见 run_model）。
         self._graph_bs_active = 0
@@ -184,11 +199,14 @@ class ModelRunner:
             [('ids', M), ('pos', M), ('slots', M), ('ctx', M), ('bt', M * W), ('topks', M)],
             [('temperatures', M), ('top_ps', M)])
 
-        dist.init_process_group(self.backend.dist_name, "tcp://localhost:2333", world_size=self.world_size, rank=rank)
-        torch.cuda.set_device(rank)
+        dist.init_process_group(self.backend.dist_name, f"tcp://localhost:{config.hccl_port}", world_size=self.world_size, rank=rank)
+        self.backend.set_device(rank)
         default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.dtype)
-        torch.set_default_device("cuda")
+        if self.backend.default_dtype is not None and self.backend.default_dtype != hf_config.dtype:
+            print(f'[nano-vllm] 后端 {self.backend.name} 强制 dtype={self.backend.default_dtype}'
+                  f'（hf_config 为 {hf_config.dtype}），权重将在加载时隐式转换', flush=True)
+        torch.set_default_dtype(self.dtype)
+        torch.set_default_device(self.backend.device_name)
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         if self.spec_enabled:
@@ -228,10 +246,16 @@ class ModelRunner:
         if not self.enforce_eager:
             if not self.spec_enabled:
                 self.capture_cudagraph()
-            elif (self.world_size == 1 and self.backend.supports_spec_graph
-                  and os.environ.get("NANOVLLM_SPEC_GRAPH", "1") != "0"):
-                # spec 解码路径 CUDA Graph（draft 链图 + verify 图，仅 TP=1 / CUDA）。
-                self.capture_spec_cudagraph()
+            else:
+                # spec 解码路径图捕获（draft 链图 + verify 图，仅 TP=1）。spec 图
+                # 无条件录 Gumbel 采样（forward_native），默认门同时要求
+                # graph_sample_default（RNG 图安全性未验证的后端不默认尝试）；
+                # NANOVLLM_SPEC_GRAPH 显式设置优先后端默认，可实验性覆盖。
+                _env_spec = os.environ.get("NANOVLLM_SPEC_GRAPH")
+                if (self.world_size == 1 and self.backend.supports_spec_graph
+                        and (_env_spec != "0" if _env_spec is not None
+                             else self.backend.graph_sample_default)):
+                    self.capture_spec_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -252,7 +276,7 @@ class ModelRunner:
                 self.shm.unlink()
         if self.graphs is not None:
             del self.graphs, self.graph_pool
-        torch.cuda.synchronize()
+        self.backend.synchronize()
         dist.destroy_process_group()
 
     def loop(self):
@@ -286,8 +310,8 @@ class ModelRunner:
         return method(*args)
 
     def warmup_model(self):
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
+        self.backend.empty_cache()
+        self.backend.reset_peak_memory_stats()
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
         seq_len = min(max_num_batched_tokens, max_model_len)
         num_seqs = min(max_num_batched_tokens // seq_len, self.config.max_num_seqs)
@@ -301,27 +325,29 @@ class ModelRunner:
             self.spec_hidden.clear()
         else:
             self.run(seqs, True)
-        torch.cuda.empty_cache()
+        self.backend.empty_cache()
 
     def allocate_kv_cache(self):
         config = self.config
         hf_config = config.hf_config
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * self.dtype.itemsize
         if self.spec_enabled:
             # draft KV cache 与 target 共用同一 block_table/slot 布局，预算一并扣除。
+            # 布局一致性由 backend.get_kv_cache_shape 保证（cuda/ascend=BSHD、corex=HND，
+            # 两模型同后端必同布局）；draft 槽位写入与 target 走同一 _slot_of 映射。
             d = self.draft_config
             draft_kv_heads = d.num_key_value_heads // self.world_size
             draft_head_dim = getattr(d, "head_dim", d.hidden_size // d.num_attention_heads)
-            block_bytes += 2 * d.num_hidden_layers * self.block_size * draft_kv_heads * draft_head_dim * hf_config.dtype.itemsize
+            block_bytes += 2 * d.num_hidden_layers * self.block_size * draft_kv_heads * draft_head_dim * self.dtype.itemsize
         # WSL 下上一进程退出后驱动回收显存存在数秒延迟，`used` 可能虚高；
         # 预算不足时短暂等待重测，而非直接断言崩溃。
         for _ in range(6):
-            free, total = torch.cuda.mem_get_info()
+            free, total = self.backend.mem_get_info()
             used = total - free
-            peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-            current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+            peak = self.backend.memory_stats()["allocated_bytes.all.peak"]
+            current = self.backend.memory_stats()["allocated_bytes.all.current"]
             config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
             if config.num_kvcache_blocks > 0:
                 break
@@ -368,7 +394,7 @@ class ModelRunner:
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
-        block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
         return block_tables
 
     def _slot_of(self, seq: Sequence, p: int) -> int:
@@ -415,13 +441,13 @@ class ModelRunner:
                 slot_mapping.extend(range(slot_start, slot_end))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
+        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
+        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
         # 槽位 dtype 由后端决定（CUDA int32 / CoreX int64），cu_seqlens 两后端均为 int32。
-        slot_mapping = torch.tensor(slot_mapping, dtype=self.backend.graph_slot_mapping_dtype(), pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        slot_mapping = torch.tensor(slot_mapping, dtype=self.backend.graph_slot_mapping_dtype(), pin_memory=True).to(self.device, non_blocking=True)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, block_size=self.block_size)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -457,17 +483,18 @@ class ModelRunner:
                                 context_lens=gv['context_lens'][:n],
                                 block_tables=gv['block_tables'][:n],
                                 max_context_len=self.config.max_model_len,
-                                use_cuda_graph=True)
+                                use_cuda_graph=True,
+                                block_size=self.block_size)
                 return gv['input_ids'][:n], gv['positions'][:n]
         # 无图回退：直接 H2D 出 staging 张量（槽位 dtype 随后端；ctx/block_table 两后端均 int32）
         with torch.inference_mode():
             slot_dtype = self.backend.graph_slot_mapping_dtype()
-            input_ids = ids_v[:n].cuda(non_blocking=True)
-            positions = pos_v[:n].cuda(non_blocking=True)
-            slot_mapping = slots_v[:n].cuda(non_blocking=True).to(slot_dtype)
-            context_lens = ctx_v[:n].cuda(non_blocking=True).to(torch.int32)
-            block_tables = bt[:n].cuda(non_blocking=True).to(torch.int32)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables, max_context_len=self.config.max_model_len)
+            input_ids = ids_v[:n].to(self.device, non_blocking=True)
+            positions = pos_v[:n].to(self.device, non_blocking=True)
+            slot_mapping = slots_v[:n].to(self.device, non_blocking=True).to(slot_dtype)
+            context_lens = ctx_v[:n].to(self.device, non_blocking=True).to(torch.int32)
+            block_tables = bt[:n].to(self.device, non_blocking=True).to(torch.int32)
+        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables, max_context_len=self.config.max_model_len, block_size=self.block_size)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence], is_prefill: bool = False):
@@ -489,9 +516,9 @@ class ModelRunner:
             return gv['temperatures'][:n], gv['top_ps'][:n], gv['top_ks'][:n]
         with torch.inference_mode():
             off = blob.offset('topks')
-            return (blob.f32[:n].cuda(non_blocking=True),
-                    blob.f32[M:M + n].cuda(non_blocking=True),
-                    blob.i64[off:off + n].cuda(non_blocking=True))
+            return (blob.f32[:n].to(self.device, non_blocking=True),
+                    blob.f32[M:M + n].to(self.device, non_blocking=True),
+                    blob.i64[off:off + n].to(self.device, non_blocking=True))
 
     @torch.inference_mode()
     def run_model(
@@ -684,23 +711,24 @@ class ModelRunner:
 
         # ---- 采样行引导（冷/热一致，与旧 eager 实现逐位相同） ----
         draft_vocab = self.draft_config.draft_vocab_size
-        temperatures = torch.tensor([seq.temperature for seq in seqs], dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
-        top_ps = torch.tensor([seq.top_p for seq in seqs], dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
+        temperatures = torch.tensor([seq.temperature for seq in seqs], dtype=torch.float32, pin_memory=True).to(self.device, non_blocking=True)
+        top_ps = torch.tensor([seq.top_p for seq in seqs], dtype=torch.float32, pin_memory=True).to(self.device, non_blocking=True)
         # draft 采样在 draft 词表上，top_k 上限相应取 draft 词表大小。
         top_ks_draft = torch.tensor(
             [seq.top_k if 0 < seq.top_k < draft_vocab else draft_vocab for seq in seqs],
-            dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
         h_seed = torch.cat([self.spec_hidden[seq.seq_id] for seq in seqs], dim=0)
         seed = self.draft_model.project_aux(h_seed)
         slot_dtype = self.backend.graph_slot_mapping_dtype()
-        p = torch.tensor([l - 2 for l in lens], dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        ctx = torch.tensor([l - 1 for l in lens], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        p = torch.tensor([l - 2 for l in lens], dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
+        ctx = torch.tensor([l - 1 for l in lens], dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
         slots = torch.tensor([[self._slot_of(seq, l - 2)] for seq, l in zip(seqs, lens)],
-                             dtype=slot_dtype, pin_memory=True).cuda(non_blocking=True)
-        tokens = torch.tensor([seq.last_token for seq in seqs], dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+                             dtype=slot_dtype, pin_memory=True).to(self.device, non_blocking=True)
+        tokens = torch.tensor([seq.last_token for seq in seqs], dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
         set_context(False, slot_mapping=slots, context_lens=ctx,
                     block_tables=self.prepare_block_tables(seqs),
-                    max_context_len=self.config.max_model_len)
+                    max_context_len=self.config.max_model_len,
+                    block_size=self.block_size)
         row_m_hidden, draft_logits = self.draft_model.forward_decode(p, seed, tokens)
         row_m_hidden = row_m_hidden.clone()
         draft_ids = self.sampler.forward_native(draft_logits, temperatures, top_ps, top_ks_draft)
@@ -743,7 +771,7 @@ class ModelRunner:
             metaf=self._sblob.device_f32(),
             # draft 链静态 buffer；carry_seed 为上一轮 refill 采样行（row k）的
             # midlayer 输出（TTT 链种子），drafted_ids[0] 为其采样的首个提案。
-            carry_seed=torch.zeros(max_bs, hf_config.hidden_size, dtype=hf_config.dtype),
+            carry_seed=torch.zeros(max_bs, hf_config.hidden_size, dtype=self.dtype),
             chain_tokens=torch.zeros(max_bs, dtype=torch.int64),
             drafted_ids=torch.zeros(k, max_bs, dtype=torch.int64),
             chain_pos=torch.zeros(k, max_bs, dtype=torch.int64),
@@ -764,7 +792,7 @@ class ModelRunner:
             v_temps=torch.ones(max_bs * rows, dtype=torch.float32),
             v_topps=torch.ones(max_bs * rows, dtype=torch.float32),
             v_topks=torch.full((max_bs * rows,), vocab, dtype=torch.int64),
-            v_aux=torch.zeros(max_bs * rows, hf_config.hidden_size * 3, dtype=hf_config.dtype),
+            v_aux=torch.zeros(max_bs * rows, hf_config.hidden_size * 3, dtype=self.dtype),
             v_token_ids=torch.zeros(max_bs * rows, dtype=torch.int64),
             # 接受/提交输出（cnt 打包在最后一列，每轮仅一次 D2H）
             commit_buf=torch.full((max_bs, rows + 1), -1, dtype=torch.int64),
@@ -809,7 +837,8 @@ class ModelRunner:
                     context_lens=g['chain_ctxlen'][1][:bs],
                     block_tables=g['chain_btables'][:bs],
                     max_context_len=self.config.max_model_len,
-                    use_cuda_graph=use_cuda_graph)
+                    use_cuda_graph=use_cuda_graph,
+                    block_size=self.block_size)
         seed = g['carry_seed'][:bs]
         for i in range(1, k):
             if i > 1:
@@ -818,7 +847,8 @@ class ModelRunner:
                             context_lens=g['chain_ctxlen'][i][:bs],
                             block_tables=g['chain_btables'][:bs],
                             max_context_len=self.config.max_model_len,
-                            use_cuda_graph=use_cuda_graph)
+                            use_cuda_graph=use_cuda_graph,
+                            block_size=self.block_size)
             seed, logits = self.draft_model.forward_decode(
                 g['chain_pos'][i][:bs], seed, g['drafted_ids'][i - 1][:bs])
             ids = self.sampler.forward_native(
@@ -837,7 +867,8 @@ class ModelRunner:
                     max_seqlen_q=rows,
                     max_seqlen_k=self.config.max_model_len,
                     slot_mapping=g['v_slots'][:bs * rows],
-                    block_tables=g['v_btables'][:bs])
+                    block_tables=g['v_btables'][:bs],
+                    block_size=self.block_size)
         hidden, aux = self.model(g['v_input_ids'][:bs * rows], g['v_positions'][:bs * rows])
         logits = F.linear(hidden, self.model.lm_head.weight)
         g['v_token_ids'][:bs * rows] = self.sampler.forward_native(
@@ -886,7 +917,8 @@ class ModelRunner:
                     max_seqlen_q=rows,
                     max_seqlen_k=self.config.max_model_len,
                     slot_mapping=g['v_slots'][:bs * rows],
-                    block_tables=g['v_btables'][:bs])
+                    block_tables=g['v_btables'][:bs],
+                    block_size=self.block_size)
         h = self.draft_model.forward_prefill(
             g['v_positions'][:bs * rows], seed_r, ids_r)
         h_m = h.view(bs, rows, -1).gather(
@@ -925,25 +957,26 @@ class ModelRunner:
                 g['v_cu_k'][:bs + 1] = g['v_cu_q'][:bs + 1]
                 self._sg_round(bs, use_cuda_graph=True)
                 reset_context()
-                torch.cuda.synchronize()
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph, pool=self.spec_graph_pool):
+                self.backend.synchronize()
+                graph = self.backend.new_graph()
+                with self.backend.graph_ctx(graph, pool=self.spec_graph_pool):
                     self._sg_round(bs, use_cuda_graph=True)
                 if self.spec_graph_pool is None:
                     self.spec_graph_pool = graph.pool()
                 self.spec_graphs[bs] = graph
                 reset_context()
-                torch.cuda.synchronize()
+                self.backend.synchronize()
         except Exception as e:
             # 后端不支持图捕获（如部分 vendor kernel 含 host 同步/动态 workspace）
             # 时优雅降级：spec_round 自动回落到同构 eager 轮，功能不受影响。
             print(f'[nano-vllm] spec CUDA Graph 捕获失败，降级为 eager spec 轮：'
                   f'{type(e).__name__}: {e}', flush=True)
+            traceback.print_exc()
             reset_context()
-            torch.cuda.synchronize()
+            self.backend.synchronize()
             self.spec_graphs = None
             self.spec_graph_pool = None
-            torch.cuda.empty_cache()
+            self.backend.empty_cache()
 
     @torch.inference_mode()
     def _spec_round_graph(self, seqs: list[Sequence], bucket: int) -> list[list[int]]:
@@ -992,7 +1025,7 @@ class ModelRunner:
             input_ids, positions = io[:max_bs], io[max_bs:]
             slot_mapping, context_lens = sc[:max_bs], sc[max_bs:]
             block_tables = torch.full((max_bs, max_num_blocks), -1, dtype=torch.int32)
-            outputs = torch.zeros(max_bs, hf_config.hidden_size, dtype=hf_config.dtype)
+            outputs = torch.zeros(max_bs, hf_config.hidden_size, dtype=self.dtype)
             temperatures = torch.ones(max_bs, dtype=torch.float32)
             top_ps = torch.ones(max_bs, dtype=torch.float32)
             top_ks = torch.full((max_bs,), hf_config.vocab_size, dtype=torch.int64)
@@ -1022,7 +1055,7 @@ class ModelRunner:
                 top_ps[:bs].copy_(topps_d[:bs])
 
             for bs in reversed(self.graph_bs):
-                graph = torch.cuda.CUDAGraph()
+                graph = self.backend.new_graph()
                 # Graph Context 必须静态：max_context_len 用 config.max_model_len，
                 # 不要用 context_lens.max().item()（capture 后不可变 python 整数）。
                 set_context(
@@ -1032,6 +1065,7 @@ class ModelRunner:
                     block_tables=block_tables[:bs],
                     max_context_len=config.max_model_len,
                     use_cuda_graph=True,
+                    block_size=self.block_size,
                 )
                 # Warmup：IXFormer kernel lazy init / workspace / torch.compile
                 # 必须在正式 capture 前完成。graph_sample 路径把 lm_head + sampler
@@ -1044,8 +1078,8 @@ class ModelRunner:
                         self.model.compute_logits(hidden), temperatures[:bs], top_ps[:bs], top_ks[:bs])
                 else:
                     outputs[:bs] = hidden
-                torch.cuda.synchronize()
-                with torch.cuda.graph(graph, pool=self.graph_pool):
+                self.backend.synchronize()
+                with self.backend.graph_ctx(graph, pool=self.graph_pool):
                     scatter(bs)
                     hidden = self.model(input_ids[:bs], positions[:bs])    # capture
                     if self.graph_sample:
@@ -1056,7 +1090,7 @@ class ModelRunner:
                 if self.graph_pool is None:
                     self.graph_pool = graph.pool()
                 self.graphs[bs] = graph
-                torch.cuda.synchronize()
+                self.backend.synchronize()
                 reset_context()
 
             self.graph_vars = dict(
@@ -1082,8 +1116,9 @@ class ModelRunner:
             # 分支），与 spec 捕获的降级策略一致。
             print(f'[nano-vllm] decode CUDA Graph 捕获失败，降级为 eager：'
                   f'{type(e).__name__}: {e}', flush=True)
+            traceback.print_exc()
             reset_context()
-            torch.cuda.synchronize()
+            self.backend.synchronize()
             self.graphs = None
             self.graph_pool = None
-            torch.cuda.empty_cache()
+            self.backend.empty_cache()

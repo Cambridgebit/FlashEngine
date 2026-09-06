@@ -16,15 +16,17 @@ class Context:
     # CUDA Graph capture 期间置 True（capture 后由 graph.replay() 驱动，
     # 不再走 python）；普通 eager decode 保持 False。
     use_cuda_graph: bool = False
+    # KV block 大小：npu 融合算子 decode 路径消费；CUDA 路径无读者，恒传值无害。
+    block_size: int = 0
 
 _CONTEXT = Context()
 
 def get_context():
     return _CONTEXT
 
-def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None, context_lens=None, block_tables=None, max_context_len=None, use_cuda_graph=False):
+def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None, context_lens=None, block_tables=None, max_context_len=None, use_cuda_graph=False, block_size=0):
     global _CONTEXT
-    _CONTEXT = Context(is_prefill, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, context_lens, block_tables, max_context_len, use_cuda_graph)
+    _CONTEXT = Context(is_prefill, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, context_lens, block_tables, max_context_len, use_cuda_graph, block_size)
 
 def reset_context():
     global _CONTEXT

@@ -8,7 +8,7 @@
 
 - **EAGLE3 投机解码**：draft 链式起草 + target 单次验证 + **spec 单图整轮**（每轮 2 次 H2D + 1 次 D2H）
 - **两级 CUDA Graph**：decode 单步图（图内采样）+ spec 整轮图；捕获失败自动降级 eager，只降速不崩溃
-- **多硬件 backend**：NVIDIA CUDA（已实证）/ 天数智芯 CoreX（代码就绪待实机）/ Ascend 预留接口位
+- **多硬件 backend**：NVIDIA CUDA（已实证）/ 天数智芯 CoreX（代码就绪待实机）/ 华为 Ascend 310P（代码就绪待实机）
 - **OpenAI 兼容 server**：continuous batching + SSE 流式，纯 stdlib 零新依赖，支持投机
 
 > 开发约定、实测数据明细与「勿回退」清单见 [AGENTS.md](AGENTS.md)。
@@ -58,7 +58,7 @@ nanovllm/
 │   ├── qwen3.py            # target 模型（aux 隐层捕获）
 │   └── eagle3.py           # EAGLE3 draft（官方 cnets 链式推理等价实现）
 ├── layers/                 # attention / activation / embed_head / layernorm / linear / rope / sampler
-├── backends/               # base 接口 ← cuda / corex
+├── backends/               # base 接口 ← cuda / corex / ascend310p
 └── utils/                  # context 全局上下文 + 权重加载
 scripts/
 ├── benchmark.py            # graph / prefix 吞吐基准
@@ -66,7 +66,8 @@ scripts/
 ├── check_prefix_cache.py   # prefix cache 数值回归门（退出码非零 = FAIL）
 ├── stream_bench.py         # Cherry 式流式基准（TTFB / usage 断言 / median 表 / 自测）
 ├── openai_server.py        # OpenAI 兼容 server
-└── verify_corex.sh         # CoreX 实机五步验证清单
+├── verify_corex.sh         # CoreX 实机五步验证清单
+└── verify_ascend310p.sh    # Ascend 310P 实机验证清单（环境预检+载荷算子探测+四步）
 ```
 
 ## 架构
@@ -82,7 +83,7 @@ API 层    LLM（generate → add_request → step 循环）
           → CUDA Graph | eager → 读回（每轮 1 次 D2H）
 模型层    Qwen3ForCausalLM（target）/ Eagle3DraftModel（draft，共享词表）
 算子层    Attention / RMSNorm / Linear(TP) / Embedding / RoPE / MLP / Sampler
-硬件层    backends/：CUDABackend（flash-attn + triton）/ CoreXBackend（ixformer）
+硬件层    backends/：CUDABackend（flash-attn + triton）/ CoreXBackend（ixformer）/ Ascend310PBackend（torch_npu）
 ```
 
 层间仅三种耦合，无横向越级调用：
@@ -138,26 +139,26 @@ decode 图失败 → 全 eager 前向——任何失败只降速，不崩溃。
 
 ## 多硬件适配
 
-切换：`LLM(..., backend="corex")` / `NANOVLLM_BACKEND=corex` / 自动探测（`torch.corex` 标记）。
+切换：`LLM(..., backend="cuda|corex|ascend310p")` / `NANOVLLM_BACKEND=<同名>` / 自动探测（`torch.corex` 标记 → corex；`torch.npu` 存在且可用 → ascend310p；否则 cuda）。
 厂商差异全部收在 `BackendBase` 的方法与能力声明里，业务代码零感知：
 
-| 抽象点 | CUDA | CoreX |
-|---|---|---|
-| KV 布局 | 连续 [2,L,B,S,H,D] | HND [2,L,B,H,S,D] |
-| 图 slot dtype | int32 | int64 |
-| KV 写入 / attention | triton + flash-attn | ixformer（vendor .so） |
-| spec 图捕获 | 已实证 | 尝试 + 失败自动降级 |
-| TP `dist_name` | nccl | nccl（厂商兼容层） |
+| 抽象点 | CUDA | CoreX | Ascend 310P |
+|---|---|---|---|
+| KV 布局 | 连续 [2,L,B,S,H,D] | HND [2,L,B,H,S,D] | 同 CUDA |
+| 图 slot dtype | int32 | int64 | int32 |
+| KV 写入 / attention | triton + flash-attn | ixformer（vendor .so） | torch_npu（`_npu_reshape_and_cache` + TND prefill / BNSD decode） |
+| spec 图捕获 | 已实证 | 尝试 + 失败自动降级 | ❌ 引擎层拒绝（paged-TND 待后续） |
+| TP `dist_name` | nccl | nccl（厂商兼容层） | hccl |
 
 - **CoreX 状态**：代码就绪、硬件差异已参数化，**待实机验证**——
   `bash scripts/verify_corex.sh <target> <draft>` 五步清单（decode 图回归 → graph_sample 对照 →
   spec eager E → spec 图捕获尝试 → TPS sweep）。
-- **Ascend**：Tier-2 设备代理层接口位已预留（backend.device / graph API 工厂 / pin 策略），方案见 AGENTS.md。
+- **Ascend 310P 状态**：代码就绪（torch_npu 懒加载+承重算子守卫、设备代理 `torch.npu.*`、NPUGraph 图工厂、NPU 融合算子），**待实机验证**——`bash scripts/verify_ascend310p.sh <target> <draft>`。已知限制：prefix 命中 prefill 的 k/v=整池 4D 切片，TND 算子不消费（与参考实现同款，需 paged-TND 后续适配）——spec 全路径因此被引擎层拒绝（`supports_spec=False`）。
 
 ## 环境变量
 
 | 变量 | 作用 |
 |---|---|
-| `NANOVLLM_BACKEND` | 强制后端：cuda / corex（默认 auto 探测） |
+| `NANOVLLM_BACKEND` | 强制后端：cuda / corex / ascend310p（默认 auto 探测） |
 | `NANOVLLM_SPEC_GRAPH=0` | 关闭 spec 整轮图（强制 eager spec 轮） |
 | `NANOVLLM_GRAPH_SAMPLE=0` | 关闭 decode 图内采样（采样回图外） |

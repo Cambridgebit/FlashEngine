@@ -90,10 +90,13 @@ def _run_engine(model, backend, eager, block_size, prompts, max_tokens, max_mode
         return outs, llm.scheduler.block_manager.get_prefix_stats()
     finally:
         atexit.unregister(llm.exit)
+        # 显存回收走 backend 代理（scripts 零硬件直呼：NPU-only 主机上
+        # torch.cuda.empty_cache() 会因 CUDA 初始化失败而崩）。
+        backend = llm.model_runner.backend
         llm.exit()
         del llm
         gc.collect()
-        torch.cuda.empty_cache()
+        backend.empty_cache()
 
 
 def _report(name, outs, stats, sys_len, p1_len, p2_len):
@@ -118,7 +121,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="prefix cache correctness & hit-rate check (agent workflow)")
     parser.add_argument("model", help="model directory path")
-    parser.add_argument("--backend", default="auto", choices=["auto", "cuda", "corex"])
+    parser.add_argument("--backend", default="auto", choices=["auto", "cuda", "corex", "ascend310p"])
     parser.add_argument("--graph", action="store_true", help="额外验证 CUDA Graph 模式")
     parser.add_argument("--block-size", type=int, default=256)
     parser.add_argument("--sys-tokens", type=int, default=1200, help="system prompt 目标 token 数")
