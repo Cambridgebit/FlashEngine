@@ -10,6 +10,16 @@ from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
+# Qwen3 系 packed 权重重映射（q/k/v → qkv_proj 分片、gate/up → gate_up_proj 分片）。
+# target 与 EAGLE3 draft 共用（draft midlayer 的 self_attn / mlp 同命名约定）。
+PACKED_MODULES_MAPPING = {
+    "q_proj": ("qkv_proj", "q"),
+    "k_proj": ("qkv_proj", "k"),
+    "v_proj": ("qkv_proj", "v"),
+    "gate_proj": ("gate_up_proj", 0),
+    "up_proj": ("gate_up_proj", 1),
+}
+
 
 class Qwen3Attention(nn.Module):
 
@@ -208,13 +218,7 @@ class Qwen3Model(nn.Module):
 
 
 class Qwen3ForCausalLM(nn.Module):
-    packed_modules_mapping = {
-        "q_proj": ("qkv_proj", "q"),
-        "k_proj": ("qkv_proj", "k"),
-        "v_proj": ("qkv_proj", "v"),
-        "gate_proj": ("gate_up_proj", 0),
-        "up_proj": ("gate_up_proj", 1),
-    }
+    packed_modules_mapping = PACKED_MODULES_MAPPING
 
     def __init__(
         self,

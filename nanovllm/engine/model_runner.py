@@ -228,10 +228,9 @@ class ModelRunner:
             # spec 解码缓冲在启用时即分配：eager 轮统一复用图轮 body（_sg_round），
             # 捕获被跳过/失败时缓冲仍需存在；须在 allocate_kv_cache 之后，保持
             # kv 预算计算不含本缓冲（与基线一致）。
-            self._spin_M, self._spin_W = self._graph_max_bs, self._max_num_blocks + 1
             k = self.config.spec_num_tokens
             rows = k + 1
-            M, W = self._spin_M, self._spin_W
+            M, W = self._pin_M, self._pin_W
             # spec 热路径 pinned 元数据 blob（段名/顺序/尺寸与旧 _meta_off/_metaf_off
             # 逐一对应；每轮 2 次 H2D，零 cudaHostAlloc）。
             self._sblob = MetaBlob(
@@ -526,7 +525,6 @@ class ModelRunner:
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         is_prefill: bool,
-        sample: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
     ) -> tuple[torch.Tensor, bool]:
         """端到端 graph 路径返回 (token_ids, True)，其余返回 (logits, False)。"""
         # FULL_DECODE_ONLY：prefill 永远 eager；只有 decode 走 CUDA Graph。
@@ -556,7 +554,7 @@ class ModelRunner:
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         sample = self.prepare_sample(seqs, is_prefill) if self.rank == 0 else None
-        result, sampled = self.run_model(input_ids, positions, is_prefill, sample)
+        result, sampled = self.run_model(input_ids, positions, is_prefill)
         if self.rank == 0:
             token_ids = (result.tolist() if sampled
                          else self.sampler(result, *sample).tolist())
@@ -618,7 +616,7 @@ class ModelRunner:
         n = len(seqs)
         lens = [len(seq) for seq in seqs]
         blob = self._sblob
-        M, W = self._spin_M, self._spin_W
+        M, W = self._pin_M, self._pin_W
         draft_vocab = self.draft_config.draft_vocab_size
         vocab = self.config.hf_config.vocab_size
         chain_tokens = blob.view_i64('chain_tokens')
@@ -762,13 +760,12 @@ class ModelRunner:
         hf_config = self.config.hf_config
         vocab = hf_config.vocab_size
         draft_vocab = self.draft_config.draft_vocab_size
-        max_num_blocks = (self.config.max_model_len + self.block_size - 1) // self.block_size + 1
+        # bt 宽度含 +1 余量，与 decode 图捕获的 block_tables 一致（_pin_W）。
+        max_num_blocks = self._pin_W
         # 槽位 dtype 由后端决定（CUDA int32 / CoreX int64）；ctx/cu_seqlens/
         # block_table 两后端均为 int32；meta blob 统一存 int64，图内 copy_ 自动转型。
         slot_dtype = self.backend.graph_slot_mapping_dtype()
         return dict(
-            meta=self._sblob.device_i64(),
-            metaf=self._sblob.device_f32(),
             # draft 链静态 buffer；carry_seed 为上一轮 refill 采样行（row k）的
             # midlayer 输出（TTT 链种子），drafted_ids[0] 为其采样的首个提案。
             carry_seed=torch.zeros(max_bs, hf_config.hidden_size, dtype=self.dtype),
@@ -804,7 +801,7 @@ class ModelRunner:
         k = self.config.spec_num_tokens
         rows = k + 1
         blob = self._sblob
-        M, W = self._spin_M, self._spin_W
+        M, W = self._pin_M, self._pin_W
         g['chain_tokens'][:bs].copy_(blob.device_view_i64('chain_tokens')[:bs])
         cp = blob.device_view_i64('chain_pos', (k, M))
         cc = blob.device_view_i64('chain_ctxlen', (k, M))
@@ -986,7 +983,7 @@ class ModelRunner:
         if bucket < self._spec_graph_active:
             k = self.config.spec_num_tokens
             rows = k + 1
-            M, W = self._spin_M, self._spin_W
+            M, W = self._pin_M, self._pin_W
             blob = self._sblob
             cp = blob.view_i64('chain_pos', (k, M))
             cc = blob.view_i64('chain_ctxlen', (k, M))
@@ -1016,8 +1013,8 @@ class ModelRunner:
             hf_config = config.hf_config
             max_bs = self._graph_max_bs
             # + 1：runtime block_tables 宽度可能比 capture 时更宽
-            # （nano-vLLM 公开 bug），static buffer 直接留出余量。
-            max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size + 1
+            # （nano-vLLM 公开 bug），static buffer 直接留出余量（_pin_W）。
+            max_num_blocks = self._pin_W
             # 同 dtype 的输入合并为一块连续 buffer，prepare 阶段可单次 H2D 直写。
             io = torch.zeros(2 * max_bs, dtype=torch.int64)
             sc = torch.zeros(max_bs, dtype=self.backend.graph_slot_mapping_dtype())
@@ -1098,11 +1095,6 @@ class ModelRunner:
                 reset_context()
 
             self.graph_vars = dict(
-                M=max_bs,
-                io=io,
-                sc=sc,
-                dmeta=self._dblob.device_i64(),
-                dmetaf=self._dblob.device_f32(),
                 block_tables=block_tables,
                 outputs=outputs,
                 top_ks=top_ks,

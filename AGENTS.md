@@ -103,12 +103,12 @@ Nano-vLLM：从零实现的极简 vLLM（研究/学习用代码库，非生产�
 - 口径：ours 用 check_eagle3 同款 kwargs（max_model_len 4096 / max_num_seqs 8 / kvcache_block_size 256，E 直方图 monkey-patch spec_round）；initial 同构（其 SamplingParams 不支持 temp0，用 1e-9 近似 greedy）；vLLM 用 `LLM(max_model_len=2048, max_num_seqs=8, gpu_memory_utilization=0.85)`（graphs 默认 FULL_AND_PIECEWISE），vllm-spec 加 `speculative_config={'method':'eagle3','model':<draft>,'num_speculative_tokens':3}`（离线 LLM 传 dict；serve CLI 传 JSON 字符串）。
 - spec 结构收益两引擎一致：ours 108.7/66.2 = 1.64×，vllm 125.6/69.5 = 1.81×；E=2.095 与历史锚点完全一致。ours decode 距 initial 0.97（66.2 vs 68.2，采样修复后从 0.92 收窄）、距 vllm decode 0.95（66.2 vs 69.5）——残差 ~3-5% 与流式配对口径一致（GEMM 异常已复检排除，见流式节），不是 spec 路径特有的。
 
-### vllm bench serve 在线口径 vs benchmark jsonl（可比性约定，2026-09）
+### vllm bench serve 在线口径 vs benchmark jsonl（2026-09 对齐后可直接同表）
 
-- **TPS 数字同构可直接同表**：vllm bench 的 Output token throughput = Σ输出 token / 总墙钟（含 prefill、串行、temp0、warmup 同构）≈ jsonl 的 AGG TPS 口径。
-- **四前提**：① vLLM server 显式开 spec——bench 只是 client，未配 `--speculative-config '{"method":"eagle3","model":<draft>,"num_speculative_tokens":3}'` 测的就是纯 decode；② prompt 口径——completions 发 raw 文本（无 chat template），jsonl 是 chat template（enable_thinking=False）：decode TPS 对内容不敏感大致可比，**spec TPS 强依赖 E 不可直接比**；③ TTFT 为 client 端口径（含 HTTP 往返），比进程内高几 ms 只比趋势；④ 确认 vLLM server 与引擎同硬件（跨机对比只是参考）。
-- **自查**：逐条 output len 对照 jsonl log 的 tok 列（明显不同 = prompt 不同源）；server 日志 SpecDecoding accept length 指标确认 spec 已生效。
-- **最干净对法**：同一 vllm bench client 打两个 server（vLLM server vs 本引擎 openai_server——后者 completions 对 raw prompt 直接 encode，与 vLLM completions 行为一致，协议税一致）。benchmark jsonl 三配置（CoreX 实测 8.1/76.5/104.1）是引擎直调口径，**两套口径不混表**。
+- **vllm bench spec_bench 真实口径（读 vllm-env 0.26 bench 源码核对，旧记载有误已修正）**：prompt **不是 raw 文本**——`CustomDataset.sample`（SpecBench 继承）对 prompt **套 chat template**（`tokenize=False` 字符串、不传 kwargs → Qwen3 默认 enable_thinking）后发 completions；数据集加载即 `random.seed(--seed)`+shuffle 取前 N（`--seed` 默认 0）；输出上限 = `--spec-bench-output-len` 默认 **256**；预热 = 就绪检查 1 次 + `--num-warmups 5` 次同一首条 prompt（均不计指标）。
+- **jsonl 已同构复刻（默认即对齐）**：① prompt 构造——模板字符串再 encode（V1.8 的 `--raw-prompt` 已随对齐删除）；② 采样——`--seed` 默认 0 + shuffle（`-1`=文件序「前 N 条」历史口径），同 seed 即同 prompt 集；③ `--max-tokens` 默认 256；④ `--warmup` 默认 5、统一打 qs[0]；⑤ 吞吐改**单墙钟**（Σtokens / 主跑总墙钟，含逐条 tokenize/打印）= vllm Output token throughput 同口径。**同 seed → 同 prompt 集 → E 相同 → spec TPS 可直接同表**（原「spec TPS 强依赖 E 不可直接比」结论作废）。
+- **残余口径差**：① TTFT——vllm 为 client 端（HTTP 往返，高几 ms），jsonl 为进程内，只比趋势；② vllm 侧 client 协议税（逐 chunk SSE 解析在其计时窗内，实测 ~1-4%）使 vllm TPS 天然偏低；③ EOS 计数差 1 token/条（<1%）。其余前提不变：vLLM server 显式开 spec（bench 只是 client）、确认同硬件。
+- **历史口径回溯**：旧 jsonl 数字（如 CoreX 三配置 8.1/76.5/104.1）= 文件序前 N + token 化模板（enable_thinking=False）+ 512 + warm 3 + 分墙钟——`--seed -1 --max-tokens 512 --warmup 3` 近似重现；E=2.095 锚点的精确复现走 check_eagle3 家族口径（未动）。
 
 ## CoreX（Iluvatar）移植状态——实机验证通过（2026-09，32GB 板卡 / corex-4.4.0 / Python 3.10 / transformers 4.57.6）
 

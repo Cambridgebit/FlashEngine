@@ -22,7 +22,7 @@ class Scheduler:
     def add(self, seq: Sequence):
         self.waiting.append(seq)
 
-    def schedule(self, spec_decode: bool = False) -> tuple[list[Sequence], bool]:
+    def schedule(self) -> tuple[list[Sequence], bool]:
         scheduled_seqs = []
         num_batched_tokens = 0
 
@@ -55,10 +55,6 @@ class Scheduler:
             return scheduled_seqs, True
 
         # decode
-        # 投机解码：block 容量由 prepare_spec_round 预分配，此处不做 can_append/may_append。
-        if spec_decode:
-            assert self.running
-            return list(self.running), False
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
             while not self.block_manager.can_append(seq):

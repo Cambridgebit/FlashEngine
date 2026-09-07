@@ -25,6 +25,7 @@ from nanovllm.layers.linear import (
 )
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.rotary_embedding import get_rope
+from nanovllm.models.qwen3 import PACKED_MODULES_MAPPING
 from nanovllm.utils.loader import default_weight_loader
 
 
@@ -132,13 +133,7 @@ class Qwen3AttentionModule(nn.Module):
 
 class Eagle3DraftModel(nn.Module):
 
-    packed_modules_mapping = {
-        "q_proj": ("qkv_proj", "q"),
-        "k_proj": ("qkv_proj", "k"),
-        "v_proj": ("qkv_proj", "v"),
-        "gate_proj": ("gate_up_proj", 0),
-        "up_proj": ("gate_up_proj", 1),
-    }
+    packed_modules_mapping = PACKED_MODULES_MAPPING
 
     def __init__(self, config, target_embed_tokens: nn.Module) -> None:
         super().__init__()
