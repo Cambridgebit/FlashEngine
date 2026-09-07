@@ -7,18 +7,16 @@ Nano-vLLM：从零实现的极简 vLLM（研究/学习用代码库，非生产�
 脚本需要**本地模型目录**（不能用 HuggingFace hub id）和 CUDA 兼容 GPU（NVIDIA，或 Iluvatar + `corex` 后端）。本机（RTX 4070 Laptop 8GB / WSL2）实际使用 `~/vllm-env/bin/python3`（Python 3.12, torch 2.11, transformers 5.15）：
 
 ```bash
-~/vllm-env/bin/python3 -m scripts.benchmark graph   /path/to/Qwen3-1.7B [--batch 1 2 4 8] [--backend corex]
-~/vllm-env/bin/python3 -m scripts.benchmark prefix  /path/to/Qwen3-1.7B [--backend corex]
-~/vllm-env/bin/python3 -m scripts.check_prefix_cache /path/to/Qwen3-1.7B [--graph] [--backend corex]
-~/vllm-env/bin/python3 -m scripts.check_eagle3 /path/to/Qwen3-1.7B --draft /path/to/Qwen3-1.7B-EAGLE3 [--num-prompts 10]
+~/vllm-env/bin/python3 -m scripts.benchmark /path/to/Qwen3-1.7B [--spec-model <draft 目录>] [--backend corex]
 ~/vllm-env/bin/python3 -m scripts.openai_server /path/to/Qwen3-1.7B [--port 8000] [--eager] [--spec-model <draft 目录>] [--spec-num-tokens k]
 ```
 
+- **2026-09 精简**：benchmark 仅保留 question.jsonl 串行基准（vllm bench serve 对齐口径不变：seed shuffle / chat template / warmup 首条 / 单墙钟）；`benchmark graph|prefix` 子命令与 `check_eagle3` / `check_prefix_cache` / `verify_corex.sh` / `verify_ascend310p.sh` 已删除——文中历史锚点（E=2.095、CoreX 五步清单等）出自已移除的脚本，口径描述仍有效。
 - 必须以模块方式从仓库根目录运行（`-m scripts.X`），不能 `python scripts/X.py`（本机 shell 有 ROS 的 PYTHONPATH，`scripts/__init__.py` 用于避免包遮蔽）。
-- 脚本只跑 GPU 且对数值敏感：计时前先预热引擎，结果逐 token 对比；`check_prefix_cache` 失败时退出码非零。
+- 脚本只跑 GPU 且对数值敏感：计时前先预热引擎。
 - `--eager` / `enforce_eager=True` 关闭 CUDA Graph 捕获（小显存卡推荐）；CUDA Graph 需按 batch 形状逐桶捕获，遇到未捕获形状首轮会失败。
 - `tqdm` 被引擎导入但 **pyproject.toml 未声明**，全新安装后需手动装。
-- 空板卡（无桌面占用显存）跑任何脚本建议传 `--gpu-mem-util 0.85`：KV 池按 util 贴地分配，图捕获/大桶采样峰值需余量（32GB CoreX 卡实测贴地后仅剩 ~112MB，图内采样 OOM）；`check_prefix_cache` 另有 `--max-num-seqs`（默认 8）。
+- 空板卡（无桌面占用显存）跑任何脚本建议传 `--gpu-mem-util 0.85`：KV 池按 util 贴地分配，图捕获/大桶采样峰值需余量（32GB CoreX 卡实测贴地后仅剩 ~112MB，图内采样 OOM）。
 
 ## 测试环境与已知的坑（WSL2 + 4070 Laptop 8GB）
 
@@ -26,7 +24,7 @@ Nano-vLLM：从零实现的极简 vLLM（研究/学习用代码库，非生产�
 - WSL 下显存回收有数秒延迟：`allocate_kv_cache` 已做预算不足时的等待重试。
 - 对照基线：vLLM 0.26 需 `VLLM_WSL2_ENABLE_PIN_MEMORY=1` 才能在 WSL2 跑通；spec_bench 数据在 `~/vllm-lab/benchdata/spec_bench/question.jsonl`，模型在 `~/vllm-lab/models/`（Qwen3-1.7B、Qwen3-1.7B-EAGLE3=腾讯 AngelSlim 官方等）。
 - EAGLE3 draft checkpoint 的 config.json **没有** aux 层字段 / fc_norm / norm_before_fc；aux 层用引擎默认 (2, n//2, n-3)。
-- spec_bench 验收脚本已晋升为 `scripts/check_eagle3.py`（E/逐位置接受率/直方图/TPS；`--save-out`/`--tag` 输出与回归 compare 流程同 schema）；测试工件在 `~/vllm-lab/benchdata/nv_regression/`。
+- spec_bench 验收脚本曾晋升为 `scripts/check_eagle3.py`（E/逐位置接受率/直方图/TPS；`--save-out`/`--tag` 输出与回归 compare 流程同 schema），2026-09 已随精简删除；测试工件在 `~/vllm-lab/benchdata/nv_regression/`。
 - 数值确定性：bf16 下目标模型自身就随 batch 形状漂移（逐个 vs 批量跑同一批 prompt 有 3/10 输出分歧）——"投机 vs 非投机逐 token 一致"只在无分歧翻转的负载上成立。
 - Cherry 式流式对比以 stream_bench 为准；spec 开关对低 E 负载可能负收益，对比时须同时报告 E。
 

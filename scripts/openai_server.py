@@ -1,24 +1,19 @@
-"""OpenAI 兼容 HTTP server（给 Cherry Studio / vLLM client 用）。
+"""OpenAI 兼容 HTTP server（continuous batching + SSE 流式，纯 stdlib 零新依赖）。
 
-特性：
-- 并发请求 + continuous batching：后台引擎驱动线程统一调度所有排队请求，
-  不再全局串行 —— 多客户端 / 多会话可同时请求（vLLM 式）。
-- 纯 Python stdlib，零新依赖（无需 fastapi / uvicorn）。
-- 真逐 token SSE 流式：每 decode step 后取新增 token，decode 后按文本 diff
-  推送（兼容 CJK 多字节切分）。
-- 标准 OpenAI 端点：/v1/models、/v1/chat/completions、/v1/completions、/health。
-- 参数：max_tokens / temperature / top_p（转发给 SamplingParams）/ stop（文本级截断并中止生成）/
-  n=1 / stream / stream_options.include_usage。
-- 只使用 nano-vLLM 公开 API（LLM、Sequence、SamplingParams、scheduler），不修改库文件。
+端点：/v1/models、/v1/chat/completions、/v1/completions、/health（含无 /v1 前缀别名）。
+参数：max_tokens（未传 = 生成到上下文顶）/ temperature / top_p / top_k / stop（文本级截断并中止生成）/
+stream / stream_options.include_usage；n 仅支持 1。
+并发模型：后台引擎驱动线程统一 step() 驱动所有排队请求（continuous batching），
+HTTP 线程只负责收发与流式推送。
+
+服务端日志：
+- [req ] 请求到达：id、端点、prompt token 数、采样参数、流式与否、内容预览；
+- [done] 请求完成：输出 token 数、TTFT、墙钟、单请求 TPS、本请求前缀缓存命中率、结束原因；
+- [tps ] 实时吞吐：后台线程每 TPS_INTERVAL 秒打印窗口 TPS（有 token 生成才打印）+ 累计前缀缓存命中率。
 
 用法（必须从仓库根目录以 -m 方式运行，直跑 scripts/X.py 会 ModuleNotFoundError）：
     python3 -m scripts.openai_server /path/to/Qwen3-1.7B [--port 8000]
-                  [--api-key xxx] [--eager] [--max-model-len 4096]
-                  [--temperature 0.7] [--backend auto]
-
-Cherry Studio 配置：OpenAI 兼容 provider，
-    Base URL = http://127.0.0.1:8000/v1
-    API Key  = 任意（或 --api-key 指定的值）
+        [--spec-model <draft 目录>] [--spec-num-tokens k] [--eager] [--api-key xxx]
 """
 import argparse
 import json
@@ -49,20 +44,55 @@ _wakeup = threading.Event()          # 有请求加入 / 中止时唤醒 driver
 _shutdown = threading.Event()
 _active = {}                         # seq_id -> _Request
 
+TPS_INTERVAL = 1.0                   # [tps] 实时打印周期（秒）
+_gen_lock = threading.Lock()
+_gen_total = 0                       # 服务启动以来累计生成 token 数
+_gen_window = 0                      # 当前 TPS 统计窗口内的生成 token 数
+
 
 class _Request:
     """单个请求的状态：driver 写入，HTTP 线程读取。"""
 
-    def __init__(self, seq, max_tokens):
+    def __init__(self, seq, max_tokens, rid):
         self.seq = seq
         self.max_tokens = max_tokens
+        self.rid = rid
         self.prompt_tokens = seq.num_prompt_tokens
+        self.t_start = time.perf_counter()
+        self.t_first = None          # 首个 token 产出时刻（driver 写入）
+        self.stats_before = None     # 入队时 BlockManager 统计快照（算本请求缓存命中用）
         self.tokens = deque()        # driver 追加已生成的 token（eos 已剔除）
         self.n_seen = 0
         self.event = threading.Event()
         self.finished = False
         self.finish_reason = None
         self.error = None
+
+
+def _bump_tokens(n):
+    """driver 每产出 n 个 token 调用一次，供 [tps] 线程统计。"""
+    global _gen_total, _gen_window
+    with _gen_lock:
+        _gen_total += n
+        _gen_window += n
+
+
+def _tps_loop():
+    """实时吞吐打印线程：窗口内有 token 生成才打印（空闲不刷屏）。"""
+    global _gen_window
+    while not _shutdown.wait(TPS_INTERVAL):
+        with _gen_lock:
+            win, total = _gen_window, _gen_total
+            _gen_window = 0
+        if win == 0:
+            continue
+        with engine_lock:
+            n_active = len(_active)
+            s = engine.scheduler.block_manager.stats
+            total_blocks = s["cached_blocks"] + s["new_blocks"]
+        cache = f"{s['cached_blocks'] / total_blocks * 100:.0f}%" if total_blocks else "-"
+        print(f"[tps] {win / TPS_INTERVAL:7.1f} tok/s  "
+              f"(累计 {total} tok, 活跃 {n_active} req, 前缀缓存 {cache})", flush=True)
 
 
 def _drain(queue):
@@ -86,6 +116,22 @@ def _abort(seq):
             scheduler.waiting.remove(seq)
         except ValueError:
             pass
+
+
+def _log_done(st, ct, reason):
+    """请求完成统计：输出 token 数 / TTFT / 墙钟 / 单请求 TPS / 本请求前缀缓存命中率。"""
+    now = time.perf_counter()
+    ttft = f"{(st.t_first - st.t_start) * 1000:.0f}ms" if st.t_first else "-"
+    speed = f"{ct / (now - st.t_first):.1f} tok/s" if st.t_first and now > st.t_first else "-"
+    cache = "-"
+    if st.stats_before is not None:
+        s = engine.scheduler.block_manager.stats
+        cached = s["cached_blocks"] - st.stats_before["cached_blocks"]
+        total = cached + (s["new_blocks"] - st.stats_before["new_blocks"])
+        if total > 0:
+            cache = f"{cached / total * 100:.0f}%({cached}/{total} blk)"
+    print(f"[done] {st.rid} completion={ct} tok  TTFT={ttft}  "
+          f"wall={now - st.t_start:.2f}s  {speed}  cache={cache}  finish={reason}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -113,9 +159,12 @@ def _engine_loop():
                     seq = st.seq
                     comp = seq.completion_token_ids
                     if len(comp) > st.n_seen:
-                        for tok in comp[st.n_seen:]:
-                            if tok != _eos:
-                                st.tokens.append(tok)
+                        new_tokens = [t for t in comp[st.n_seen:] if t != _eos]
+                        if new_tokens:
+                            if st.t_first is None:
+                                st.t_first = time.perf_counter()
+                            st.tokens.extend(new_tokens)
+                            _bump_tokens(len(new_tokens))
                         st.n_seen = len(comp)
                     if seq.is_finished:
                         st.finish_reason = (
@@ -160,17 +209,14 @@ def _run_llm(st, stop, emit):
     emit(delta_text) 在流式下逐 delta 调用；None 表示非流式。
     客户端断连（emit 抛 IOError）后继续跑完请求但不推送。
     增量 detokenization：每次唤醒只解码新增 token 中能完整落在 UTF-8 字符
-    边界上的前缀（pending 携带跨字节残留），不再对全量 token 列表重解码
-    （旧实现每次唤醒 decode 整个 gen，O(n²)/请求，且在引擎线程释放窗口内
-    长时间持有 GIL）。finish 时仍做一次全量解码兜底，保证最终文本与旧
-    实现逐字节一致。
+    边界上的前缀（pending 携带跨字节残留）；finish 时全量解码兜底，保证最终
+    文本与全量解码逐字节一致。
     """
     if emit is None:    # 非流式：吞掉增量推送，只累积最终文本
         emit = lambda _delta: None
     gen = []
     pending = []        # 尚不能安全解码的 token 尾部（UTF-8 多字节边界残留）
     prev_text = ""
-    final = ""
     reason = "stop"
     dead = False
 
@@ -201,8 +247,7 @@ def _run_llm(st, stop, emit):
         # 边界回退策略：整段 pending 解码若以替换符 \ufffd 结尾，说明末尾
         # token 可能只覆盖了某个多字节字符的前半部分 —— 从尾部回退一个
         # token 再试；单 token 仍不完整时整体留到下次唤醒（finish 全量
-        # 解码兜底）。字节级 BPE 下，安全边界两侧的 decode 结果与全量
-        # decode 逐字节一致（utf-8 自同步，errors=replace 只在非法边界生效）。
+        # 解码兜底）。
         piece = ""
         keep = len(pending)
         while keep > 0:
@@ -267,6 +312,21 @@ def _completion_prompt_ids(body):
                 ids.extend(_tokenizer.encode(s))
             return ids
     raise ValueError("invalid 'prompt'")
+
+
+def _preview(body, mode, limit=40):
+    """请求内容预览（日志用）：chat 取最后一条 user 消息，completion 取 prompt。"""
+    if mode == "chat":
+        content = next((m.get("content") for m in reversed(body.get("messages") or [])
+                        if m.get("role") == "user"), "")
+    else:
+        content = body.get("prompt") or ""
+    if isinstance(content, list):
+        content = "".join(i.get("text", "") for i in content if isinstance(i, dict))
+    if not isinstance(content, str):
+        return ""
+    flat = " ".join(content.split())
+    return flat[:limit] + ("…" if len(flat) > limit else "")
 
 
 def _openai_body(req_id, model, mode, content, finish_reason, usage):
@@ -411,9 +471,7 @@ class Handler(BaseHTTPRequestHandler):
         if n != 1:
             self._error("'n' != 1 is not supported", 400)
             return
-        max_tokens = int(body.get("max_tokens") or 512)
-        if max_tokens < 1:
-            max_tokens = 1
+        max_tokens = int(body.get("max_tokens") or 0)    # 未传 / 0 / 负数 = 生成到上下文顶
         temperature = body.get("temperature")
         if temperature is None:
             temperature = _default_temperature
@@ -442,16 +500,26 @@ class Handler(BaseHTTPRequestHandler):
         if len(prompt_ids) >= _max_model_len:
             print(f"[warn] prompt truncated to {_max_model_len - 1} tokens", flush=True)
             prompt_ids = prompt_ids[:_max_model_len - 1]
+        if max_tokens < 1:
+            max_tokens = _max_model_len - len(prompt_ids)    # 长文本：到上下文顶为止（vLLM 语义）
 
         req_id = f"chatcmpl-{time.time_ns()}" if mode == "chat" else f"cmpl-{time.time_ns()}"
+        rid = req_id[-6:]
 
         seq = Sequence(prompt_ids, SamplingParams(
             temperature=temperature, max_tokens=max_tokens, top_p=top_p, top_k=top_k))
         with engine_lock:
             engine.scheduler.add(seq)
-            st = _Request(seq, max_tokens)
+            st = _Request(seq, max_tokens, rid)
             _active[seq.seq_id] = st
+            st.stats_before = dict(engine.scheduler.block_manager.stats)
             _wakeup.set()
+
+        # [req] 请求到达 info：端点 / token 数 / 采样参数 / 流式 / 内容预览
+        print(f"[req ] {rid} {self.path} client={self.client_address[0]} stream={stream} "
+              f"prompt={st.prompt_tokens} tok max_tokens={max_tokens} "
+              f"temp={temperature:g} top_p={top_p:g} top_k={top_k} stop={len(stop)} "
+              f"| {_preview(body, mode)}", flush=True)
 
         usage = {
             "prompt_tokens": st.prompt_tokens,
@@ -470,6 +538,7 @@ class Handler(BaseHTTPRequestHandler):
             if not stream:
                 text, reason, ct = _run_llm(st, stop, None)
                 usage.update(completion_tokens=ct, total_tokens=st.prompt_tokens + ct)
+                _log_done(st, ct, reason)
                 self._json(_openai_body(req_id, model, mode, text, reason, usage))
                 return
 
@@ -488,6 +557,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.flush()
 
             text, reason, ct = _run_llm(st, stop, emit)
+            _log_done(st, ct, reason)
 
             done = json.dumps(_chunk(req_id, model, mode, "", reason),
                               ensure_ascii=False).encode("utf-8")
@@ -511,6 +581,7 @@ class Handler(BaseHTTPRequestHandler):
         except BrokenPipeError:
             pass    # 客户端断开：请求已在 _run_llm 内跑完/中止
         except Exception as exc:
+            print(f"[error] {rid} generation failed: {exc}", flush=True)
             try:
                 self._error(f"generation failed: {exc}", 500)
             except (BrokenPipeError, ConnectionResetError, OSError):
@@ -564,7 +635,6 @@ def main():
     else:
         # 8GB 卡上大 max_num_seqs 的宽桶/宽 buffer 拖慢单步回放，实测 nospec
         # 512→8 = 59.0→66.8 tok/s；需要更高并发的用户显式传 --max-num-seqs。
-        # spec 模式此前已默认 8（捕获池随 max_bs 增长），现统一。
         kwargs["max_num_seqs"] = 8
     if args.block_size is not None:
         kwargs["kvcache_block_size"] = args.block_size
@@ -575,12 +645,13 @@ def main():
     _eos = engine.scheduler.eos
     _max_model_len = engine.model_runner.config.max_model_len
     _model_name = args.model.rstrip("/").rsplit("/", 1)[-1]
-    print(f"model '{_model_name}' ready", flush=True)
-    spec_info = f"ON(k={args.spec_num_tokens}, {args.spec_model.rstrip('/').rsplit('/', 1)[-1]})" if args.spec_model else "OFF"
-    ms_info = args.max_num_seqs if args.max_num_seqs is not None else 8
-    print(f"eos={_eos} | eager={args.eager} | spec={spec_info} | max_model_len={_max_model_len} | max_num_seqs={ms_info}", flush=True)
+    spec_info = f"ON(k={args.spec_num_tokens}, {args.spec_model.rstrip('/').rsplit('/', 1)[-1]})" \
+        if args.spec_model else "OFF"
+    print(f"model '{_model_name}' ready | eos={_eos} | eager={args.eager} | spec={spec_info} | "
+          f"max_model_len={_max_model_len} | max_num_seqs={kwargs['max_num_seqs']}", flush=True)
 
     threading.Thread(target=_engine_loop, daemon=True).start()
+    threading.Thread(target=_tps_loop, daemon=True).start()
 
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     httpd.daemon_threads = True
