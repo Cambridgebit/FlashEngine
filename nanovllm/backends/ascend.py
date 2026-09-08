@@ -60,6 +60,9 @@ _INDEXING_WARNED = False
 # auto 档 probe 裁决回落的一次性告警锁存（resolve_auto_attention_impl 用，
 # 与 _INDEXING_WARNED 同款模式；构造期正常只解析一次，测试直调防刷屏）。
 _AUTO_FALLBACK_WARNED = False
+# graph_ctx pool kwarg TypeError 兜底的一次性告警锁存（pool 不被支持时每张
+# 图捕获都会触发同一 TypeError，锁存后只告警一次；与上两处同款模式）。
+_POOL_WARNED = False
 
 
 def _has_op(name):
@@ -215,10 +218,31 @@ class Ascend310PBackend(BackendBase):
 
     @contextmanager
     def graph_ctx(self, graph, pool=None):
-        # 纯透传（同 base 约定）：厂商 torch 不支持 pool 时的 TypeError 由此抛出、
-        # 由 capture 层整体降级 eager。禁止在此吞 TypeError 重试——重试会二次
-        # 执行捕获体（kernel 双跑），且掩盖真实异常源。
-        with torch.npu.graph(graph, pool=pool):
+        # 构造期 vs 体执行期严格区分（关键安全语义，演进自旧版整条禁令
+        # "禁止在此吞 TypeError 重试——重试会二次执行捕获体"）：
+        # - 旧禁令针对的是【体执行期】异常：__enter__ 之后捕获体已在执行，
+        #   吞掉重试 = 捕获体二次执行（kernel 双跑、KV 双写），必须原样穿透
+        #   到 capture 层整体 try/except 降级 eager——本任务不变该语义；
+        # - 而 torch.npu.graph(graph, pool=pool) 的 TypeError 发生在【上下文
+        #   管理器构造期】（pool kwarg 不被该版本 torch_npu 接受；构造与
+        #   __enter__ 分离的语义与 torch.cuda.graph 同族），此刻捕获体一行
+        #   都没执行——构造无共享池版本重试是安全的，且把"整图降级 eager"
+        #   改善为"无共享池捕获成功"（逐图独立内存，显存代价见 AGENTS.md）。
+        try:
+            ctx = torch.npu.graph(graph, pool=pool)
+        except TypeError:
+            # pool 不支持时每张图捕获都会抛同一 TypeError，锁存一次性告警
+            # （_POOL_WARNED，与 _INDEXING_WARNED/_AUTO_FALLBACK_WARNED 同款）。
+            global _POOL_WARNED
+            if not _POOL_WARNED:
+                _POOL_WARNED = True
+                print("[ascend310p] torch.npu.graph 不支持 pool kwarg，已改用无共享池捕获"
+                      "（逐图独立内存，显存代价见 AGENTS.md）")
+            ctx = torch.npu.graph(graph)
+        # with 在 try/except 之外：ctx.__enter__ 与捕获体执行期的任何异常
+        # （含 __enter__ 之后的）不在此捕获，原样穿透到 capture 层降级链
+        # （model_runner.capture_cudagraph 的告警 → graphs=None → eager）。
+        with ctx:
             yield
 
     # ---- attention auto 档裁决（model_runner 构造期调用一次，非热路径）----
