@@ -97,6 +97,28 @@ def _nd_to_nz_rearrange(mask_2d):
     return mask_2d.reshape(1, s0, s1 // 16, 16).transpose(1, 2).contiguous()
 
 
+def _gather_kv_history(cache, block_table_row, ctx_len, block_size):
+    """按单序列 block_table 行从 KV 池层切片 gather 历史并截断（纯 torch，CPU 可跑）。
+
+    flash_incre 档 decode 主路径的历史收集步（每序列每层每步一次）。写法对照
+    参考实现 compat._decode（nano_vllm_310p_compat.py:254-276）：块 id 行上取
+    整对齐 block_size → index_select 取整块 → reshape 展平 → 截断 [:ctx_len]。
+
+    cache: [num_blocks, block_size, H, D]（KV 池 [2,L,B,S,H,D] 的层切片，BSHD）；
+    block_table_row: 该序列块 id 行（设备 int32 padded，可长于所需——padded 尾
+    部块 id 由上取整切片排除）；ctx_len: 该序列当前上下文长度（Python int，
+    来自 context_lens .item() 的 host sync 产物）；block_size: KV 块大小。
+
+    gather 上界 = ceil(ctx_len/block_size) 个整块（展平后 ceil*block_size 行），
+    再截断 [:ctx_len] 丢弃尾块残留行；行序 = 块表顺序拼接（块 b 的行紧接块表
+    下一块的行）。返回 [ctx_len, H, D]。
+    """
+    block_count = (ctx_len + block_size - 1) // block_size    # 上取整对齐块整
+    block_ids = block_table_row[:block_count].to(torch.long)
+    hist = cache.index_select(0, block_ids).reshape(-1, cache.shape[-2], cache.shape[-1])
+    return hist[:ctx_len]
+
+
 def setup_env():
     """收口 torch_npu 的环境耦合：必须在 torch_npu 首次 import 前调用。
 
@@ -136,6 +158,11 @@ class Ascend310PBackend(BackendBase):
     # store_kvcache 分派对 auto 暂按"探测到 fused 算子即走 fused"处理（与
     # 最终语义一致，probe 裁决接管后不影响分派结果）。
     attention_impl = "auto"
+    # decode paged 候选优化开关：默认 False（逐序列主路径兜底）。置 True 条件
+    # = probe 报告 paged_attention 项 PASS 且显式选 flash_incre+paged 档（任务
+    # 9/10 依 probe 报告决定是否置 True）；auto / 无 probe 报告一律走逐序列
+    # 主路径（_decode_flash 内分派）。
+    paged_candidate_enabled = False
 
     def __init__(self):
         # 环境收口必须先于 _torch_npu() 的任何调用：torch_npu 是懒加载 import，
@@ -289,6 +316,15 @@ class Ascend310PBackend(BackendBase):
         return _call(self._causal_mask_fp16(q.device, context))[0]
 
     def decode_attention(self, q, k_cache, v_cache, context, scale):
+        # 档位分派（attention_impl 选型语义见类属性注释）：
+        # - flash_incre → _decode_flash（npu_incre_flash_attention 逐序列主路径，
+        #   eager-only：host sync 不可入图，本档下引擎 decode 图捕获失败自动
+        #   降级 eager，capture 的 try/except 已兜底）；
+        # - fia_v2 / auto → 下方 BNSD paged 现路径原样。auto 暂按 fia_v2 处理
+        #   （与 store/prefill 的 auto 语义对齐：先给可用路径，auto 的最终裁决
+        #   归 probe 报告，任务 9 接管后注入实际档位值）。
+        if self.attention_impl == "flash_incre":
+            return self._decode_flash(q, k_cache, v_cache, context, scale)
         tn = _torch_npu()
         bs, num_heads, head_dim = q.shape
         # q [bs, H, D] → BNSD [bs, H, 1, D]；paged KV 读取走 block_table + block_size
@@ -307,6 +343,86 @@ class Ascend310PBackend(BackendBase):
         )[0]
         # [bs, H, 1, D] → [bs, H*D]
         return out.transpose(1, 2).reshape(bs, -1)
+
+    # ---- flash_incre 档 decode（npu_incre_flash_attention 逐序列主路径）----
+    # 板端实证形态（参考实现 compat._decode、本仓 probe _check_incre 同源，两处
+    # 须保持同构）：逐序列按 block_table 从整池 gather K/V 历史 → BNSD 单序列
+    # incre_flash 前向 → cat 拼回。逐序列循环 + .item() 的 host sync ×每序列×
+    # 每层×每步是吞吐瓶颈点（唯一被板端证实的形态，后续性能轮优化对象）。
+    # 批量 paged 形态为 UNVERIFIED 候选优化，默认关闭（_decode_paged_candidate）。
+
+    def _decode_flash(self, q, k_cache, v_cache, context, scale):
+        """flash_incre decode 主路径：逐序列 gather 历史 + incre_flash（板端实证）。
+
+        参数组逐项对照 probe _check_incre 与参考实现 compat._decode
+        （nano_vllm_310p_compat.py:245-296）：每序列 q_part [1,H_q,1,D]、历史
+        k/v [1,H_kv,ctx,D]（BNSD）、actual_seq_lengths=[ctx]（list）、
+        inner_precise=1；输出 squeeze/transpose 后 cat 拼 [bs,H_q,D]。
+
+        eager-only：.item() host sync 不可入图——本档下引擎 decode 图捕获失败
+        自动降级 eager（capture try/except 已兜底，同 prefill flash_incre 档）。
+        """
+        tn = _torch_npu()
+        if self.paged_candidate_enabled and _has_op("_npu_paged_attention"):
+            # 候选优化分派：paged_candidate_enabled 由任务 9/10 依 probe 报告
+            # 显式置 True（probe paged_attention 项 PASS + 显式 flash_incre+
+            # paged 才启用）；auto / 无报告一律走下方逐序列主路径。
+            return self._decode_paged_candidate(q, k_cache, v_cache, context, scale)
+        block_size = int(context.block_size)
+        outputs = []
+        # 逐序列循环：每序列每层每步一次 Python 迭代 + 单序列算子 launch——
+        # host 开销点之一（吞吐瓶颈点，后续性能轮优化对象）。
+        for i in range(q.shape[0]):
+            # host sync：context_lens D2H（.item()）——逐序列每层每步一次，
+            # 吞吐瓶颈点（后续性能轮优化对象）。
+            ctx_len = int(context.context_lens[i].item())
+            k_hist = _gather_kv_history(k_cache, context.block_tables[i], ctx_len, block_size)
+            v_hist = _gather_kv_history(v_cache, context.block_tables[i], ctx_len, block_size)
+            q_part = q[i:i + 1].transpose(0, 1).unsqueeze(0).contiguous()   # [1,H_q,1,D]
+            k_part = k_hist.transpose(0, 1).unsqueeze(0).contiguous()       # [1,H_kv,ctx,D]
+            v_part = v_hist.transpose(0, 1).unsqueeze(0).contiguous()
+            out = tn.npu_incre_flash_attention(
+                q_part, k_part, v_part,
+                actual_seq_lengths=[ctx_len],        # compat/probe 同款 list
+                num_heads=q.shape[-2],
+                num_key_value_heads=k_cache.shape[-2],
+                input_layout="BNSD",
+                scale_value=scale,
+                inner_precise=1,
+            )
+            # [1,H_q,1,D] → [1,H_q,D]（compat 同款 squeeze/transpose 整形）
+            outputs.append(out.squeeze(0).transpose(0, 1).contiguous())
+        # [bs,H_q,D] → [bs,H*D]（attention 层消费口径，与 fia_v2 decode 返回形态一致）
+        return torch.cat(outputs, dim=0).reshape(q.shape[0], -1)
+
+    def _decode_paged_candidate(self, q, k_cache, v_cache, context, scale):
+        """UNVERIFIED 候选：_npu_paged_attention 批量 paged 形态（板端未实证）。
+
+        参数组对照 vllm-ascend 310P 官方形态（vllm_ascend/_310p/attention/
+        attention_v1.py forward_paged_attention）与本仓 probe _check_paged 的
+        kwarg 组——两者均 UNVERIFIED：官方 cache 为 5D 对齐布局 (2,B,(H*D)/16,
+        S,16)，本引擎为 4D 池层切片 [B,S,H_kv,D]；q 形态取 probe 两连试的 A 案
+        [bs,1,H,D]（BNSD）。形态差异是否可跑/数值正确以板端 probe 裁决为准，
+        默认不启用（启用条件见 _decode_flash 分派注释）。
+        """
+        tn = _torch_npu()
+        bs, num_heads, head_dim = q.shape
+        # q [bs, H, D] → BNSD [bs, H, 1, D]（probe A 案同款整形）
+        q_input = q.view(bs, 1, num_heads, head_dim).transpose(1, 2).contiguous()
+        out = torch.empty_like(q_input)
+        tn._npu_paged_attention(
+            query=q_input,
+            key_cache=k_cache,
+            value_cache=v_cache,
+            num_kv_heads=k_cache.shape[-2],
+            num_heads=num_heads,
+            scale_value=scale,
+            block_table=context.block_tables,
+            context_lens=context.context_lens,
+            out=out,
+        )
+        # [bs,1,H,D] → [bs,H*D]（probe 同款 reshape 口径，attention 层消费形态）
+        return out.reshape(bs, -1)
 
     # ---- causal 掩码（prefill/verify 共用，类持有缓存）----
 
