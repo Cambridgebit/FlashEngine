@@ -31,6 +31,11 @@ class LLMEngine:
         self.model_runner = ModelRunner(config, 0, self.events)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
+        # 按后端能力位强制关闭 prefix cache（310P 不支持 prefix-hit 形态：
+        # TND prefill 不消费整池 4D k/v 切片）；CUDA/CoreX 能力位为 True，
+        # 此处为 no-op，行为逐字节不变。裁决必须在后端解析后（ModelRunner
+        # 已构造）、BlockManager 构造前（Scheduler 内创建）。
+        config.enable_prefix_cache = config.enable_prefix_cache and self.model_runner.backend.supports_prefix_cache
         self.scheduler = Scheduler(config)
         atexit.register(self.exit)
 

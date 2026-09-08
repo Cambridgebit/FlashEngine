@@ -78,6 +78,13 @@ class Ascend310PBackend(BackendBase):
     default_dtype = torch.float16
     # NPU RNG 图安全性未验证，decode 图内采样起步保守关闭。
     graph_sample_default = False
+    # prefix cache 命中形态（prefill_attention 收到整池 4D k/v 切片）不支持，
+    # 引擎据此强制关闭 prefix cache。两条依据：
+    # ① 本后端 TND prefill（npu_fused_infer_attention_score_v2）只直读当前批
+    #    k/v，不消费整池 4D 切片（登记见 prefill_attention 内注释）；
+    # ② flash_incre 档要求 q/kv 等长，prefix-hit 的 kv 长度 > q 长度直接违反
+    #    该约束（计划 Scope 第 3 条）。
+    supports_prefix_cache = False
 
     def __init__(self):
         # 环境收口必须先于 _torch_npu() 的任何调用：torch_npu 是懒加载 import，

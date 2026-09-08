@@ -51,6 +51,10 @@ class BackendBase(ABC):
     # 显式设置时优先后端默认。Ascend 起步保守关闭（NPU RNG 图安全性未验证），
     # 关闭时 logits/采样走图外 gv["outputs"] 分支。
     graph_sample_default = True
+    # prefix cache 命中时，attention 层会把 k/v 换成整池 4D 切片
+    # （nanovllm/layers/attention.py 的 prefix-hit 分支）喂给 prefill_attention；
+    # 不支持该形态的后端必须声明 False（引擎据此强制关闭 prefix cache）。
+    supports_prefix_cache = True
 
     @abstractmethod
     def store_kvcache(
