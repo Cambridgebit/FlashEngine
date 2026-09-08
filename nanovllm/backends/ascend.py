@@ -7,7 +7,9 @@
 # torch_npu 懒加载：模块顶部只 import torch——CUDA 机器 import nanovllm 零 NPU 依赖；
 # torch_npu 的导入与承重算子校验收口在 _torch_npu() 首用引导。
 
+import json
 import os
+import subprocess
 from contextlib import contextmanager
 
 import torch
@@ -55,6 +57,9 @@ def _torch_npu():
 _OP_CACHE = {}
 # indexing fallback 的一次性告警锁存（print 热路径每 token 都过，只告警一次）
 _INDEXING_WARNED = False
+# auto 档 probe 裁决回落的一次性告警锁存（resolve_auto_attention_impl 用，
+# 与 _INDEXING_WARNED 同款模式；构造期正常只解析一次，测试直调防刷屏）。
+_AUTO_FALLBACK_WARNED = False
 
 
 def _has_op(name):
@@ -215,6 +220,62 @@ class Ascend310PBackend(BackendBase):
         # 执行捕获体（kernel 双跑），且掩盖真实异常源。
         with torch.npu.graph(graph, pool=pool):
             yield
+
+    # ---- attention auto 档裁决（model_runner 构造期调用一次，非热路径）----
+
+    def resolve_auto_attention_impl(self, configured: str) -> str:
+        """auto 档最终裁决：读 probe 报告（scripts/probe_ascend310p.py 产出，
+        T8 契约含 toolchain/repo_hash/recommended_attention_impl/checks）的
+        recommended_attention_impl，翻译成具体档位返回。
+
+        纯函数式：只返回档位值，不自行写 self.attention_impl（由调用方
+        model_runner 构造期赋值，热路径 store/prefill/decode 只读该值分派）。
+
+        采信规则（计划 Verification strategy 定死）：
+        - 显式档位（fia_v2/flash_incre）→ 原样返回，尊重用户选择；
+        - 报告 repo_hash 与当前 git HEAD 不一致 → 报告不可信，告警回落
+          flash_incre；git 调用失败（非仓库/无 git 环境）视同不一致处理；
+        - 报告文件缺失 / 解析失败 / recommended_attention_impl 缺失或不在
+          值域 {"fia_v2", "flash_incre"} → 同样告警回落 flash_incre。
+        所有回落路径走模块级一次性中文告警（_AUTO_FALLBACK_WARNED 锁存）。
+        """
+        if configured != "auto":
+            return configured
+
+        def _fallback(reason):
+            global _AUTO_FALLBACK_WARNED
+            if not _AUTO_FALLBACK_WARNED:
+                _AUTO_FALLBACK_WARNED = True
+                print(f"[ascend310p] attention auto 档回落 flash_incre（原因：{reason}）；"
+                      "板端跑 scripts.probe_ascend310p --save-out 可修复裁决")
+            return "flash_incre"
+
+        path = os.environ.get("NANOVLLM_PROBE_REPORT") or ".omo/evidence/ascend310p-backend/probe_report.json"
+        try:
+            with open(path, encoding="utf-8") as f:
+                report = json.load(f)
+        except FileNotFoundError:
+            return _fallback(f"probe 报告不存在：{path}")
+        except (OSError, ValueError) as e:
+            # ValueError 覆盖 json.JSONDecodeError（其父类）；OSError 覆盖
+            # 路径是目录/权限类错误。
+            return _fallback(f"probe 报告解析失败：{e!r}")
+        # repo_hash 对比：报告的 repo_hash 来自写入时的 git HEAD。git 调用失败
+        # （非仓库环境）视同不一致——无法核验的报告不采信，不抛出。
+        try:
+            proc = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                capture_output=True, text=True, timeout=10,
+            )
+            head = proc.stdout.strip() if proc.returncode == 0 else ""
+        except Exception:
+            head = ""
+        if not head or head != report.get("repo_hash"):
+            return _fallback(f"报告 repo_hash={report.get('repo_hash')!r} 与当前 HEAD={head!r} 不一致")
+        impl = report.get("recommended_attention_impl")
+        if impl not in ("fia_v2", "flash_incre"):
+            return _fallback(f"recommended_attention_impl 缺失或不在值域：{impl!r}")
+        return impl
 
     # ---- KV 写入与 attention ----
 

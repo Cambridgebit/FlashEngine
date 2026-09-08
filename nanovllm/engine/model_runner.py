@@ -154,6 +154,11 @@ class ModelRunner:
         # 设备语义串与 dtype 解析：后端强制 dtype（如 310P 仅 fp16）优先于 hf_config。
         self.device = self.backend.device_name
         self.dtype = self.backend.default_dtype or hf_config.dtype
+        # 310P attention 档位接线：仅 ascend 后端有该接口（duck-typing），
+        # CUDA/CoreX 无感。auto 档在此由 probe 报告一次性裁决为具体档位
+        # （构造期），显式档位原样透传。
+        if hasattr(self.backend, "resolve_auto_attention_impl"):
+            self.backend.attention_impl = self.backend.resolve_auto_attention_impl(config.attention_impl)
         # EAGLE3 投机解码（仅 TP=1，见 config 断言）。
         self.spec_enabled = bool(config.spec_model)
         if self.spec_enabled and not self.backend.supports_spec:
