@@ -51,6 +51,30 @@ def _torch_npu():
     return _npu
 
 
+# _has_op 算子探测结果缓存（算子名 → bool）
+_OP_CACHE = {}
+# indexing fallback 的一次性告警锁存（print 热路径每 token 都过，只告警一次）
+_INDEXING_WARNED = False
+
+
+def _has_op(name):
+    """探测 torch_npu 是否提供指定算子（hasattr 结果按算子名缓存）。
+
+    与 _torch_npu() 的启动门语义不同：这里是能力探测（store_kvcache 的
+    fused/indexing 分派用），import 失败静默返回 False，不抛 RuntimeError。
+    仅在后端实例方法内调用——构造函数已确保 setup_env() 先于 torch_npu
+    import，此处不破坏懒加载边界。
+    """
+    if name not in _OP_CACHE:
+        try:
+            import torch_npu
+        except ImportError:
+            _OP_CACHE[name] = False
+        else:
+            _OP_CACHE[name] = hasattr(torch_npu, name)
+    return _OP_CACHE[name]
+
+
 def setup_env():
     """收口 torch_npu 的环境耦合：必须在 torch_npu 首次 import 前调用。
 
@@ -85,6 +109,11 @@ class Ascend310PBackend(BackendBase):
     # ② flash_incre 档要求 q/kv 等长，prefix-hit 的 kv 长度 > q 长度直接违反
     #    该约束（计划 Scope 第 3 条）。
     supports_prefix_cache = False
+    # attention 路径档位：auto→按 probe 报告裁决（后续任务注入实际值）；
+    # fia_v2→npu_fused_infer_attention_score_v2 现路径；flash_incre→新路径。
+    # store_kvcache 分派对 auto 暂按"探测到 fused 算子即走 fused"处理（与
+    # 最终语义一致，probe 裁决接管后不影响分派结果）。
+    attention_impl = "auto"
 
     def __init__(self):
         # 环境收口必须先于 _torch_npu() 的任何调用：torch_npu 是懒加载 import，
@@ -137,6 +166,23 @@ class Ascend310PBackend(BackendBase):
     # ---- KV 写入与 attention ----
 
     def store_kvcache(self, key, value, k_cache, v_cache, slot_mapping):
+        # 分派入口（对外签名不变，layers/attention.py 唯一调用点）：
+        # - 显式 fia_v2 档，或探测到 fused 算子（auto 档默认语义）→ 算子写入；
+        # - 算子缺失 → 纯 torch 高级索引写入 + 一次性告警。
+        # 显式 fia_v2 但环境不满足时由 _store_fused 内 _torch_npu() 抛清晰错误
+        # （启动门语义），不静默回落。
+        if self.attention_impl == "fia_v2" or _has_op("_npu_reshape_and_cache"):
+            self._store_fused(key, value, k_cache, v_cache, slot_mapping)
+        else:
+            global _INDEXING_WARNED
+            if not _INDEXING_WARNED:
+                _INDEXING_WARNED = True
+                print("[ascend310p] 未检测到 _npu_reshape_and_cache 算子，"
+                      "KV cache 写入已回落纯 torch 高级索引路径（仅限 eager，性能次优）")
+            self._store_indexing(key, value, k_cache, v_cache, slot_mapping)
+
+    @staticmethod
+    def _store_fused(key, value, k_cache, v_cache, slot_mapping):
         tn = _torch_npu()
         # 引擎传入的 k/v_cache 是 KV 池 [2, L, B, S, H, D] 的层切片（连续），
         # 即 BSHD [num_blocks, block_size, kv_heads, head_dim]；
@@ -153,6 +199,21 @@ class Ascend310PBackend(BackendBase):
             # eager 路径就地转型。
             slot_mapping.int(),
         )
+
+    @staticmethod
+    def _store_indexing(key, value, k_cache, v_cache, slot_mapping):
+        # 纯 torch 高级索引写入（fused 算子缺失时的 fallback）：KV 池按槽位展平
+        # 成 [B*S, H, D] 后按扁平槽位（block_idx*block_size+offset）直接赋值。
+        # 本 fallback 仅限 eager 路径——eager 无 -1 padding，下述 >=0 掩码是
+        # 防御层；不得进入图捕获（动态布尔索引不可捕获，图路径必须走 fused）。
+        # 掩码是硬要求：图路径 padding 槽位为 -1（model_runner 静态 slot buffer
+        # fill_(-1)），高级索引负槽会按 Python 负索引写池尾 = 静默 KV 污染
+        # （fused 算子有负槽跳过语义，纯 torch 没有该语义）。
+        blocks, block_size, kv_heads, head_dim = k_cache.shape
+        valid = slot_mapping >= 0
+        idx = slot_mapping.to(torch.long)[valid]
+        k_cache.view(blocks * block_size, kv_heads, head_dim)[idx] = key.to(k_cache.dtype)[valid]
+        v_cache.view(blocks * block_size, kv_heads, head_dim)[idx] = value.to(v_cache.dtype)[valid]
 
     def prefill_attention(self, q, k, v, context, scale):
         tn = _torch_npu()
