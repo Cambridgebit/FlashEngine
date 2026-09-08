@@ -7,6 +7,7 @@
 # torch_npu 懒加载：模块顶部只 import torch——CUDA 机器 import nanovllm 零 NPU 依赖；
 # torch_npu 的导入与承重算子校验收口在 _torch_npu() 首用引导。
 
+import os
 from contextlib import contextmanager
 
 import torch
@@ -20,6 +21,10 @@ _REQUIRED_OPS = (
     "_npu_reshape_and_cache",
     "npu_fused_infer_attention_score_v2",
     "npu_add_rms_norm",
+    # npu_rms_norm 与 add_rms_norm 的清单不对称：rms_norm()（首层 input_layernorm
+    # residual=None、q_norm/k_norm 热路径）在用却未入门——老 torch_npu 会穿过启动
+    # 门，拖到首次 forward 深处才 AttributeError，故补入提前校验。
+    "npu_rms_norm",
     "npu_swiglu",
 )
 
@@ -46,6 +51,17 @@ def _torch_npu():
     return _npu
 
 
+def setup_env():
+    """收口 torch_npu 的环境耦合：必须在 torch_npu 首次 import 前调用。
+
+    CANN 自带原生 protobuf 运行时，torch_npu 捆绑的 TorchAir Python protobuf
+    绑定会再加载一个与之冲突的 C++ protobuf 运行时；切到纯 Python 实现规避。
+    参考实现板端实证同款做法（nano_vllm_torchair_bootstrap.py:8-12）。
+    setdefault 幂等：外部已显式设置时不覆盖。
+    """
+    os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+
+
 class Ascend310PBackend(BackendBase):
 
     name = "ascend310p"
@@ -64,6 +80,9 @@ class Ascend310PBackend(BackendBase):
     graph_sample_default = False
 
     def __init__(self):
+        # 环境收口必须先于 _torch_npu() 的任何调用：torch_npu 是懒加载 import，
+        # __init__ 首行时尚未 import，在此调 setup_env() 正好赶在其前。
+        setup_env()
         # 选型即校验：torch_npu 缺包/缺算子在 get_backend() 处干净报错，
         # 不拖到首次 forward 才在模型栈深处炸出难读 traceback。
         _torch_npu()
