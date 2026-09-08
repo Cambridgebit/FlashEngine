@@ -127,11 +127,30 @@ Nano-vLLM：从零实现的极简 vLLM（研究/学习用代码库，非生产�
 
 ## Ascend 310P（Atlas 300I Duo / 200I Pro）适配状态
 
-- 代码层已就绪（tri-backend-fusion）：`backends/ascend.py`（Ascend310PBackend）+ 设备代理/图 API 工厂全后端收口（engine/layers 内 `torch.cuda.*`/`.cuda()` 零直呼）。技术来源：nanovllm-ascend 的 torch_npu 对接形态 + vllm-ascend 的 310P 硬件事实。
-- **能力矩阵**：decode 图 = NPUGraph 尝试+降级（310P 仅支持 decode-only 级捕获）；**spec 全路径 = ❌ 引擎层拒绝**（`supports_spec=False`：verify 恒传 block_tables → attention 层走整池 4D 分支，TND 算子不消费，首个 spec 轮即硬崩——出现 spec_model 配置时干净报错；paged-TND 适配后再开，vllm-ascend A2 已证 v2 算子支持 TND+block_table）；算子融合 = `npu_rms_norm`/`npu_add_rms_norm`/`npu_swiglu` 级（npu_swiglu 已入承重清单；Npugraph_ex 在 310P 不可用，融合只能做在算子层）；graph_sample 默认 False（NPU RNG 图安全性未验证，`NANOVLLM_GRAPH_SAMPLE=1` 可实验性强制；spec 图门默认同时要求 graph_sample_default）。三后端 × 两图种的完整真值表见 `backends/base.py` 头部注释。
-- **硬件硬规矩**：仅 fp16（ATB 算子不支持 bf16，引擎按 `default_dtype` 强制 + 加载时隐式转换）；不支持 triton（本引擎 ascend 路径不依赖 triton）；prefill causal mask 按 max_model_len 全量构建有 OOM 风险——勿依赖 max-model-len 自动探测；TP=1 目标形态（多卡受 event-id 限制，且 spec 本就 TP=1）。
-- **已知限制**：prefix cache 命中的 prefill 会把 k/v 换成整池 4D 切片（attention 层 prefix-hit 分支），TND 算子不消费该形态——与 nanovllm-ascend 参考实现同款；310P 上前缀命中负载（如 check_prefix_cache 的 warm 轮）预期在此崩溃，需 paged-TND 适配后解锁，勿当回归报。同分支也命中 spec verify（block_tables 恒传）——spec 全路径被引擎层拒绝的根因即此（见能力矩阵）。
-- **待实机验证**（本机无法测）：`bash scripts/verify_ascend310p.sh <target> <draft>` 环境预检 + 四步（eager prefix 回归[R1 cold 判据，warm 轮预期命中已知限制] → decode 图捕获 → spec 拒绝守卫 → TPS sweep）；步骤 0 探测四个载荷算子（`_npu_reshape_and_cache`/`npu_fused_infer_attention_score_v2`/`npu_add_rms_norm`/`npu_swiglu`）与 pinned allocator。
+- 代码层就绪（tri-backend-fusion + ascend310p-backend 计划 T1-T14，commit 链 8b5dcb4→2648f16）：`backends/ascend.py`（Ascend310PBackend）+ 设备代理/图 API 工厂全后端收口（engine/layers/models 内 `torch.cuda.*`/`.cuda()`/`torch.npu` 零直呼）。技术来源：nanovllm-ascend 的 torch_npu 对接形态 + vllm-ascend 的 310P 硬件事实；计划全文见 `.omo/plans/ascend310p-backend.md`。
+- **能力矩阵**（三后端 × 两图种完整真值表见 `backends/base.py` 头部注释；T14 静态核查 6/6 格 + env 覆盖矩阵 + `world_size==1` 守卫恰 2 处全部一致，见 `.omo/evidence/ascend310p-backend/task-14/`）：
+  - **decode 图 = NPUGraph 尝试+降级**（310P 仅支持 decode-only 级捕获）：`graph_ctx` 已带 pool kwarg TypeError 构造期兜底（628b86d：构造期 TypeError 转无共享池捕获 + 一次性告警；捕获体执行期异常仍原样穿透整体降级，防 kernel 双跑）；捕获整体失败走 try/except 降级 eager（model_runner `capture_cudagraph`，不崩）。板端对照步骤见 board_commands.md 步骤 3。
+  - **spec 全路径 = 引擎层拒绝，verify 路径已实现待解锁**：`supports_spec=False`（ascend.py:173），spec_model 配置构造期干净报错（model_runner 能力位裁决）。旧根因（verify 恒传 block_tables → attention 层走整池 4D 分支，TND 算子不消费即硬崩；vllm-ascend A2 已证 v2 算子支持 TND+block_table）已由 T13 的 **paged_verify 三候选专径解除**（2648f16）：候选 A=FIA v2 BNSD 多 q / B=`_npu_paged_attention` q_len>1 / C=gather+`_npu_flash_attention`，attention 层按 `spec_verify_q_lens>0` duck-typing 分流（layers/attention.py:62，CUDA/CoreX 无此方法行为零变化）。**解锁条件=板端 probe 报告 `spec_unlock_candidate` 非 null + 端到端 E 回归**，届时 `supports_spec` 一行翻转（T14 依证据执行）；翻转前该路径不可达，翻转后亦仅 eager spec 轮可达（`supports_spec_graph=False`，本轮维持）。
+  - **prefix cache = 按 `supports_prefix_cache=False` 能力位强制关闭**（aee62e4；llm_engine.py:38 在 BlockManager 构造前接线，CUDA/CoreX 为 no-op 行为不变）。原已知限制「prefix 命中 prefill 把 k/v 换成整池 4D 切片、TND 不消费预期崩溃」由此**全局排除**（该形态不再到达，勿当回归报）；spec verify 的同一形态由 paged_verify 专径解决（见上）。
+  - 算子融合 = `npu_rms_norm`/`npu_add_rms_norm`/`npu_swiglu` 级（三者均已入启动门承重清单 `_REQUIRED_OPS`，8b5dcb4；Npugraph_ex 在 310P 不可用，融合只能做在算子层）。
+  - graph_sample 默认 False（NPU RNG 图安全性未验证，`NANOVLLM_GRAPH_SAMPLE=1` 可实验性强制；spec 图门默认同时要求 graph_sample_default，本位 False 即 spec 图双闭）。
+- **attention 档位**（config `attention_impl` 字段 ba78a65 + 分派接线 bbbf9a4；值域 auto/fia_v2/flash_incre，`--attention-impl` 可显式锁档）：
+  - `auto`（默认）= probe 报告裁决：model_runner 构造期 `resolve_auto_attention_impl` 读报告 `recommended_attention_impl`；报告缺失/解析失败/repo_hash 与当前 HEAD 不一致 → 一次性告警回落 `flash_incre`（probe 与 benchmark 须同仓同 commit 执行）。
+  - `fia_v2` = `npu_fused_infer_attention_score_v2` 融合算子档（prefill TND varlen + decode BNSD paged 整池直读）= **性能候选**；图兼容双模，decode 图捕获仅本档承担。
+  - `flash_incre` = `_npu_flash_attention` + NZ 分形掩码 prefill（q/kv 等长 + `%16==0 且 ≤2048` 守卫，508f6e0）+ `npu_incre_flash_attention` 逐序列 decode（260ac92，逐序列 gather + host sync 是吞吐瓶颈点）= **板端实证保底档**；host sync 不可入图，本档下图捕获失败降级 eager 属预期。
+  - `store_kvcache` 三层（e21032f）：fused `_npu_reshape_and_cache` → 纯 torch 高级索引 fallback（`slot>=0` 掩码防负索引写池尾静默污染、仅 eager）→ 显式 fia_v2 而算子缺失时清晰报错（启动门语义，不静默回落）。
+- **probe 用法**（板端唯一探测入口，5785796）：`python3 -m scripts.probe_ascend310p --save-out .omo/evidence/ascend310p-backend/probe_report.json`。checks 共 17 项 = 12 数值契约（含 3 个 spec verify 候选）+ 4 基础设施（npugraph/torchair/pin_memory/memory_stats_keys）+ toolchain；JSON 顶层五键 = toolchain / repo_hash / recommended_attention_impl / spec_unlock_candidate / checks。板端 probe_report.json 是 auto 档裁决、spec 解锁、T12（torchair 第二档）决策的唯一依据。
+- **板端执行入口**：`.omo/evidence/ascend310p-backend/task-10/board_commands.md`（环境准备/预检/probe/eager 冒烟/图对照五步 + 逐步回传清单，命令与当前 scripts CLI 逐一核对）。原 `scripts/verify_ascend310p.sh` 已随 2026-09 精简删除，职责由该清单 + probe 接管。
+- **实测数据（占位，板端回传后回填并同步更新本节）**：eager 冒烟 TPS/TTFT = `<待板端实测>`；图 vs eager 对照（TPS + temp0 逐条输出位等）= `<待板端实测>`；spec E（解锁后）= `<待板端实测>`。
+
+### PyTorch × CANN 耦合三铁律
+
+1. **CANN 消费面唯一 = torch_npu**：engine/layers/models 零 `torch_npu` import、零 `torch.npu` 直呼（三重 grep 门保持：`import torch_npu` / `torch.npu.*` / `torch.cuda.*` 直呼三查，命中仅限 backends/ 收口处）；`backends/ascend.py` 是唯一 import 点且全函数体懒加载（模块顶部只 import torch，CUDA 机器 import nanovllm 零 NPU 依赖）。
+2. **禁止 ascendcl/CANN C++ 直链与 Ascend C kernel 落仓**（参考实现 nano-vllm-ascend 的 RTS 初始化/符号冲突实证教训）；未来自定义算子唯一合法形态 = 纯 torch C++ 扩展注册 `torch.ops.*` 且默认不构建。
+3. **CANN 环境耦合两点收口**：① 进程内 `setup_env()`（`PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python`，先于 torch_npu 首次 import、幂等 setdefault，`__init__` 首行调用，8b5dcb4）；② 文档化板端 source 顺序（board_commands.md：CANN set_env.sh → ATB set_env.sh → venv）。版本钉 torch-npu==2.10.0.post4 / CANN 9.1.0 由启动门校验（缺包/缺算子在 `_torch_npu()` 报错并给版本指引）。
+- **采信规则**：默认档位/能力位翻转只采信钉定 toolchain 上重跑的 probe PASS；参考实现（nano-vllm-ascend 910C 实证、nano-vllm-qwen3-310p 板端实证）仅作形态参考。
+
+- **硬件硬规矩**：仅 fp16（ATB 算子不支持 bf16，引擎按 `default_dtype` 强制 + 加载时隐式转换，T10 声明-消费-转换三点闭合核查）；不支持 triton（本引擎 ascend 路径不依赖 triton）；prefill causal mask 风险分档：fia_v2 档 bool 掩码仍按 max_context_len 全量构建（OOM 风险仍在，勿依赖 max-model-len 自动探测），flash_incre 档已加 `%16/≤2048` 守卫（508f6e0，超限抛 RuntimeError 提示改 max_model_len）；TP=1 目标形态（多卡受 event-id 限制，且 spec 本就 TP=1；TP 分布式走 HCCL，`dist_name="hccl"` + `config.hccl_port`）。
 - 环境钉（vllm-ascend 口径）：torch-npu==2.10.0.post4 / CANN 9.1.0 / 310p 专用镜像。
 
 ## 约定
