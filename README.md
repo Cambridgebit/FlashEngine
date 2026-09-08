@@ -6,7 +6,7 @@
 
 - **EAGLE3 投机解码**：小草稿模型先猜 k 个 token，主模型一次前向批量验证，一轮生成多个 token（原理见「架构」一节）。
 - **CUDA Graph 加速**：解码一步录一张图、投机解码一整轮录一张图；录制失败自动退回逐算子执行，只降速、不影响功能。
-- **多硬件后端**：NVIDIA CUDA 与天数智芯 CoreX 均已实机验证，华为 Ascend 310P 代码就绪、待实机验证。
+- **多硬件后端**：NVIDIA CUDA 与天数智芯 CoreX 均已实机验证，华为 Ascend 310P 代码实证校准完成（attention 双档 + KV 写入 fallback + 图捕获兜底 + spec verify 路径就绪），板端冒烟清单见 AGENTS.md「Ascend 310P」节，实测数据待板端回填。
 - **OpenAI 兼容服务**：流式输出 + 连续批处理，纯 Python 标准库实现，零新增依赖。
 
 > 开发约定与实测数据明细见 [AGENTS.md](AGENTS.md)。
@@ -112,7 +112,7 @@ scripts/
 - **执行层**：引擎里最重的一层。把一批请求组装成模型输入（token id、每个 token 在 KV cache 里的位置、注意力元数据），调用模型，写回 KV cache 并读回采样结果。CUDA Graph 的录制与回放、投机解码一轮的完整流程都由它编排。
 - **模型层**：Qwen3 主模型与 EAGLE3 草稿模型的网络结构定义，二者共享词表。
 - **算子层**：线性层内置张量并行（多卡时各算一部分再汇总）；各算子通过全局上下文获取当前步的位置等信息，不污染模型函数签名。
-- **后端层**：同一套引擎代码跑在不同 GPU 上，只有这层不同——KV cache 的显存排布、attention 用的厂商 kernel、图捕获的兼容处理。CUDA 用 flash-attn + triton，CoreX 用 ixformer，Ascend 310P 用 torch_npu。新增硬件只需实现一个后端类。
+- **后端层**：同一套引擎代码跑在不同 GPU 上，只有这层不同——KV cache 的显存排布、attention 用的厂商 kernel、图捕获的兼容处理。CUDA 用 flash-attn + triton，CoreX 用 ixformer，Ascend 310P 用 torch_npu（attention 双档 fia_v2 / flash_incre 由板端 probe 实测裁决，KV 写入融合算子 + fallback 双路径，图捕获三级降级、失败回落 eager）。新增硬件只需实现一个后端类。
 
 ### 一次请求的流程
 
@@ -141,3 +141,13 @@ scripts/
 | 逐算子执行（无 CUDA Graph） | 8.1 |
 | CUDA Graph | 76.5 |
 | **CUDA Graph + 投机 k=3** | **104.1** |
+
+**华为 Ascend 310P（待板端实测）**
+
+| 配置 | 吞吐（tokens/s） | E |
+|---|---|---|
+| 逐算子执行（EAGER） | <待板端实测> | — |
+| NPUGraph（CUDA Graph 等价） | <待板端实测> | — |
+| **NPUGraph + 投机 k=3** | <待板端实测> | <待板端实测> |
+
+> 板端执行清单见 AGENTS.md「Ascend 310P」节（board_commands.md 五步）。
