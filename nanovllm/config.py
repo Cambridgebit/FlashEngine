@@ -22,6 +22,10 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    # 前缀缓存开关（block 级 hash 复用，仅 prefill 阶段命中）。
+    # 关闭时跳过 hash 计算与命中查找（含每步 decode 的 hash_blocks 开销），
+    # 用于 A/B 对照测量其对 TTFT / 吞吐的影响。
+    enable_prefix_cache: bool = True
     # EAGLE3 投机解码：draft 模型目录（官方 EAGLE-3 权重，含 midlayer/fc/d2t）。
     # 空字符串 = 关闭。chain 模式：draft 链式起草，target 单次前向验证。
     spec_model: str = ""
