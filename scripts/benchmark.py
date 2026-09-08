@@ -101,6 +101,11 @@ def main():
     parser.add_argument("--no-prefix-cache", action="store_true",
                         help="关闭前缀缓存（enable_prefix_cache=False，引擎跳过 block hash"
                              "与命中查找），用于 TTFT/吞吐 A/B 对照")
+    parser.add_argument("--attention-impl", choices=["auto", "fia_v2", "flash_incre"],
+                        default="auto",
+                        help="Ascend attention 实现档位（仅 ascend310p 后端消费，"
+                             "CUDA/CoreX 忽略）：auto=按 probe 报告裁决；"
+                             "fia_v2=TND/BNSD 融合算子；flash_incre=_npu_flash_attention+incre")
     parser.add_argument("--max-tokens", type=int, default=256,
                         help="每条输出上限（对齐 vllm spec_bench 默认 output_len=256；EOS 即停）")
     parser.add_argument("--seed", type=int, default=0,
@@ -138,7 +143,8 @@ def main():
                   max_model_len=args.max_model_len, max_num_seqs=args.max_num_seqs,
                   kvcache_block_size=args.block_size, compile=args.compile,
                   gpu_memory_utilization=args.gpu_mem_util,
-                  enable_prefix_cache=not args.no_prefix_cache)
+                  enable_prefix_cache=not args.no_prefix_cache,
+                  attention_impl=args.attention_impl)
     if args.spec_model:
         kwargs.update(spec_model=args.spec_model, spec_num_tokens=args.spec_num_tokens)
     llm = LLM(args.model, **kwargs)

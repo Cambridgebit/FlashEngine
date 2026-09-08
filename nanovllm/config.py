@@ -26,6 +26,10 @@ class Config:
     # 关闭时跳过 hash 计算与命中查找（含每步 decode 的 hash_blocks 开销），
     # 用于 A/B 对照测量其对 TTFT / 吞吐的影响。
     enable_prefix_cache: bool = True
+    # Ascend attention 实现档位——auto=读 probe 报告裁决（读不到默认 flash_incre）；
+    # fia_v2=TND/BNSD 融合算子档；flash_incre=_npu_flash_attention+incre 板端实证档。
+    # 仅 ascend310p 后端消费，CUDA/CoreX 忽略。
+    attention_impl: str = "auto"
     # EAGLE3 投机解码：draft 模型目录（官方 EAGLE-3 权重，含 midlayer/fc/d2t）。
     # 空字符串 = 关闭。chain 模式：draft 链式起草，target 单次前向验证。
     spec_model: str = ""
