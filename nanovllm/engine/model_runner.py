@@ -870,7 +870,8 @@ class ModelRunner:
                     max_seqlen_k=self.config.max_model_len,
                     slot_mapping=g['v_slots'][:bs * rows],
                     block_tables=g['v_btables'][:bs],
-                    block_size=self.block_size)
+                    block_size=self.block_size,
+                    spec_verify_q_lens=rows)    # 310P verify 专径分流标记（CUDA/CoreX 后端无 paged_verify，不受影响）
         hidden, aux = self.model(g['v_input_ids'][:bs * rows], g['v_positions'][:bs * rows])
         logits = F.linear(hidden, self.model.lm_head.weight)
         g['v_token_ids'][:bs * rows] = self.sampler.forward_native(

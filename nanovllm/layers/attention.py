@@ -52,7 +52,15 @@ class Attention(nn.Module):
 
         if context.is_prefill:
 
-            if context.block_tables is not None:    # prefix cache
+            if context.block_tables is not None:    # prefix cache / spec verify
+                # 310P spec verify 专径（T13）：verify 与 prefix-hit 同为 prefill 形态
+                # + 恒传 block_tables，但其分页 KV 消费形态 TND prefill 算子不接受
+                # ——后端实现 paged_verify（duck-typing 探测，CUDA/CoreX 无此方法）
+                # 且本步确为 verify（spec_verify_q_lens>0，_sg_verify 组装时传入）时
+                # 分流；普通 prefix-hit prefill 行为不变（310P 由
+                # supports_prefix_cache=False 全局排除，不会到达此分支）。
+                if hasattr(self.backend, "paged_verify") and context.spec_verify_q_lens > 0:
+                    return self.backend.paged_verify(q, k_cache, v_cache, context, self.scale)
                 k = k_cache
                 v = v_cache
 

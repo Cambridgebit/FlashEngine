@@ -17,6 +17,24 @@
                            板端实证形态（nano_vllm_310p_compat.py:245-296，flash_incre decode 主路径）
 - rms_norm / add_rms_norm / swiglu   三个融合归一化/激活算子的返回值解包契约
 
+spec verify 解锁候选组（计划 Scope #8，T13；裁决序 A→B→C，首个数值契约 PASS 者写入
+报告顶层 spec_unlock_candidate，全 FAIL/absent 记 null——supports_spec 翻转（T14）的
+前置证据键。每序列 q 长度均质 rows=k+1（EAGLE3 verify 语义，对照 model_runner._sg_verify：
+行 j 可见 key = 位置 0..l-1+j，单序列 key 总数 = l+k），夹具刻意取批内 key 长度不齐 [7,5]）：
+- spec_verify_fia_bnsd_paged  候选 A：npu_fused_infer_attention_score_v2 BNSD paged 多 q
+                              （q [bs,H,rows,D] + 整池 4D 直读 + block_table +
+                              actual_seq_kvlen + verify 因果掩码 [rows, W]，行 j 遮蔽位
+                              c ≥ W-(k-j) 右对齐窗口语义——与 ascend.py
+                              _paged_verify_fia / _verify_causal_mask_rows 同构）
+- spec_verify_paged_attention 候选 B：_npu_paged_attention q_len>1 形态（无掩码入参，
+                              可见性依赖算子内建因果，预期 bottom-right 对齐=verify 语义；
+                              q 形态两连试 [bs,rows,H,D] → [bs,H,rows,D]，对照
+                              _check_paged 先例扩展多 q）
+- spec_verify_gather_flash    候选 C：全量 gather（_gather_kv_history 同款）+
+                              _npu_flash_attention 不等长 q/kv + 自定义掩码（行 j 遮蔽位
+                              c ≥ l+j；掩码形态两连试 ND fp16 精确尺寸 → NZ 16 对齐
+                              padding，与 ascend.py _paged_verify_gather_flash 同构）
+
 基础设施组：npugraph（NPUGraph 存在性 + pool kwarg TypeError 探测 + 最小捕获回放）、
 torchair（torch_npu.dynamo → torchair import，图三档链第二档前提）、
 pin_memory（分配 + non_blocking H2D 往返）、memory_stats_keys（引擎显存统计依赖的键名）、
@@ -28,11 +46,16 @@ JSON 报告契约（字段名/取值域定死，消费端按此解析，不得�
   "repo_hash": "<git rev-parse --short HEAD，失败记 unknown>",
   "recommended_attention_impl": "fia_v2" | "flash_incre",
       # fia_v2 仅当 fia_v2_tnd_prefill 与 fia_v2_bnsd_paged_decode 双 PASS，否则 flash_incre
+  "spec_unlock_candidate": "A" | "B" | "C" | null,
+      # spec 解锁候选（裁决序 A→B→C，首个 PASS 者；全 FAIL/absent 记 null）——
+      # 引擎 T14 翻转 supports_spec 的前置证据键
   "checks": {"<name>": {"status": "PASS" | "FAIL" | "absent", "detail": "..."}}
 }
 检查名固定为：fia_v2_tnd_prefill / fia_v2_bnsd_paged_decode / reshape_and_cache /
-flash_attention_nz / paged_attention / incre_flash_attention / rms_norm / add_rms_norm /
-swiglu / npugraph / torchair / pin_memory / memory_stats_keys / toolchain。
+flash_attention_nz / paged_attention / spec_verify_fia_bnsd_paged /
+spec_verify_paged_attention / spec_verify_gather_flash / incre_flash_attention /
+rms_norm / add_rms_norm / swiglu / npugraph / torchair / pin_memory /
+memory_stats_keys / toolchain。
 
 用法（仓库根目录，两种方式等价）：
     python3 -m scripts.probe_ascend310p [--save-out PATH]
@@ -77,12 +100,14 @@ def make_tensor(shape, offset):
     )
 
 
-def ref_gqa_attention(q, k, v, causal):
+def ref_gqa_attention(q, k, v, causal, mask=None):
     """CPU float32 参考注意力（GQA：k/v 头 repeat_interleave 到 q 头数）。
 
     q [Sq, Hq, D] / k, v [Skv, Hkv, D] → [Sq, Hq, D]。causal=True 时要求 Sq==Skv
     （prefill 场景）：第 i 个 q 位置仅可见前 i+1 个 k/v 位置；causal=False 用于
-    decode（单 q 位置 attend 全部历史）。
+    decode（单 q 位置 attend 全部历史）。mask（bool，True=遮蔽，[Sq, Skv]）为
+    spec verify 候选组专用：与 causal 互斥使用，逐位覆盖可见性（verify 行 j
+    可见列 0..l+j-1 之类的非对齐结构无法用 causal 布尔表达）。
     """
     reps = q.shape[-2] // k.shape[-2]
     d = q.shape[-1]
@@ -93,6 +118,8 @@ def ref_gqa_attention(q, k, v, causal):
     if causal:
         upper = torch.triu(torch.ones(scores.shape[-2:], dtype=torch.bool), diagonal=1)
         scores = scores.masked_fill(upper, float("-inf"))
+    if mask is not None:
+        scores = scores.masked_fill(mask, float("-inf"))
     return torch.softmax(scores, dim=-1) @ vc
 
 
@@ -169,6 +196,50 @@ def _paged_refs(q, k_cache, v_cache, table, ctx, block_size, hkv, d):
         kh = kc[ids].reshape(-1, hkv, d)[:n]
         vh = vc[ids].reshape(-1, hkv, d)[:n]
         refs.append(ref_gqa_attention(q[i:i + 1], kh, vh, causal=False))
+    return torch.cat(refs, dim=0)
+
+
+def _verify_fixture():
+    """spec verify 三候选共用夹具：KV 池 + 2 序列块表 + 均质 verify q（varlen 拼接）。
+
+    EAGLE3 verify 语义（对照引擎 model_runner._sg_verify / ascend.py
+    _verify_causal_mask_rows，两处须保持同构）：每序列 q 行数 rows=k+1=3（k=2，
+    spec_verify_q_lens 口径），行 j 的 rope 位置 = l-1+j（l=提交前缀长），可见
+    key = 位置 0..l-1+j（历史全可见 + q 段因果）；store_kvcache 先行写入全部
+    verify 行后单序列 key 总数 = l+k。形状：池 [num_blocks=4, block_size=4,
+    H_kv=2, D=64]；历史 l=[5,3] → key 总数 kv=[7,5]（刻意不齐，暴露共享掩码的
+    对齐方向）→ 块表 [[0,1],[2,3]]（ceil(7/4)=ceil(5/4)=2 块/序列）；
+    q varlen [bs*rows=6, H_q=4, D=64]（引擎口径 cu_seqlens_q=arange*rows）。
+    """
+    nb, block_size, hkv, hq, d = 4, 4, 2, 4, 64
+    hist = [5, 3]
+    k_draft = 2
+    rows = k_draft + 1
+    kv = [n + k_draft for n in hist]        # 单序列 key 总数 [7, 5]
+    k_cache = make_tensor((nb, block_size, hkv, d), 31)
+    v_cache = make_tensor((nb, block_size, hkv, d), 57)
+    q = make_tensor((len(hist) * rows, hq, d), 83)
+    table = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32, device="npu")
+    return k_cache, v_cache, q, table, hist, kv, rows, (block_size, hkv, hq, d)
+
+
+def _verify_refs(q, k_cache, v_cache, table, kv, rows, block_size, hkv, d):
+    """verify CPU 参考：逐序列 gather key 总数（l+k）行 + 行 j 可见列 0..l+j-1
+    （遮蔽 c ≥ l+j）的掩码注意力 → [bs*rows, H_q, D]（varlen 拼接，与引擎 q 顺序
+    一致；mask 走 ref_gqa_attention 的逐位掩码入参）。"""
+    kc, vc = k_cache.float().cpu(), v_cache.float().cpu()
+    tab = table.cpu()
+    k = rows - 1
+    refs = []
+    for i, n in enumerate(kv):
+        l = n - k                    # 提交前缀长
+        n_blk = (n + block_size - 1) // block_size
+        ids = tab[i, :n_blk].long()
+        kh = kc[ids].reshape(-1, hkv, d)[:n]
+        vh = vc[ids].reshape(-1, hkv, d)[:n]
+        qs = q.float().cpu()[i * rows:(i + 1) * rows]
+        mask = torch.arange(n).unsqueeze(0) >= (l + torch.arange(rows)).unsqueeze(1)
+        refs.append(ref_gqa_attention(qs, kh, vh, causal=False, mask=mask))
     return torch.cat(refs, dim=0)
 
 
@@ -332,6 +403,197 @@ def _check_paged(tn):
             return "；".join(attempts) + "（UNVERIFIED 候选获板端实证）"
         except Exception as e:
             attempts.append(f"{tag} FAIL: {type(e).__name__}: {e}")
+    raise RuntimeError("；".join(attempts))
+
+
+def _check_spec_fia_bnsd(tn):
+    """spec_verify_fia_bnsd_paged：候选 A——FIA v2 BNSD paged 多 q verify 契约。
+
+    UNVERIFIED 候选（本 probe 即实证手段）。参数组与引擎 ascend.py
+    _paged_verify_fia 同构：q [bs,H,rows,D]（BNSD，varlen [bs*rows,H,D] 均质切分
+    转置）+ 整池 4D 池直读 + block_table + block_size + actual_seq_kvlen=逐序列
+    key 总数（l+k）+ verify 因果掩码（共享 2D [rows, W=max kv]，行 j 遮蔽位
+    c ≥ W-(k-j)，sparse_mode=0 无内建因果）。批内 key 长度不齐 kv=[7,5] 刻意暴露
+    共享掩码的对齐方向：右对齐窗口语义 PASS / 左对齐或按掩码宽对齐 FAIL。
+    两连试各一（同 _check_fia_bnsd / prefill_attention 先例）：actual_seq_kvlen
+    CPU int32 → 设备 int32；bool 掩码 → fp16 -inf 掩码（部分 CANN 拒收 bool）。
+    任一参数组与 verify CPU 参考一致即 PASS，detail 记录全部尝试。
+    """
+    k_cache, v_cache, q, table, hist, kv, rows, (block_size, hkv, hq, d) = _verify_fixture()
+    refs = _verify_refs(q, k_cache, v_cache, table, kv, rows, block_size, hkv, d)
+    k = rows - 1
+    bs = len(hist)
+    width = max(kv)
+    q_in = q.view(bs, rows, hq, d).transpose(1, 2).contiguous()     # [bs, H, rows, D] BNSD
+    # 共享 2D 掩码：行 j 遮蔽位 c ≥ width-(k-j)（右缘锚定；与引擎
+    # _verify_causal_mask_rows 同公式。width=7 时 [3,7]：行 0 遮 {5,6}、行 1 遮 {6}、
+    # 行 2 全可见——上三角阶梯结构）。
+    mask_bool = (torch.arange(width, device="npu").unsqueeze(0)
+                 >= (width - k + torch.arange(rows, device="npu")).unsqueeze(1))
+    mask_fp16 = torch.zeros((rows, width), dtype=torch.float16, device="npu")
+    mask_fp16.masked_fill_(mask_bool, float("-inf"))
+    attempts = []
+    for lens_tag, lens in (
+        ("CPU int32", torch.tensor(kv, dtype=torch.int32)),
+        ("device int32", torch.tensor(kv, dtype=torch.int32, device="npu")),
+    ):
+        for mask_tag, mask in (("bool", mask_bool), ("fp16 -inf", mask_fp16)):
+            try:
+                out = tn.npu_fused_infer_attention_score_v2(
+                    q_in, k_cache, v_cache,
+                    num_query_heads=hq,
+                    num_key_value_heads=hkv,
+                    input_layout="BNSD",
+                    softmax_scale=d ** -0.5,
+                    block_table=table,
+                    block_size=block_size,
+                    actual_seq_kvlen=lens,
+                    atten_mask=mask,
+                    sparse_mode=0,
+                    inner_precise=1,
+                )
+                out = out[0] if isinstance(out, (tuple, list)) else out
+                got = out.transpose(1, 2).reshape(bs * rows, hq, d)
+                torch.testing.assert_close(got.float().cpu(), refs, rtol=RTOL, atol=ATOL)
+                attempts.append(f"actual_seq_kvlen={lens_tag}+{mask_tag} 掩码 PASS")
+                return "；".join(attempts) + "（UNVERIFIED 候选获板端实证）"
+            except Exception as e:
+                attempts.append(
+                    f"actual_seq_kvlen={lens_tag}+{mask_tag} 掩码 FAIL: {type(e).__name__}: {e}")
+    raise RuntimeError("；".join(attempts))
+
+
+def _check_spec_paged_attention(tn):
+    """spec_verify_paged_attention：候选 B——_npu_paged_attention q_len>1 形态。
+
+    UNVERIFIED 候选（存在性由注册表 attrs 门控）。kwarg 组复用 _check_paged 的
+    vllm-ascend 310P 官方形态（query/key_cache/value_cache/num_kv_heads/num_heads/
+    scale_value/block_table/context_lens/out，官方把 context_lens 移到设备），扩展
+    q_len>1（每序列 rows=k+1 均质）；算子无掩码入参——q_len>1 的可见性依赖算子
+    内建因果，预期 bottom-right 对齐（行 j 可见 key 窗口前 l+j 列 = verify 语义），
+    对齐方向由本项数值比对裁决。q 形态两连试（对照 _check_paged 先例扩展多 q）：
+    A=[bs,rows,H,D]（引擎 _paged_verify_paged_attention 首案）→ B=[bs,H,rows,D]
+    （BNSD）；任一形态与 verify CPU 参考一致即 PASS，detail 记录全部尝试。
+    """
+    k_cache, v_cache, q, table, hist, kv, rows, (block_size, hkv, hq, d) = _verify_fixture()
+    refs = _verify_refs(q, k_cache, v_cache, table, kv, rows, block_size, hkv, d)
+    bs = len(hist)
+
+    def _try(tag, q_in, out_shape, reshape):
+        out = torch.empty(out_shape, dtype=torch.float16, device="npu")
+        tn._npu_paged_attention(
+            query=q_in,
+            key_cache=k_cache,
+            value_cache=v_cache,
+            num_kv_heads=hkv,
+            num_heads=hq,
+            scale_value=d ** -0.5,
+            block_table=table,
+            context_lens=torch.tensor(kv, dtype=torch.int32, device="npu"),
+            out=out,
+        )
+        torch.npu.synchronize()
+        torch.testing.assert_close(
+            reshape(out).float().cpu(), refs, rtol=RTOL, atol=ATOL)
+        return f"{tag} PASS"
+
+    attempts = []
+    try:
+        attempts.append(_try(
+            "A: q=[bs,rows,H,D]",
+            q.view(bs, rows, hq, d).contiguous(), (bs, rows, hq, d),
+            lambda o: o.reshape(bs * rows, hq, d)))
+        return "；".join(attempts) + "（UNVERIFIED 候选获板端实证）"
+    except Exception as e:
+        attempts.append(f"A: q=[bs,rows,H,D] FAIL: {type(e).__name__}: {e}")
+    try:
+        attempts.append(_try(
+            "B: q=[bs,H,rows,D]",
+            q.view(bs, rows, hq, d).transpose(1, 2).contiguous(), (bs, hq, rows, d),
+            lambda o: o.transpose(1, 2).reshape(bs * rows, hq, d)))
+        return "；".join(attempts) + "（UNVERIFIED 候选获板端实证）"
+    except Exception as e:
+        attempts.append(f"B: q=[bs,H,rows,D] FAIL: {type(e).__name__}: {e}")
+    raise RuntimeError("；".join(attempts))
+
+
+def _check_spec_gather_flash(tn):
+    """spec_verify_gather_flash：候选 C——全量 gather + _npu_flash_attention
+    不等长 q/kv + 自定义掩码。
+
+    UNVERIFIED 候选。逐序列（引擎 ascend.py _paged_verify_gather_flash 同构）：
+    块表 gather key 总数（l+k）行（_gather_kv_history 同款：上取整整块 → 展平 →
+    截断）→ q_part [rows,H,D] / k,v [l+k,H_kv,D] 不等长前向 + 行 j 遮蔽位 c ≥ l+j
+    的自定义掩码（逐序列精确尺寸，可见性结构与 A 的共享掩码不同源——此处无对齐
+    方向问题，考的是算子对不等长 q/kv 与非 NZ 掩码的接受度）。掩码形态两连试：
+    ND fp16 精确尺寸 → NZ 分形（16 对齐 padding：q 尾 pad 行掩码全 0 可见防全
+    -inf 行 softmax NaN、输出行丢弃；kv 尾 pad 列被遮蔽公式覆盖为 -inf；
+    npu_format_cast 同 _check_flash_nz 实证形态）；任一形态与 verify CPU 参考
+    一致即 PASS，detail 记录全部尝试。
+    """
+    k_cache, v_cache, q, table, hist, kv, rows, (block_size, hkv, hq, d) = _verify_fixture()
+    refs = _verify_refs(q, k_cache, v_cache, table, kv, rows, block_size, hkv, d)
+    k = rows - 1
+
+    def _gather(i, n, cache):
+        n_blk = (n + block_size - 1) // block_size
+        ids = table[i, :n_blk].long()
+        return cache.index_select(0, ids).reshape(-1, hkv, d)[:n]
+
+    def _run(mask_tag):
+        outs = []
+        for i, n in enumerate(kv):
+            l = n - k
+            q_part = q[i * rows:(i + 1) * rows]     # [rows, H_q, D]
+            k_h, v_h = _gather(i, n, k_cache), _gather(i, n, v_cache)
+            if mask_tag == "ND fp16":
+                mask = torch.zeros((rows, n), dtype=torch.float16, device="npu")
+                mask.masked_fill_(
+                    torch.arange(n, device="npu").unsqueeze(0)
+                    >= (l + torch.arange(rows, device="npu")).unsqueeze(1),
+                    float("-inf"))
+                q_in, k_in, v_in, out = q_part, k_h, v_h, torch.empty_like(q_part)
+            else:
+                rows_pad = (rows + 15) // 16 * 16
+                kv_pad = (n + 15) // 16 * 16
+                mask = torch.zeros((rows_pad, kv_pad), dtype=torch.float16, device="npu")
+                mask.masked_fill_(
+                    ~(torch.arange(kv_pad, device="npu").unsqueeze(0)
+                      < (l + torch.arange(rows_pad, device="npu")).unsqueeze(1)),
+                    float("-inf"))
+                mask[rows:, :] = 0.0        # pad q 行全可见（防 NaN，输出行丢弃）
+                q_in = torch.zeros((rows_pad, hq, d), dtype=torch.float16, device="npu")
+                q_in[:rows] = q_part
+                k_in = torch.zeros((kv_pad, hkv, d), dtype=torch.float16, device="npu")
+                k_in[:n] = k_h
+                v_in = torch.zeros((kv_pad, hkv, d), dtype=torch.float16, device="npu")
+                v_in[:n] = v_h
+                mask = tn.npu_format_cast(
+                    mask.reshape(1, rows_pad, kv_pad // 16, 16).transpose(1, 2).contiguous(),
+                    ACL_FORMAT_FRACTAL_NZ)
+                out = torch.empty((rows_pad, hq, d), dtype=torch.float16, device="npu")
+            tn._npu_flash_attention(
+                query=q_in, key=k_in, value=v_in,
+                mask=mask,
+                seq_len=torch.tensor([rows], dtype=torch.int32),    # q 侧行数（UNVERIFIED 语义）
+                scale_value=d ** -0.5,
+                num_heads=hq,
+                num_kv_heads=hkv,
+                out=out,
+            )
+            torch.npu.synchronize()
+            outs.append(out[:rows])
+        got = torch.cat(outs, dim=0)
+        torch.testing.assert_close(got.float().cpu(), refs, rtol=RTOL, atol=ATOL)
+
+    attempts = []
+    for mask_tag in ("ND fp16", "NZ 16对齐 padding"):
+        try:
+            _run(mask_tag)
+            attempts.append(f"{mask_tag} 掩码 PASS")
+            return "；".join(attempts) + "（UNVERIFIED 候选获板端实证）"
+        except Exception as e:
+            attempts.append(f"{mask_tag} 掩码 FAIL: {type(e).__name__}: {e}")
     raise RuntimeError("；".join(attempts))
 
 
@@ -540,6 +802,9 @@ NUMERIC_CHECKS = (
     ("reshape_and_cache", ("_npu_reshape_and_cache",), _check_reshape_cache),
     ("flash_attention_nz", ("_npu_flash_attention", "npu_format_cast"), _check_flash_nz),
     ("paged_attention", ("_npu_paged_attention",), _check_paged),
+    ("spec_verify_fia_bnsd_paged", ("npu_fused_infer_attention_score_v2",), _check_spec_fia_bnsd),
+    ("spec_verify_paged_attention", ("_npu_paged_attention",), _check_spec_paged_attention),
+    ("spec_verify_gather_flash", ("_npu_flash_attention", "npu_format_cast"), _check_spec_gather_flash),
     ("incre_flash_attention", ("npu_incre_flash_attention",), _check_incre),
     ("rms_norm", ("npu_rms_norm",), _check_rms),
     ("add_rms_norm", ("npu_add_rms_norm",), _check_add_rms),
@@ -586,12 +851,15 @@ def _run_infra(report):
             report.record(name, "FAIL", f"{type(e).__name__}: {e}")
 
 
-def build_report(toolchain, repo_hash, recommended, checks):
-    """组报告 dict（顶层四键 = 定死契约：toolchain / repo_hash / recommended_attention_impl / checks）。"""
+def build_report(toolchain, repo_hash, recommended, checks, spec_unlock_candidate=None):
+    """组报告 dict（顶层五键 = 定死契约：toolchain / repo_hash /
+    recommended_attention_impl / spec_unlock_candidate / checks；spec_unlock_candidate
+    缺省 None 仅为向后兼容旧四参调用，契约要求键恒在——全 FAIL/报告缺项即 null）。"""
     return {
         "toolchain": toolchain,
         "repo_hash": repo_hash,
         "recommended_attention_impl": recommended,
+        "spec_unlock_candidate": spec_unlock_candidate,
         "checks": checks,
     }
 
@@ -601,6 +869,24 @@ def decide_recommended(checks):
     tnd = checks.get("fia_v2_tnd_prefill", {}).get("status")
     bnsd = checks.get("fia_v2_bnsd_paged_decode", {}).get("status")
     return "fia_v2" if tnd == "PASS" and bnsd == "PASS" else "flash_incre"
+
+
+# spec 解锁候选裁决序（计划 Scope #8）：A→B→C，检查名 → 候选编号。
+_SPEC_CANDIDATE_ORDER = (
+    ("spec_verify_fia_bnsd_paged", "A"),
+    ("spec_verify_paged_attention", "B"),
+    ("spec_verify_gather_flash", "C"),
+)
+
+
+def decide_spec_unlock_candidate(checks):
+    """spec 解锁候选裁决：按 A→B→C 序取首个数值契约 PASS 者；全 FAIL/absent 记
+    None（JSON 序列化为 null）——T14 翻转 supports_spec 的前置证据键，null 即
+    维持引擎层拒绝（ascend.py supports_spec 注释引用本键与证据路径）。"""
+    for name, candidate in _SPEC_CANDIDATE_ORDER:
+        if checks.get(name, {}).get("status") == "PASS":
+            return candidate
+    return None
 
 
 def report_exit_code(checks):
@@ -692,7 +978,9 @@ def main(argv=None):
             "toolchain", "PASS",
             f"torch_npu={toolchain['torch_npu']}；CANN={toolchain['cann']}；torch={toolchain['torch']}")
 
-    payload = build_report(toolchain, _git_repo_hash(), decide_recommended(report.checks), report.checks)
+    payload = build_report(
+        toolchain, _git_repo_hash(), decide_recommended(report.checks), report.checks,
+        decide_spec_unlock_candidate(report.checks))
     emit_report(payload, args.save_out)
     return report_exit_code(report.checks)
 
