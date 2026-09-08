@@ -7,11 +7,12 @@ Nano-vLLM：从零实现的极简 vLLM（研究/学习用代码库，非生产�
 脚本需要**本地模型目录**（不能用 HuggingFace hub id）和 CUDA 兼容 GPU（NVIDIA，或 Iluvatar + `corex` 后端）。本机（RTX 4070 Laptop 8GB / WSL2）实际使用 `~/vllm-env/bin/python3`（Python 3.12, torch 2.11, transformers 5.15）：
 
 ```bash
-~/vllm-env/bin/python3 -m scripts.benchmark /path/to/Qwen3-1.7B [--spec-model <draft 目录>] [--backend corex]
+~/vllm-env/bin/python3 -m scripts.benchmark /path/to/Qwen3-1.7B [--spec-model <draft 目录>] [--no-think] [--backend corex]
 ~/vllm-env/bin/python3 -m scripts.openai_server /path/to/Qwen3-1.7B [--port 8000] [--eager] [--spec-model <draft 目录>] [--spec-num-tokens k]
 ```
 
 - **2026-09 精简**：benchmark 仅保留 question.jsonl 串行基准（vllm bench serve 对齐口径不变：seed shuffle / chat template / warmup 首条 / 单墙钟）；`benchmark graph|prefix` 子命令与 `check_eagle3` / `check_prefix_cache` / `verify_corex.sh` / `verify_ascend310p.sh` 已删除——文中历史锚点（E=2.095、CoreX 五步清单等）出自已移除的脚本，口径描述仍有效。
+- **benchmark 内置 spec 接受统计 + `--no-think`（2026-09-08）**：`--spec-model` 时汇总打印 Acceptance length (E) / token 接受率 / 逐位置接受率——脚本侧 monkey-patch `spec_round`（每轮返回列表长度 = 接受数 m + 1 bonus，图/eager、冷/热四路统一从 `_readback_spec_commit` 出），预热后安装、仅计主跑；EOS/max_tokens 截断发生在 scheduler 层、图内 cnt 不感知，收尾轮轻微高估（CoreX 实测 2560 token 多计 5 个 ≈0.2%，可忽略）。check_eagle3 删除后 E 锚点复现职责由 benchmark 接管。`--no-think` = 对 chat template 显式传 `enable_thinking=False`（默认不传 kwargs，与 vllm bench 逐字节一致），表头打印 `thinking=` 状态便于对表。
 - 必须以模块方式从仓库根目录运行（`-m scripts.X`），不能 `python scripts/X.py`（本机 shell 有 ROS 的 PYTHONPATH，`scripts/__init__.py` 用于避免包遮蔽）。
 - 脚本只跑 GPU 且对数值敏感：计时前先预热引擎。
 - `--eager` / `enforce_eager=True` 关闭 CUDA Graph 捕获（小显存卡推荐）；CUDA Graph 需按 batch 形状逐桶捕获，遇到未捕获形状首轮会失败。
@@ -24,7 +25,7 @@ Nano-vLLM：从零实现的极简 vLLM（研究/学习用代码库，非生产�
 - WSL 下显存回收有数秒延迟：`allocate_kv_cache` 已做预算不足时的等待重试。
 - 对照基线：vLLM 0.26 需 `VLLM_WSL2_ENABLE_PIN_MEMORY=1` 才能在 WSL2 跑通；spec_bench 数据在 `~/vllm-lab/benchdata/spec_bench/question.jsonl`，模型在 `~/vllm-lab/models/`（Qwen3-1.7B、Qwen3-1.7B-EAGLE3=腾讯 AngelSlim 官方等）。
 - EAGLE3 draft checkpoint 的 config.json **没有** aux 层字段 / fc_norm / norm_before_fc；aux 层用引擎默认 (2, n//2, n-3)。
-- spec_bench 验收脚本曾晋升为 `scripts/check_eagle3.py`（E/逐位置接受率/直方图/TPS；`--save-out`/`--tag` 输出与回归 compare 流程同 schema），2026-09 已随精简删除；测试工件在 `~/vllm-lab/benchdata/nv_regression/`。
+- spec_bench 验收脚本曾晋升为 `scripts/check_eagle3.py`（E/逐位置接受率/直方图/TPS；`--save-out`/`--tag` 输出与回归 compare 流程同 schema），2026-09 已随精简删除（E/接受率统计职责移入 benchmark `--spec-model`，见「命令」节）；测试工件在 `~/vllm-lab/benchdata/nv_regression/`。
 - 数值确定性：bf16 下目标模型自身就随 batch 形状漂移（逐个 vs 批量跑同一批 prompt 有 3/10 输出分歧）——"投机 vs 非投机逐 token 一致"只在无分歧翻转的负载上成立。
 - Cherry 式流式对比以 stream_bench 为准；spec 开关对低 E 负载可能负收益，对比时须同时报告 E。
 
@@ -106,7 +107,8 @@ Nano-vLLM：从零实现的极简 vLLM（研究/学习用代码库，非生产�
 - **vllm bench spec_bench 真实口径（读 vllm-env 0.26 bench 源码核对，旧记载有误已修正）**：prompt **不是 raw 文本**——`CustomDataset.sample`（SpecBench 继承）对 prompt **套 chat template**（`tokenize=False` 字符串、不传 kwargs → Qwen3 默认 enable_thinking）后发 completions；数据集加载即 `random.seed(--seed)`+shuffle 取前 N（`--seed` 默认 0）；输出上限 = `--spec-bench-output-len` 默认 **256**；预热 = 就绪检查 1 次 + `--num-warmups 5` 次同一首条 prompt（均不计指标）。
 - **jsonl 已同构复刻（默认即对齐）**：① prompt 构造——模板字符串再 encode（V1.8 的 `--raw-prompt` 已随对齐删除）；② 采样——`--seed` 默认 0 + shuffle（`-1`=文件序「前 N 条」历史口径），同 seed 即同 prompt 集；③ `--max-tokens` 默认 256；④ `--warmup` 默认 5、统一打 qs[0]；⑤ 吞吐改**单墙钟**（Σtokens / 主跑总墙钟，含逐条 tokenize/打印）= vllm Output token throughput 同口径。**同 seed → 同 prompt 集 → E 相同 → spec TPS 可直接同表**（原「spec TPS 强依赖 E 不可直接比」结论作废）。
 - **残余口径差**：① TTFT——vllm 为 client 端（HTTP 往返，高几 ms），jsonl 为进程内，只比趋势；② vllm 侧 client 协议税（逐 chunk SSE 解析在其计时窗内，实测 ~1-4%）使 vllm TPS 天然偏低；③ EOS 计数差 1 token/条（<1%）。其余前提不变：vLLM server 显式开 spec（bench 只是 client）、确认同硬件。
-- **历史口径回溯**：旧 jsonl 数字（如 CoreX 三配置 8.1/76.5/104.1）= 文件序前 N + token 化模板（enable_thinking=False）+ 512 + warm 3 + 分墙钟——`--seed -1 --max-tokens 512 --warmup 3` 近似重现；E=2.095 锚点的精确复现走 check_eagle3 家族口径（未动）。
+- **thinking 口径对 E 的影响（2026-09-08 CoreX 实测，勿误判回归）**：Qwen3 模板不传 kwargs = enable_thinking=True，输出先吐 `<think>` 推理文本，draft 可预测性显著低于直答。同 seed 同题集单变量对照（k=3, max_tokens 256, temp0）：thinking-on **E=1.748 / 85.3 tok/s** → `--no-think` **E=2.125 / 101.3 tok/s**（E +22%）。**历史 E 锚点（4070 的 2.095、CoreX 的 2.050）全部是 thinking-off 口径**——对齐 vllm bench（thinking-on）跑出 E≈1.7-1.8 属正常，勿与锚点直接比；对比时认准 benchmark 表头 `thinking=` 状态，两边口径必须一致。
+- **历史口径回溯**：旧 jsonl 数字（如 CoreX 三配置 8.1/76.5/104.1）= 文件序前 N + token 化模板（enable_thinking=False）+ 512 + warm 3 + 分墙钟——`--seed -1 --max-tokens 512 --warmup 3 --no-think` 重现（2026-09-08 CoreX 实测 E=2.050、TPS=103.7，与 check_eagle3 锚点逐位一致：benchmark 内置统计与旧脚本同构互证，check_eagle3 删除后的锚点复现即此命令；4070 的 E=2.095 同款命令待复测）。
 
 ## CoreX（Iluvatar）移植状态——实机验证通过（2026-09，32GB 板卡 / corex-4.4.0 / Python 3.10 / transformers 4.57.6）
 

@@ -25,8 +25,9 @@ class Block:
 
 class BlockManager:
 
-    def __init__(self, num_blocks: int, block_size: int):
+    def __init__(self, num_blocks: int, block_size: int, enable_prefix_cache: bool = True):
         self.block_size = block_size
+        self.enable_prefix_cache = enable_prefix_cache
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
@@ -62,6 +63,9 @@ class BlockManager:
         self.free_block_ids.append(block_id)
 
     def can_allocate(self, seq: Sequence) -> int:
+        # 关闭前缀缓存：不查哈希表，全部按新块分配（-1 = 空闲块不足）。
+        if not self.enable_prefix_cache:
+            return 0 if len(self.free_block_ids) >= seq.num_blocks else -1
         h = -1
         num_cached_blocks = 0
         num_new_blocks = seq.num_blocks
@@ -133,6 +137,10 @@ class BlockManager:
         return True
 
     def hash_blocks(self, seq: Sequence):
+        # 关闭前缀缓存：跳过 hash 计算与哈希表登记（含每步 decode 的开销），
+        # 块保持 hash=-1，can_allocate 也不会命中任何条目。
+        if not self.enable_prefix_cache:
+            return
         start = seq.num_cached_tokens // self.block_size
         end = (seq.num_cached_tokens + seq.num_scheduled_tokens) // self.block_size
         if start == end: return
