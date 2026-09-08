@@ -75,6 +75,28 @@ def _has_op(name):
     return _OP_CACHE[name]
 
 
+# ACL_FORMAT_FRACTAL_NZ：CANN 分形 NZ 排布的 format 编号（npu_format_cast 的
+# 目标 format；参考实现 probe_310p_native_attention.py 与 probe_ascend310p.py
+# 的 _check_flash_nz 同款常量）。
+ACL_FORMAT_FRACTAL_NZ = 29
+
+
+def _nd_to_nz_rearrange(mask_2d):
+    """nd → NZ 分形重排的纯 torch 前半段（CPU 可跑、零 torch_npu 依赖）。
+
+    写法逐行对照参考实现 probe_310p_native_attention.py:33-38（即其注释
+    "Equivalent to vllm_ascend.utils.nd_to_nz_2d for aligned dimensions" 的
+    等价展开）：[S, S] → reshape(1, S, S//16, 16) → transpose(1, 2) →
+    contiguous()，得 [1, S//16, S, 16] 连续张量——npu_format_cast(
+    ACL_FORMAT_FRACTAL_NZ) 的输入形态。后半段 npu_format_cast 为 NPU 专属
+    调用（本机无 torch_npu 不可执行），由 _nz_causal_mask 在设备上收口，
+    板端数值契约由 probe 的 _check_flash_nz 裁决；本函数即微测对照的引擎侧
+    纯函数形态。要求边长 16 对齐（调用方守卫负责）。
+    """
+    s0, s1 = mask_2d.shape
+    return mask_2d.reshape(1, s0, s1 // 16, 16).transpose(1, 2).contiguous()
+
+
 def setup_env():
     """收口 torch_npu 的环境耦合：必须在 torch_npu 首次 import 前调用。
 
@@ -129,6 +151,10 @@ class Ascend310PBackend(BackendBase):
         self._mask_device = None
         # bool 掩码被 CANN 拒收后的偏好锁存（见 prefill_attention）。
         self._mask_wants_fp16 = False
+        # NZ 分形掩码缓存（flash_incre 档 prefill 专用，fp16 -inf 形态 + NZ 排布）：
+        # 与上面 bool 掩码缓存并列实现（形态不同，不共用），同"只增不减"模式。
+        self._nz_mask = None
+        self._nz_mask_device = None
 
     # ---- 设备代理（Tier-2 收口）：base 默认 torch.cuda.*，NPU 机器必须镜像 torch.npu.* ----
 
@@ -216,6 +242,16 @@ class Ascend310PBackend(BackendBase):
         v_cache.view(blocks * block_size, kv_heads, head_dim)[idx] = value.to(v_cache.dtype)[valid]
 
     def prefill_attention(self, q, k, v, context, scale):
+        # 档位分派（attention_impl 选型语义见类属性注释）：
+        # - flash_incre → _prefill_flash_nz（310P 板端唯一实证形态，保底档，
+        #   eager-only）：图兼容双模（use_cuda_graph 张量/list）仅 fia_v2 档
+        #   承担——flash_incre 档下引擎图捕获会失败降级 eager（可接受，capture
+        #   的 try/except 已兜底）；
+        # - fia_v2 / auto → 下方 TND 现路径原样。auto 暂按 fia_v2 处理（与 T5
+        #   store 的 auto 语义对齐：先给可用路径，auto 的最终裁决归 probe 报告，
+        #   任务 9 接管后注入实际档位值）。
+        if self.attention_impl == "flash_incre":
+            return self._prefill_flash_nz(q, k, v, context, scale)
         tn = _torch_npu()
         # 图兼容双模：capture/verify 路径以 int32 张量传 cu_seqlens（tolist 的
         # D2H 同步不可入图）；eager prefill 用 list（参考实现便捷口径）。
@@ -291,6 +327,92 @@ class Ascend310PBackend(BackendBase):
         if self._mask_fp16 is None:
             self._mask_fp16 = mask.to(torch.float16)
         return self._mask_fp16
+
+    # ---- flash_incre 档 prefill（_npu_flash_attention + NZ 分形掩码）----
+    # 310P 板端唯一实证过的 attention 形态（vllm-ascend 310P prefill 同款私有
+    # 算子）：_npu_flash_attention + NZ 因果掩码 + q/kv 等长。算子契约与参考
+    # 实现 probe_310p_native_attention.py、compat 的 _prefill 及本仓 probe
+    # scripts/probe_ascend310p.py 的 _check_flash_nz 同源（引擎侧与探针侧同一
+    # 形态，两处须保持同构）。与 fia_v2（TND，性能候选）并存 = 计划决策 D1。
+
+    def _prefill_flash_nz(self, q, k, v, context, scale):
+        """flash_incre prefill：q/k/v 等长 varlen [total_tokens, H, D] 单次前向。
+
+        eager-only：NZ 掩码构建与 seq_len 的 CPU 构造均含 host 交互，不可入图
+        ——图捕获仅 fia_v2 档承担（见 prefill_attention 分派注释）。
+        """
+        tn = _torch_npu()
+        # 防御层：prefix-hit 形态（k/v=整池 4D 切片、kv 长于 q）不该到达本档
+        # ——supports_prefix_cache=False 已在引擎层全局排除，此处兜底报错而非
+        # 静默错算。
+        if context.block_tables is not None:
+            raise RuntimeError(
+                "flash_incre 档不消费 prefix-hit 形态（block_tables 非空）——"
+                "310P 后端 supports_prefix_cache=False 已全局排除该负载，"
+                "出现此错误说明引擎能力位被绕过"
+            )
+        # 逐序列长度（CPU int32，host sync——本档 eager-only 可接受；算子口径
+        # 同 compat._prefill 的 seq_len=逐序列长度，非 cumsum）。
+        q_off = context.cu_seqlens_q.to(device="cpu", dtype=torch.int32)
+        k_off = context.cu_seqlens_k.to(device="cpu", dtype=torch.int32)
+        q_lens = q_off[1:] - q_off[:-1]
+        k_lens = k_off[1:] - k_off[:-1]
+        if not torch.equal(q_lens, k_lens):
+            raise RuntimeError(
+                "310P flash_incre 档要求 prefill 逐序列 q/kv 等长——当前批 "
+                "cu_seqlens_q/k 不一致（多为 prefix cache 命中形态，该形态应由 "
+                "supports_prefix_cache=False 全局排除）"
+            )
+        out = torch.empty_like(q)
+        # 参数组逐项对照 probe _check_flash_nz / compat._prefill：q/k/v varlen
+        # 压缩 [total_tokens, H, D]（B=1 隐含）、mask=NZ 分形掩码、seq_len=CPU
+        # int32 逐序列长度、out 预分配同形。
+        tn._npu_flash_attention(
+            query=q.contiguous(),
+            key=k.contiguous(),
+            value=v.contiguous(),
+            mask=self._nz_causal_mask(q.device, context),
+            seq_len=q_lens.contiguous(),
+            scale_value=scale,
+            num_heads=q.shape[-2],
+            num_kv_heads=k.shape[-2],
+            out=out,
+        )
+        # [total_tokens, H, D] → [total_tokens, H*D]（attention 层消费口径，
+        # 与 decode_attention 的返回形态一致）。
+        return out.reshape(q.shape[0], -1)
+
+    def _nz_causal_mask(self, device, context):
+        """NZ 分形因果掩码（fp16 -inf 上三角，npu_format_cast 转分形 NZ）缓存。
+
+        尺寸口径同 _causal_mask：max_context_len or max_seqlen_k。max_model_len
+        守卫用该目标尺寸作代理判定（context 无 max_model_len 字段）：仅在新
+        构建时检查（掩码可大于序列——probe 512 掩码配 seq=2 同理；缓存已覆盖
+        时不重建、不再拦）。16 对齐是 NZ 分形排布的硬约束，≤2048 为掩码内存
+        上界；该约束仅 flash_incre 档有，fia_v2 档无。
+        """
+        size = context.max_context_len or context.max_seqlen_k
+        if self._nz_mask is None or self._nz_mask_device != device or self._nz_mask.shape[0] < size:
+            if size % 16 != 0 or size > 2048:
+                raise RuntimeError(
+                    f"flash_incre 档 NZ 掩码目标尺寸 {size} 不满足约束"
+                    "（须 16 对齐且 ≤2048）——本档以掩码尺寸代理 max_model_len "
+                    "校验，请将 max_model_len 配置为 16 的倍数且不超过 2048"
+                    "（fia_v2 档无此约束）"
+                )
+            # 构建写法逐行对照 probe _check_flash_nz：CPU 构建 fp16 -inf 因果
+            # 掩码 → nd_to_nz 前半段重排（纯 torch，模块级 _nd_to_nz_rearrange）
+            # → 设备上 npu_format_cast 转分形 NZ（NPU 专属，板端数值契约由
+            # probe 裁决）。
+            mask = torch.zeros((size, size), dtype=torch.float16)
+            mask.masked_fill_(
+                torch.triu(torch.ones_like(mask, dtype=torch.bool), diagonal=1),
+                float("-inf"),
+            )
+            rearranged = _nd_to_nz_rearrange(mask).to(device)
+            self._nz_mask = _torch_npu().npu_format_cast(rearranged, ACL_FORMAT_FRACTAL_NZ)
+            self._nz_mask_device = device
+        return self._nz_mask
 
     # ---- 算子融合点覆盖 ----
     # （rope 纯 torch、get_kv_cache_shape=CUDA 族布局、graph_slot_mapping_dtype=int32
