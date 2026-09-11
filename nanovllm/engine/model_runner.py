@@ -597,26 +597,20 @@ class ModelRunner:
         # 代价 ≤1 槽 ssm（fp32 ~1MB），enforce_eager 下闲置无害。
         slots += 1
         self._gdn_pad_slot = slots - 1
-        # 形状键名双兼容：模型侧实际返回 conv_shape/ssm_shape（阶段1b 契约文本
-        # 写作 conv/ssm），以模型落地为准、两键名都认，防任一侧改动即炸。
-        conv_shape = spec.get("conv_shape") or spec["conv"]
-        ssm_shape = spec.get("ssm_shape") or spec["ssm"]
+        conv_shape = spec["conv_shape"]
+        ssm_shape = spec["ssm_shape"]
         # conv 状态用模型 dtype、ssm 状态 fp32——形状与 dtype 均以 get_gdn_state_spec()
         # 声明为准（勿在引擎侧硬编码，模型侧按 text_config 计算口径唯一）。
         self.conv_pool = torch.empty((n_gdn, slots) + tuple(conv_shape), dtype=spec["conv_dtype"])
         self.ssm_pool = torch.empty((n_gdn, slots) + tuple(ssm_shape), dtype=spec["ssm_dtype"])
         self._gdn_state_bytes = (self.conv_pool.numel() * self.conv_pool.element_size()
                                  + self.ssm_pool.numel() * self.ssm_pool.element_size())
-        # GDN 模块识别：优先用模型侧声明的 gdn_layers（按 GDN 层序的权威模块
-        # 引用，模型侧契约字段）；未暴露时退回与 k_cache/v_cache 同款鸭子类型
-        # （契约：GDN 模块自带 conv_cache/ssm_cache 占位属性等待注入）。
-        gdn_mods = getattr(self.model.model, "gdn_layers", None)
-        if gdn_mods is None:
-            gdn_mods = [m for m in self.model.modules()
-                        if hasattr(m, "conv_cache") and hasattr(m, "ssm_cache")]
+        # GDN 模块识别：模型侧契约字段（按 GDN 层序的权威模块引用，
+        # qwen3_5 恒赋值）。
+        gdn_mods = self.model.model.gdn_layers
         assert len(gdn_mods) == n_gdn, (
             f'GDN 模块识别数({len(gdn_mods)})与层数({n_gdn})不符：模型侧需以 '
-            f'gdn_layers 或 conv_cache/ssm_cache 占位属性声明 GDN 模块（引擎按此注入状态池切片）')
+            f'gdn_layers 声明 GDN 模块（引擎按此注入状态池切片）')
         for gdn_ord, module in enumerate(gdn_mods):
             # 注入该层的池切片 [slots, *state_shape]：模块 forward 用
             # context.gdn_state_slots[row] 在 slot 维索引读写。

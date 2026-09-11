@@ -82,8 +82,8 @@ class LLMEngine:
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
         if self.model_runner.is_hybrid:
-            # hybrid：序列 finish 即释放 GDN 状态槽（spec 与 hybrid 互斥，见
-            # model_runner 的 spec 守卫，故两条 drop 路径不会同时生效）。
+            # hybrid 非 spec 步：序列 finish 即释放 GDN 状态槽（spec 配对走
+            # step_spec，其 _drop_finished_spec_state 同步释放 spec + GDN 状态）。
             self._drop_finished_gdn_state(seqs)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens

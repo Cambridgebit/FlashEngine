@@ -13,9 +13,8 @@ from .base import BackendBase
 class CoreXBackend(BackendBase):
 
     name = "corex"
-    # 厂商 torch 提供 NCCL 兼容层，V1.3 实测路径；TP all_reduce 暂继承 base 的
-    # NCCL 路径（ixformer.distributed 等单卡/NCCL 路径稳定后，再经
-    # NANOVLLM_COREX_USE_IXFD=1 切换）。
+    # 厂商 torch 提供 NCCL 兼容层，V1.3 实测路径；TP all_reduce 继承 base 的
+    # NCCL 路径。
     dist_name = "nccl"
     # spec 图捕获 CoreX 实测可成功（2026-09 实机验证：单图整轮一次通过，
     # E=2.050 / TPS 103.7）；尝试失败仍自动降级 eager spec 轮（见

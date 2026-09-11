@@ -601,7 +601,7 @@ def main():
                         help="enforce_eager=True（跳过 CUDA Graph capture，启动更快）")
     parser.add_argument("--compile", action="store_true",
                         help="torch.compile 编译模型（CoreX 上约 8% prefill 提速）")
-    parser.add_argument("--backend", default="auto", choices=["auto", "cuda", "corex"])
+    parser.add_argument("--backend", default="auto", choices=["auto", "cuda", "corex", "ascend310p"])
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--max-num-seqs", type=int, default=None)
     parser.add_argument("--block-size", type=int, default=None,
