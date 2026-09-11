@@ -1,27 +1,30 @@
-# EAGLE3 × nano-vLLM 耦合实现说明
+# EAGLE3 在 nano-vLLM 上的实现说明
 
-> 本文面向想读懂 / 改动本项目投机解码路径的开发者，说明 EAGLE3 draft 模型是如何与
-> nano-vLLM 引擎（调度、KV 管理、CUDA Graph、多硬件后端）耦合的。
-> 全部内容以源码为准：`nanovllm/models/eagle3.py`、`nanovllm/engine/model_runner.py`、
+> 本文面向要读懂或修改本引擎投机解码路径的开发者，说明 EAGLE3 的草稿模型是如何与引擎
+> （调度、KV 缓存、计算图、多硬件后端）配合的。
+> 内容以源码为准：`nanovllm/models/eagle3.py`、`nanovllm/engine/model_runner.py`、
 > `nanovllm/engine/llm_engine.py`、`nanovllm/engine/scheduler.py`、`nanovllm/models/qwen3.py`。
 > 性能数据与历史口径见 [AGENTS.md](AGENTS.md)。
 
 ---
 
-## 0. TL;DR
+## 0. 摘要
 
-- **draft 是"半个模型"**：单层 decoder（midlayer）+ fc(3H→H) + 压缩词表头；embedding 与
-  target **共享**，KV cache 与 target **同槽位布局、独立存储**。
-- **target 是"验证器"**：只在 3 个固定层前捕获 aux 隐层（`Qwen3Model` 加一个元组字段），
-  验证时 `[末位提交 token, d1..dk]` 一次前向，顺带产出供 draft 用的 aux。
-- **编排全在 ModelRunner**：一轮投机 = 采样行引导 → draft 链式起草 → target 验证 →
-  图内链式接受 → refill（虚构窗口重放 + 下一轮采样行）。模型层保持"哑"的，
-  所有口径、状态、缓冲都在引擎层。
-- **eager 与图同构**：eager 轮直接复用图轮 body（`_sg_round(use_cuda_graph=False)`），
-  冷启动只在 eager 里多一步"采样行引导"；图捕获失败自动降级，功能不受影响。
-- **整轮单图**：draft 链 + verify + 接受 + refill + 采样全部录进一张 CUDA Graph，
-  每轮 2 次 H2D（pinned 元数据 blob）+ 1 次 D2H（commit_buf），实测"spec 必须有图"
-  （CoreX：eager spec 11.3 tok/s → 图 103.7 tok/s）。
+- **草稿模型只是"半个模型"**：一层解码器（中间层），外加一个把三层隐层拼起来压回原维度的
+  投影层，和一个缩小的输出词表。它和主模型**共享词嵌入**，KV 缓存用**相同的槽位布局、
+  但单独存放**。
+- **主模型充当"核对者"**：只在固定的三个层提前取出辅助隐层（在 Qwen3 模型里加一个元组
+  字段记录层号），核对时一次前向吃进「最后一个已提交词 + 本轮全部草稿词」，顺带产出草稿
+  模型下一步要用的辅助隐层。
+- **一轮的编排都写在 ModelRunner 里**：采样行引导 → 草稿模型链式起草 → 主模型核对 →
+  图内逐位接受 → 重放（用虚构窗口回填缓存，并采出下一轮首个草稿词）。模型层只做纯计算，
+  所有约定、跨轮状态、缓冲区都放在引擎层。
+- **逐算子执行与计算图共用同一套代码**：逐算子轮直接复用图轮的主体
+  （`_sg_round(use_cuda_graph=False)`），冷启动时只多一步"采样行引导"；图捕获失败会自动
+  退回逐算子执行，功能不受影响。
+- **整轮只录一张计算图**：草稿链、核对、接受、重放、采样全部录进一张 CUDA 计算图，每轮
+  只有 2 次主机→设备拷贝（固定内存里的元数据）和 1 次设备→主机拷贝（提交结果）。实测
+  "投机必须配图"：CoreX 上逐算子 11.3 tok/s，成图后 103.7 tok/s。
 
 ---
 
@@ -29,29 +32,30 @@
 
 | 原则 | 落地方式 |
 |---|---|
-| 模型层最小侵入 | target 只加 `aux_hidden_state_layers` 元组；draft 是普通模块；不改算子层签名 |
-| 编排集中在引擎层 | `ModelRunner` 独占投机流程；`LLMEngine.step_spec()` 只做步进分派与状态清理 |
-| eager / 图同构 | 图轮 body（`_sg_*` 方法族）同时是 eager 轮的执行体，杜绝两套实现数值漂移 |
-| 状态按 seq_id 键控 | batch 组成每轮会变，跨轮状态（carry/隐层）用 `dict[seq_id]`，不用位置索引 |
-| 能力位裁决，只降速不崩溃 | 后端声明 `supports_spec` / `supports_spec_graph` / `graph_sample_default`；图捕获失败 try/except 降级 |
-| 图安全优先 | 元数据走 pinned blob + 图内 scatter；采样用无动态 shape 的 Gumbel fast path |
+| 尽量不改模型层 | 主模型只多一个记录辅助层号的元组字段；草稿模型是普通模块；算子层接口不变 |
+| 编排集中在引擎层 | 投机流程只由 `ModelRunner` 负责；`LLMEngine.step_spec()` 只做步进分派和状态清理 |
+| 逐算子与计算图同构 | 图轮主体（`_sg_*` 这组方法）同时就是逐算子轮的执行体，避免两套实现产生数值差异 |
+| 跨轮状态按序列编号存放 | 连续批处理下每轮批次组成会变，跨轮状态用 `dict[序列编号]`，不用批次内的位置索引 |
+| 按后端能力裁决，只降速不崩溃 | 后端声明 `supports_spec` / `supports_spec_graph` / `graph_sample_default`；图捕获失败时捕获异常并退回 |
+| 优先保证图安全 | 元数据放在固定内存缓冲区并在图内分发；采样用不依赖动态形状的 Gumbel 快路径 |
 
-约束：**spec 仅支持 TP=1**（draft 种子状态在 rank0，`config.py` 显式断言）。
+约束：**投机解码只支持单卡（张量并行 = 1）**（草稿的种子状态在 0 号卡上，`config.py` 有
+显式断言）。
 
 ---
 
-## 2. 组件地图
+## 2. 涉及的文件
 
 ```
-config.py                 spec_model / spec_num_tokens / spec_aux_layers 字段 + 校验
-engine/llm_engine.py      step_spec(): prefill 分派 / decode 轮编排 / 完成态清理
-engine/scheduler.py       prepare_spec_round() 容量预分配；commit_spec() 多 token 提交 + EOS 截断
-engine/block_manager.py   ensure_capacity() 投机轮预分配 block
-engine/model_runner.py    ★ 核心：run_prefill_spec / spec_round / _sg_* / MetaBlob / 图捕获
-models/qwen3.py           Qwen3Model.aux_hidden_state_layers：aux 隐层捕获点
-models/eagle3.py          Eagle3DraftModel：fc + midlayer + 压缩词表头 + d2t/t2d
-layers/sampler.py         forward_native()：图安全采样（top-k 掩码 + Gumbel-argmax）
-backends/*                能力位、slot dtype、KV 布局、图 API 工厂
+config.py                 投机开关、草稿词数、辅助层号等配置与校验
+engine/llm_engine.py      step_spec()：预填充分派 / 解码轮编排 / 结束后清理
+engine/scheduler.py       prepare_spec_round() 预留容量；commit_spec() 一次提交多个词并处理结束符
+engine/block_manager.py   ensure_capacity()：为投机轮预留缓存块
+engine/model_runner.py    ★ 核心：预填充、单轮编排、图内各阶段、元数据缓冲、图捕获
+models/qwen3.py           主模型里记录辅助隐层的捕获点
+models/eagle3.py          草稿模型：投影层、中间层、缩小的输出词表、词表映射
+layers/sampler.py         图安全的采样实现（top-k 掩码 + Gumbel 取最大）
+backends/*                后端能力声明、槽位数据类型、KV 布局、计算图接口
 ```
 
 ---
@@ -62,222 +66,193 @@ backends/*                能力位、slot dtype、KV 布局、图 API 工厂
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `spec_model` | `""` | draft checkpoint 目录（官方 EAGLE-3 权重）；空 = 关闭投机 |
-| `spec_num_tokens` | `4` | 每轮起草 token 数 k（文档示例/基准常用 k=3） |
-| `spec_aux_layers` | `()` | aux 捕获层索引；未显式给则取 `(2, n//2, n-3)`（与官方 EAGLE / vLLM 的 Qwen3 捕获点一致，如 1.7B n=28 → (2,14,25)） |
+| `spec_model` | 空 | 草稿模型目录；留空即关闭投机 |
+| `spec_num_tokens` | 4 | 每轮起草的词数 k（示例与基准常用 3） |
+| `spec_aux_layers` | 空 | 辅助隐层的捕获层号；不指定时取 `(2, n//2, n-3)`（与官方 EAGLE / vLLM 的 Qwen3 取法一致；1.7B 共 28 层 → `(2, 14, 25)`） |
 
-校验（`__post_init__`）：`tensor_parallel_size == 1`、draft 目录存在、`k >= 1`、恰好 3 个 aux 层
-（EAGLE3 的 fc 输入就是 3 层隐层拼接）。
+校验（初始化时）：张量并行必须为 1、草稿目录必须存在、k ≥ 1、恰好 3 个辅助层（投影层固定
+吃 3 层隐层的拼接）。
 
 ### 3.2 初始化顺序（`ModelRunner.__init__`）
 
-1. 加载 target（Qwen3ForCausalLM）；
-2. spec 启用时：**先**打开 aux 捕获（`model.model.aux_hidden_state_layers = spec_aux_layers`，
-   必须在 warmup 前，否则 prefill 前向不返回 aux），再从 draft 目录读 config、构建
-   `Eagle3DraftModel` 并加载权重；
-3. `warmup_model()`：spec 路径连 draft prefill 一起预热（dummy 序列，预热后清空 `spec_hidden`）；
-4. `allocate_kv_cache()`：**draft KV 池的显存一并计入预算**（见 §4.3）；
-5. 分配 spec 专用缓冲：`_sblob`（pinned 元数据）与 `_sg`（图静态 buffer）——
-   在 KV 分配**之后**，保持 KV 预算口径与基线一致；
-6. 图捕获：普通路径 `capture_cudagraph()`；spec 路径过三重门后 `capture_spec_cudagraph()`（§9）。
+1. 加载主模型（Qwen3ForCausalLM）。
+2. 若启用投机：**先**打开辅助隐层捕获（必须在预热之前设置，否则预填充前向不返回辅助隐层），
+   再读草稿模型配置、构建 `Eagle3DraftModel` 并加载权重。
+3. 预热：投机路径连草稿的预填充一起预热（用假序列，预热后清掉辅助隐层缓存）。
+4. 分配 KV 缓存：**草稿模型的缓存显存也算进预算**（见 §4.3）。
+5. 分配投机专用缓冲（固定内存的元数据缓冲、图用的静态缓冲）——放在 KV 分配**之后**，
+   保持缓存预算与不开投机的基线一致。
+6. 捕获计算图：普通路径捕获解码图；投机路径通过三重检查后捕获整轮图（见 §9）。
 
-### 3.3 draft 权重加载（`eagle3.py: load_eagle3_draft`）
+### 3.3 草稿权重加载
 
-- 支持 `pytorch_model.bin` 与 safetensors；
-- `q/k/v_proj → qkv_proj`、`gate/up_proj → gate_up_proj` 的分片重映射**复用** Qwen3 的
-  `PACKED_MODULES_MAPPING`（draft midlayer 与 target 同命名约定）；
-- `d2t` / `t2d` 是注册 buffer，直接 `copy_`；
-- **checkpoint 中不含 embedding**——`Eagle3DraftModel.__init__` 直接收 target 的
-  `embed_tokens` 模块引用，权重天然共享。
+- 支持 `pytorch_model.bin` 与 safetensors 两种格式；
+- q/k/v 与 gate/up 的分片重映射**复用**主模型已有的规则（草稿中间层与主模型的命名一致）；
+- 草稿词表到主词表的映射表作为普通缓冲直接拷入；
+- **权重里没有词嵌入**——草稿模型直接引用主模型的词嵌入模块，天然共享。
 
 ---
 
-## 4. 两个模型怎么"握手"
+## 4. 两个模型如何配合
 
-### 4.1 aux 隐层捕获（target → draft 的信息通道）
+### 4.1 辅助隐层（主模型交给草稿模型的信息）
 
-`Qwen3Model` 增加一个字段：
+主模型里新增一个字段，默认为空表示普通路径：
 
 ```python
-self.aux_hidden_state_layers: tuple[int, ...] = ()   # 空 = 普通路径
+self.aux_hidden_state_layers: tuple[int, ...] = ()
 ```
 
-forward 中在**运行第 i 层之前**记下该层的输入隐状态（含残差、未过 final norm），
-即"第 i-1 层的完整输出"；结束时返回 `(final_hidden, cat([low, mid, high], -1))`，
-拼接顺序与 draft fc 权重的训练顺序一致。普通路径（元组为空）零开销。
+前向时在**跑第 i 层之前**记下该层的输入隐状态（含残差、未过最终归一化），也就是"第 i-1 层
+的完整输出"；结束时返回 `(最终隐层, 三个捕获点拼接)`。拼接顺序与草稿模型投影层权重的训练
+顺序一致。普通路径（元组为空）没有任何额外开销。
 
-EAGLE3 的 fc 以 `cat(aux_low, aux_mid, aux_high)`（3×hidden）为输入投影回 hidden——
-这三个捕获点就是 draft 每步的"条件信号"来源。
+草稿模型的投影层把拼接后的三层隐层（3 倍维度）压回原维度，这三个捕获点就是草稿模型每一步
+的"条件信号"来源。
 
-### 4.2 draft 结构（`Eagle3DraftModel`）
+### 4.2 草稿模型的结构
 
 ```
-embed_tokens   ← 与 target 共享（同一模块引用）
-fc             Linear(3*hidden → hidden)：project_aux()
-midlayer       单层 decoder（Eagle3MidLayer）：
-                 - 注意力输入 = cat([input_layernorm(embeds), hidden_norm(x)])，2*hidden
-                 - llama 风格：无 q/k norm；qkv 输入维度与 hidden 解耦
-                 - 写自己的 KV cache（单层 → draft_kv_cache[.,0]）
-norm + lm_head 输出投影到 draft_vocab_size（压缩词表，如 32k vs target 152k）
-d2t            draft id → target id 的偏移映射：real_id = draft_idx + d2t[draft_idx]
+词嵌入      与主模型共享（同一个模块引用）
+投影层      3 倍维度 → 原维度
+中间层      单层解码器：
+               注意力输入 = [归一化后的词嵌入, 归一化后的上一步隐层] 拼接（2 倍维度）
+               没有 q/k 归一化；qkv 的输入维度与隐层维度解耦
+               写自己的 KV 缓存（只有一层）
+输出部分    归一化后接输出投影，打到缩小的草稿词表（约 32k；主模型约 152k）
+词表映射    草稿编号 → 主词表编号
 ```
 
 两个前向入口：
-- `forward_decode(positions, seed, token_ids) → (draft_hidden, draft_logits)`：链式起草步，
-  `draft_hidden` 直接作为下一步 seed；
-- `forward_prefill(positions, seed, token_ids) → hidden`：varlen 路径（context 由调用方
-  经 `set_context` 设置），用于 draft prefill 与 refill 的虚构窗口重放。
+- `forward_decode(位置, 种子, 词编号)`：链式起草的单步，输出的隐层直接作为下一步的种子；
+- `forward_prefill(位置, 种子, 词编号)`：用于草稿预填充和重放时的虚构窗口（上下文由调用方
+  设置）。
 
-### 4.3 KV cache：同槽位、双池
+### 4.3 KV 缓存：同槽位、两块池
 
-- draft 与 target **共用同一 `block_table` 与槽位映射**（`_slot_of(seq, p)`），
-  但各有一块独立连续池：`self.kv_cache`（target，L 层）与 `self.draft_kv_cache`
-  （draft，1 层 midlayer）。布局一致性由 `backend.get_kv_cache_shape` 保证
-  （cuda/ascend = BSHD、corex = HND，同后端两模型必同布局）。
-- 显存预算（`allocate_kv_cache`）在算 `block_bytes` 时把 draft 的层开销一并扣除，
-  因此 `num_kvcache_blocks` 对两个池同时够用。
-- 被 draft 写脏、但提案被拒绝的槽位**不清理**：注意力读窗恒在 `context_len` 内，
-  残留值会被后续轮次写入覆盖（§7.5、§10.4）。
+- 草稿模型与主模型**共用同一张块表和槽位映射**，但各有一块独立的连续缓存：主模型 L 层、
+  草稿模型 1 层。两者的内存布局由后端统一决定（CUDA / Ascend 为 BSHD，CoreX 为 HND），
+  同一后端下必然一致。
+- 分配时的显存预算把草稿模型的层也算进去，所以块数对两块池同时够用。
+- 草稿模型写脏、但提案被拒的槽位**不清理**：注意力读取的范围始终不超过实际上下文长度，
+  残留值会被后续写入覆盖（见 §7.5、§10.4）。
 
 ---
 
-## 5. 核心口径：shifted draft 流
+## 5. 核心约定：草稿流整体右移一位
 
-这是全路径统一的数据流约定（官方 EAGLE cnets 的 TTT 流式口径，与 vLLM padded 分支对齐）：
+这是整条路径统一的数据流约定（来自官方 EAGLE cnets 的流式口径，与 vLLM 的实现对齐）：
 
-> **rope 位置 p 的 draft 行**：embed 输入为 `tok@p+1`（右移一位），条件 seed 为
-> `fc(aux@p)` 或上一步 draft 隐层（look-ahead aux：target 已"看过"该行 embed 的那个
-> token），输出预测 `tok@p+2`。
+> **位置 p 上的草稿行**：输入用位置 p+1 的词（右移一位），条件是"投影后的位置 p 辅助隐层"
+> 或"上一步的草稿隐层"（辅助隐层带提前量：主模型已经看过这一行输入的那个词），输出预测
+> 位置 p+2 的词。
 
-draft prefill 与 decode 的虚构窗口（refill）都用此口径（embed 右移一位、末槽补
-next_token）。由此推导出各阶段的位置/槽位/读窗公式，见 §6、§7 的表格。
+草稿预填充和解码时的虚构窗口都遵循这个约定（输入右移一位，最后一行补上主模型当前要生成的
+词）。由此推出各阶段的位置、槽位、读窗公式，见 §6、§7。
 
-记号：`l = len(seq)`（本轮开始时已提交的 token 数），已提交 token 占据位置 `0..l-1`，
-`seq.last_token = tok@l-1`；`k = spec_num_tokens`，`rows = k+1`。
-
----
-
-## 6. Prefill 耦合：`run_prefill_spec`
-
-引擎 `step_spec()` 的 prefill 分支（与普通 prefill 共用 `prepare_prefill` 的全部输入组装）：
-
-1. **target 前向**：因 aux 捕获已打开，返回 `(hidden, aux)`；正常采样出首 token；
-2. **draft 同 chunk prefill**：`seed = fc(aux)` 后过 midlayer——
-   embed 取**右移一位**的输入：`cat([input_ids[off+1 : off+len], 首个采样 token])`，
-   即 rope p 的行 embed `tok@p+1`、末行补 next_token（§5 口径）。
-   context 与 target 完全一致（token 布局/槽位相同）→ prompt 每个位置的 draft KV 都写入；
-3. **落状态**：本步完成 prefill 的序列记录
-   `spec_hidden[seq_id] = aux 最后一行`（即预测首个采样 token 时的 aux@l-2，维度 [1, 3H]），
-   并置 `seq.spec_cold = True`（§8）。
-
-分块 prefill（chunked prefill）天然兼容：只有 chunk 补完 prompt 的那一步才记录 `spec_hidden`。
-draft prefill 的输出**丢弃**——它的意义只是把 draft KV 流填到 `l-2`；
-"采样行隐层"由冷启动轮复算得到（§8.2）。
+记号：`l` 为本轮开始时已提交的词数（已提交词占位置 `0..l-1`），`k` 为每轮起草词数，
+`rows = k+1`。
 
 ---
 
-## 7. Decode 耦合：一轮 `spec_round` 的五个阶段
+## 6. 预填充的配合
 
-引擎 decode 分支：`prepare_spec_round(k)`（§10.1）→ `spec_round(active)` →
-`commit_spec()`（§10.2）→ 清理完成序列的 spec 状态。
+引擎预填充分支与普通预填充共用输入组装：
 
-`spec_round` 的分派逻辑：
+1. **主模型前向**：因为已打开辅助隐层捕获，返回 `(最终隐层, 辅助隐层)`；正常采样出第一个词。
+2. **草稿模型同批预填充**：条件用投影后的辅助隐层，词嵌入取**右移一位**的输入（末位补上
+   第一个采样词）。上下文与主模型完全一致（词布局、槽位相同），所以每个位置的草稿 KV 都
+   被写入。
+3. **落状态**：本步完成预填充的序列记录辅助隐层的最后一行，并标记为"冷启动"（见 §8）。
 
-```python
-if spec_graphs is not None and seqs and not any(seq.spec_cold for seq in seqs):
-    bucket = _bucket(spec_graph_bs, len(seqs))
-    if bucket is not None: return _spec_round_graph(seqs, bucket)   # 图路径
-return _spec_round_eager(seqs)                                      # eager 路径
+分块预填充天然兼容：只有补完整个提示词的那一步才记录辅助隐层。草稿预填充的输出**丢弃**
+——它只是把草稿 KV 填到相应位置；真正需要的"采样行隐层"由冷启动轮重新算出（见 §8.2）。
+
+---
+
+## 7. 解码：一轮的五个阶段
+
+引擎解码分支：预留容量（§10.1）→ 单轮编排 → 提交（§10.2）→ 清理已结束序列的状态。
+
+单轮编排的分派：**有可用计算图、桶能覆盖当前批大小、且所有序列都不是冷启动**时才走图，
+否则整批走逐算子执行。两条路径执行**同一个主体**，只是引导方式不同：
+
+```
+主体（图内一次执行、逐算子时逐步执行）：
+  ① 分发      固定内存元数据 → 各静态缓冲
+  ② 起草      第 1..k-1 步链式起草，逐步采样出草稿词
+  ③ 核对      主模型一次前向 [最后一个已提交词, 草稿词1..k]，图内采样并暂存辅助隐层
+  ④ 接受      逐位比较取最长匹配前缀 m，组装提交结果
+  ⑤ 重放      用虚构窗口回填草稿缓存，并在第 m 行采出下一轮首个草稿词
+
+图路径：填元数据 → 复位填充 → 装入跨轮接力状态 → 2 次主机→设备 → 回放 → 1 次设备→主机读回
+逐算子：先补一步采样行引导（§8.2），再走同一主体
 ```
 
-有捕获图、桶覆盖、且**全部序列已有 carry**（无冷启动）才走图；否则整批走 eager。
-两条路径执行**同一个 body**（`_sg_round`），仅引导方式不同：
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│ _sg_round(bs)  ——单图整轮（eager 时同函数逐算子执行）                    │
-│                                                                      │
-│  ① _sg_scatter     pinned 元数据 blob → 各静态 buffer（图内分发）       │
-│  ② _sg_draft_chain 链步 1..k-1：draft 流式起草 + 逐步采样提案            │
-│  ③ _sg_verify      target 一次前向 [tok@l-1, d1..dk]，图内采样 + 暂存 aux │
-│  ④ _sg_acceptance  图内链式接受：最长匹配前缀 m，组装 commit_buf         │
-│  ⑤ _sg_refill      虚构窗口重放：draft KV 回填 verify 槽位              │
-│                     + 行 m 采样出下一轮 draft1 + carry_seed            │
-└──────────────────────────────────────────────────────────────────────┘
-  图路径：_fill_spec_meta → [padding 复位] → _load_spec_carry
-          → _push_spec_meta(2×H2D) → graph.replay() → _readback_spec_commit(1×D2H)
-  eager 路径：采样行引导（§8.2）→ 同一 _sg_round(use_cuda_graph=False) → 同一读回
-```
-
-### 7.1 链式起草（`_sg_draft_chain`，链步 i = 1..k-1）
+### 7.1 链式起草
 
 | 项 | 值 | 说明 |
 |---|---|---|
-| rope 位置 | `l + i - 2` | §5 口径：行预测 `tok@l+i` |
-| embed | `drafted_ids[i-1]` | 上一步的采样提案 = `tok@l+i-1 = tok@p+1`，**绝不回退 last_token**（C1 教训，§12） |
-| 条件 seed | 上一步 midlayer 输出（步 1 = `carry_seed`） | raw 输出，未过额外 norm |
-| KV 写槽 | `slot_of(l+i-2)` | draft 流延伸 |
-| 读窗 | `context_lens = l+i-1` | 提交前缀 + 本行自己的流槽——**任何接受数下都不读陈旧槽** |
-| 采样 | draft 词表（top_k 上限取 `draft_vocab_size`） | `map_to_target_ids` 后写入 `drafted_ids[i]` |
+| 位置 | `l + i - 2` | 该行预测位置 `l+i` 的词 |
+| 输入词 | 上一步采样出的草稿词 | 即位置 `l+i-1` 的词，**绝不退回用最后一个已提交词**（§12） |
+| 条件种子 | 上一步中间层的原始输出（第 1 步用接力种子） | 不额外过归一化 |
+| KV 写槽 | 位置 `l+i-2` 的槽 | 草稿流向前延伸 |
+| 读窗长度 | `l+i-1` | 已提交前缀 + 本行自己的槽——**无论接受多少都不读陈旧槽** |
+| 采样 | 在缩小的草稿词表上 | 映射回主词表后作为下一步输入 |
 
-链步 i=1 的 seed 来自上一轮（carry 或冷启动引导），i≥2 在本轮内递推。
+第 1 步的种子来自上一轮（接力状态或冷启动引导），之后逐步递推。
 
-### 7.2 target 验证（`_sg_verify`）
+### 7.2 主模型核对
 
-verify 输入在 `_sg_round` 内组装：`v[:, 0] = chain_tokens`（tok@l-1）、
-`v[:, 1:] = drafted_ids[0..k-1]`（d1..dk），共 rows = k+1 行。
+核对输入由主体组装：`[最后一个已提交词, 草稿词1..k]`，共 `rows = k+1` 行。
 
 | 项 | 值 |
 |---|---|
-| rope 位置 | 行 j（0..k）：`l-1+j` |
-| KV 写槽 | `slot_of(l-1+j)`（target 池） |
-| 读窗 | 每段 K 窗长 `l+k`（`v_cu_k`），varlen + block_table 右对齐 → 行 j 读 `[0, l+j)` |
-| aux | `v_aux` 暂存 3 层捕获拼接（供 refill 的 look-ahead 条件） |
-| 采样 | 图内 `forward_native`，行 j 的采样 `t_j` 即 target 对位置 `l+j` 的预测 |
+| 位置 | 第 j 行（0..k）：`l-1+j` |
+| KV 写槽 | 位置 `l-1+j` 的槽（主模型池） |
+| 读窗 | 每段窗口长度 `l+k`，按块表右对齐；第 j 行只读 `[0, l+j)` |
+| 辅助隐层 | 暂存三层拼接，供重放当条件 |
+| 采样 | 图内采样；第 j 行的结果就是主模型对位置 `l+j` 的预测 |
 
-注意 `v_cu_q = arange(bs+1) * rows` 是**捕获后恒定**的（每序列恰好 rows 行，无需每轮更新）；
-`max_seqlen_k` 用 `max_model_len` 静态上界——varlen kernel 只用它做 grid sizing，
-正确性由 `cu_seqlens` 决定，避免把随轮次变化的 python int 烘焙进图。
+注意：每段查询长度固定为 `rows`，**捕获后不再变化**，无需每轮更新；窗口长度的上界用最大
+上下文长度做静态值——变长算子只用它划分并行粒度，正确性由分段边界决定，这样就不会把随轮次
+变化的整数烧进图里。
 
-### 7.3 图内接受（`_sg_acceptance`）
+### 7.3 图内接受
 
-全静态算子（无数据依赖 shape，图安全）：
+全是静态算子（形状不依赖数据，图安全）：
 
 ```python
-match = t[:, :k] == d          # target 逐行预测 vs 提案
-m = match.all(-1) ? k : match.int().argmin(-1)     # 最长匹配前缀
-commit_buf[:, :rows] = where(ar <= m, [d_0..d_{m-1}, t_m, -1...], -1)
-commit_buf[:, rows]  = m + 1   # 提交 token 数 = 接受数 + 1 bonus
+match = 主模型逐行预测 == 草稿提案
+m     = 全部匹配则取 k，否则取第一个不匹配的位置     # 最长匹配前缀
+提交内容 = m 个被接受的草稿词 + 1 个主模型自己采样的词，其余位置填 -1
+提交词数 = m + 1
 ```
 
-即提交内容 = **m 个被接受的提案 + 1 个 bonus**（target 在首个分歧行的预测），
-cnt 打包在 `commit_buf` 最后一列。
+即每轮提交"m 个被接受的草稿词 + 1 个主模型在首个分歧位置的预测词"。
 
-### 7.4 refill：虚构窗口重放（`_sg_refill` + `_refill_ids`）
+### 7.4 重放：虚构窗口
 
-对齐 vLLM `eagle_prepare_inputs_padded_kernel` 的 shift 口径，用 verify 的
-**同一套位置 / 槽位 / aux / cu** 重放 draft midlayer：
+对齐 vLLM 的 shift 口径，用核对阶段**完全相同**的位置、槽位、辅助隐层重放草稿中间层：
 
 | 项 | 值 |
 |---|---|
-| rope 位置 / KV 写槽 | 行 j：`l-1+j` / `slot_of(l-1+j)`——与 verify 完全相同（写的是 draft 池） |
-| 条件 | 行 j：`fc(v_aux[j])`（look-ahead aux） |
-| embed | verify token 右移一位（`t_ext = [t_1..t_k, t_k]`），**行 m 覆盖为 bonus `t_m`** |
-| 行 m 输出 `h_m` | `norm(h_m) @ lm_head` 采样出**下一轮 draft1**；`h_m` 写入 `carry_seed`（下一轮链种子） |
+| 位置 / KV 写槽 | 第 j 行：`l-1+j`（写的是草稿池） |
+| 条件 | 第 j 行：投影后的第 j 行辅助隐层 |
+| 输入词 | 核对阶段各行的预测词右移一位；**第 m 行替换为主模型补采的词** |
+| 第 m 行输出 | 经归一化和输出投影采样出**下一轮首个草稿词**；其隐层作为下一轮的接力种子 |
 
-作用有二：① 把本轮已知的 token 流回填进 draft KV 槽位，使下一轮链步的读窗
-（提交前缀 + 自己的流槽）连续可读；② 产出下一轮的采样行（carry）。
-行 m（`index_to_sample = 段尾 - 被拒数`，vLLM kernel 口径）就是下一轮的"采样行"。
+作用有两个：① 把本轮已知的词流回填进草稿 KV，使下一轮链式起草的读窗（已提交前缀 + 自己的
+槽）连续可读；② 产出下一轮的接力状态。第 m 行（取法：段尾减去被拒数）就是下一轮的"采样行"。
 
-### 7.5 统一读回（`_readback_spec_commit`）
+### 7.5 统一读回
 
-**每轮唯一一次大批量 D2H**：`commit_buf[:n].tolist()`。此后：
+**每轮唯一一次大批量设备→主机拷贝**（提交结果）。之后：
 
-- `results[i] = row[:cnt]`（提交 token 列表）；
-- `spec_carry[seq_id] = (carry_seed[i:i+1].clone(), drafted_ids[0][i].item())`
-  ——refill 行 m 的隐层与采样提案，**留在 GPU 上跨轮传递**（不落 host）；
-- `spec_hidden[seq_id] = v_aux 行 m`（eager 复算采样行 / 图不可用时的 fallback 用）；
-- `seq.num_scheduled_tokens = 0`（调度状态复位）。
+- 得到每个序列本轮提交的词；
+- 接力状态 = 第 m 行的隐层 + 采样出的首个草稿词，**留在设备上跨轮传递**，不落主机；
+- 辅助隐层第 m 行另存一份，供逐算子复算或图不可用时兜底；
+- 复位该序列本轮的调度计数。
 
 ---
 
@@ -287,190 +262,168 @@ cnt 打包在 `commit_buf` 最后一列。
 
 | 状态 | 位置 | 内容 | 生命周期 |
 |---|---|---|---|
-| `spec_carry` | `ModelRunner.spec_carry: dict[seq_id → (隐层[1,H], draft1)]` | 下一轮链步 1 的 seed 与首提案 | 每轮读回时更新 |
-| `spec_hidden` | `ModelRunner.spec_hidden: dict[seq_id → aux 行[1,3H]]` | 采样行引导用的 aux（fc 的输入） | prefill 落、每轮读回刷 |
-| `spec_cold` | `Sequence` 实例属性 | 冷启动标记 | prefill 置 True；首轮 eager 结束清 False |
+| 接力状态 | `ModelRunner` 的字典，按序列编号 | 下一轮第 1 步的种子与首个草稿词 | 每轮读回时更新 |
+| 辅助隐层 | `ModelRunner` 的字典，按序列编号 | 采样行引导用的辅助隐层 | 预填充时落，每轮读回刷新 |
+| 冷启动标记 | 序列对象的属性 | 标记该序列尚无接力状态 | 预填充置位；首轮结束后清除 |
 
-按 seq_id 键控的原因：连续批处理下 batch 组成每轮变化，batch 位置索引不安全。
-序列结束（EOS/max_tokens）由引擎 `_drop_finished_spec_state` → `drop_spec_state(seq_id)`
-清理两本字典；**抢占**（preempt）后重新 prefill 会重置 `spec_cold` 并覆盖 `spec_hidden`，
-carry 在下一轮 eager 中被重算覆盖——冷启动机制同时是抢占恢复路径。
+按序列编号存放的原因：连续批处理下每轮批次组成会变，用批次内位置索引不安全。序列结束
+（遇到结束符或达到上限）时由引擎清理两本字典；**被抢占**后重新预填充会重置冷启动标记并
+覆盖辅助隐层，接力状态在下一轮逐算子执行中被重算覆盖——冷启动机制同时也是抢占后的恢复
+路径。
 
-### 8.2 冷启动：采样行引导（`_spec_round_eager` 开头）
+### 8.2 冷启动：采样行引导
 
-prefill 后首轮无 carry（`spec_cold=True`）→ 整批走 eager，先补一步"采样行"：
+预填充后首轮没有接力状态（冷启动），整批走逐算子执行，先补一步"采样行"：用预填充记录的
+辅助隐层做条件，在位置 `l-2` 上跑一次草稿单步，采样出首个草稿词。这一步与草稿预填充的
+最后一行**位置、内容完全相同**，相当于把预填充丢弃的那一行复算回来。
 
-```
-h_seed = cat(spec_hidden[seq])          # aux@l-2（prefill 记录）
-seed   = fc(h_seed)
-row_m_hidden, logits = draft.forward_decode(
-    positions = l-2,                    # rope p = l-2
-    seed      = seed,                   # 条件 = fc(aux@p)
-    token_ids = seq.last_token)         # embed tok@l-1 = tok@p+1   ← §5 口径
-draft1  = map_to_target_ids(sample(logits))
-```
+之后把种子设为**"投影后的辅助隐层本身"**（注意：是引导行的**输入**，不是它的输出——与旧
+实现一致，属已验证口径，不要"修正"），再执行与图轮相同的主体。
 
-这一步与 draft prefill 的最后一行**同位同内容**（同 rope、同 embed、同条件），
-即把 prefill 丢弃的那个"采样行隐层"复算回来；它预测 `tok@l`，采样出 draft1。
-
-之后把 `carry_seed ← seed`（注意：是 **fc(aux) 本身，即引导行的输入**，不是
-`row_m_hidden`——与旧 eager 实现链步 1 逐位一致，已验证口径，勿"修正"）、
-`drafted_ids[0] ← draft1`，再执行与图轮同构的 `_sg_round` body。
-
-**冷→图交接**：eager 轮结束后 `spec_carry = (row_m_hidden, draft1)`（采样行隐层），
-图轮稳态的链步 1 seed 则来自 refill 行 m 的输出——两者不同源，均为已验证现状
-（§12）；读回写入的 refill 产物不跨 eager→图传递。之后 `spec_cold=False`，进图。
+**逐算子→图的交接**：逐算子轮结束后，接力状态取「第 m 行隐层, 首个草稿词」；图轮稳定后
+第 1 步的种子来自重放第 m 行的输出——两者**来源不同，都是已验证的现状**（§12）；重放产物
+不跨这一交接传递。之后清除冷启动标记，转入图路径。
 
 ---
 
-## 9. CUDA Graph：spec 单图整轮
+## 9. 计算图：整轮一张
 
-### 9.1 为什么必须整轮单图
+### 9.1 为什么整轮一张
 
-一轮 = k-1 个链步（各含 attention+MLP+采样）+ verify（一次 target 前向 + 图内采样）+
-接受/提交 + refill（一次 draft varlen 前向 + 采样），全是小 kernel，
-host launch 税会吞掉投机收益：CoreX 实测 **eager spec 11.3 tok/s vs 图 103.7 tok/s**。
-每桶一张图覆盖整轮，replay 一次即完成全部五个阶段。
+一轮包含 k-1 个链式起草步（每步都有注意力和采样）、一次核对（主模型前向 + 图内采样）、
+接受与提交、一次重放（草稿变长前向 + 采样），**全是很小的算子**，逐个启动的固定开销会吃掉
+投机收益：CoreX 上逐算子只有 11.3 tok/s，成图后 103.7 tok/s。按批大小各录一张图覆盖整轮，
+回放一次走完五个阶段。
 
-### 9.2 捕获（`capture_spec_cudagraph`）
+### 9.2 捕获
 
-- 桶表 `_graph_buckets(max_bs)`：`[1,2,4,8] + 16 步进`；未覆盖 `max_num_seqs` 时追加尾桶并告警；
-- **从大到小**逆序捕获，共享 `spec_graph_pool`（内存池复用）；
-- 每桶先 warmup（triton/flash kernel lazy init 必须在 capture 前完成；warmup 数据用
-  零/-1——slot=-1 时 store kernel 跳过 KV 写、ctxlen=0 合法），再
-  `backend.graph_ctx` 内捕获 `_sg_round(bs, use_cuda_graph=True)`；
-- **try/except 优雅降级**：捕获异常（如 vendor kernel 含 host 同步/动态 workspace）时
-  打印警告、释放图池、`spec_round` 自动回落到同构 eager 轮——只降速、不崩溃。
+- 桶表：`1, 2, 4, 8` 然后按 16 递增；若没覆盖到最大并发数，则补一个尾桶并告警；
+- **从大到小**逆序捕获，共用同一个显存池；
+- 每个桶先跑一遍预热（变长算子和 flash 算子必须在捕获前完成初始化；预热数据用零和 -1
+  ——槽位为 -1 时跳过 KV 写入，窗口长度为 0 合法），再在计算图上下文里捕获主体
+  （`_sg_round(bs, use_cuda_graph=True)`）；
+- **捕获异常时优雅退回**：遇到不支持捕获的算子时打印告警、释放图显存池，之后整轮自动退回
+  逐算子执行——**只降速，不崩溃**。
 
-捕获门（三重）：`TP==1` 且 `backend.supports_spec_graph` 且
-（`NANOVLLM_SPEC_GRAPH` env 优先，否则 `backend.graph_sample_default`——
-spec 图无条件录 Gumbel 采样，RNG 图安全性未验证的后端不默认尝试）。
+捕获的三重检查：单卡、后端声明支持整轮图、且（环境变量优先，否则看后端默认是否允许图内
+采样——图内一律录随机采样，对随机数发生器图安全性未验证的后端不默认尝试）。
 
-### 9.3 数据通路：MetaBlob + 图内 scatter
+### 9.3 数据通路
 
-每轮的动态元数据（链步/verify 的位置、槽位、采样参数、block_table、cu_k）由 host 写进
-`_sblob`（声明式 pinned blob，`MetaBlob` 类统一管理 int64/f32 两平面与命名视图）：
+每轮的动态元数据（各阶段的位置、槽位、采样参数、块表、窗口边界）由主机写进固定内存缓冲区
+（`_sblob`，由 `MetaBlob` 统一管理整数与浮点两个平面及命名视图），再在图内分发到各静态
+缓冲：
 
 ```
-host:  _fill_spec_meta()  只写 [0:n] 行（+ 桶缩小时的 padding 复位）
-H2D:   _push_spec_meta()  每个 dtype 平面一次整块 copy_（共 2 次，零逐段切片）
-图内:  _sg_scatter()      设备孪生 → 各静态 buffer（int64 → 图 buffer dtype 转型在 copy_ 内）
+主机：   _fill_spec_meta()  只写有效段（批变小时顺带复位尾部）
+拷贝：   _push_spec_meta()  每个数据类型平面整块拷一次（共 2 次，不逐段切）
+图内：   _sg_scatter()      分发到各静态缓冲（数据类型不符的在拷贝时自动转换）
 ```
 
 配套事实：
-- blob 统一存 int64；槽位类图 buffer 的 dtype 由 `backend.graph_slot_mapping_dtype()`
-  决定（CUDA int32 / CoreX int64），`context_lens`/`cu`/`block_tables` 两后端恒 int32
-  （CoreX 的 ixformer paged_attention 硬性检查 Int&&contiguous&&cuda）；
-- `carry_seed` / `drafted_ids[0]` 由 host 直写设备 buffer（`_load_spec_carry`），
-  与 blob 无关；
-- padding：桶缩小时把尾段补 -1/0，且 `cu_k[n+1:] = cu_k[n]`——尾段 K 窗零长、
-  cu 单调不降，kernel 跳过空段。
+- 缓冲区统一按 int64 存；槽位类缓冲的数据类型由后端决定（CUDA 用 int32，CoreX 用 int64），
+  窗口长度、分段边界、块表两种后端都固定用 int32（CoreX 的算子对窗口长度有硬性检查）；
+- 接力种子和首个草稿词由主机直接写设备缓冲（`_load_spec_carry`），与元数据缓冲区无关；
+- 批变小时把尾部补齐为 -1/0，并把分段边界尾部置零长窗口，算子在空段上直接跳过。
 
-### 9.4 通信量预算
+### 9.4 通信量
 
 | 每轮 | 次数 | 内容 |
 |---|---|---|
-| H2D | 2 | `_sblob` 的 i64/f32 平面整块 |
-| D2H | 1 | `commit_buf`（token + cnt 打包）；carry/aux 均留 GPU |
+| 主机→设备 | 2 | 元数据的整数 / 浮点两个平面整块 |
+| 设备→主机 | 1 | 提交结果（词 + 提交词数打包）；接力状态与辅助隐层都留在设备上 |
 
 ---
 
-## 10. 调度、KV 与采样的配合
+## 10. 与调度、缓存、采样的配合
 
-### 10.1 容量预分配（`Scheduler.prepare_spec_round`）
+### 10.1 容量预留
 
-每个 running 序列保证 block_table 能容纳 `len + k + 1` 个 token
-（draft 流最深写槽 = `l+k-3`，verify 覆盖到 `l+k-1`，再留 1 余量）；
-空闲块不足则**抢占**该序列（丢弃 KV 退回 waiting，等重 prefill——之后走冷启动）。
-`BlockManager.ensure_capacity` 预分配的块在拒绝回滚后**不回收**：被拒提案写脏的槽位
-靠覆盖失效（§4.3）。
+对每个运行中序列保证块表能容纳 `已提交词数 + k + 1` 个词（草稿流最深写到 `l+k-3`，核对
+覆盖到 `l+k-1`，再留 1 个余量）；空闲块不足则**抢占**该序列（丢弃 KV 退回等待队列，之后重新
+预填充时走冷启动）。预留的块在提案被拒回滚后**不回收**，被写脏的槽位靠覆盖失效（§4.3）。
 
-### 10.2 提交与截断（`Scheduler.commit_spec`）
+### 10.2 提交与截断
 
-逐 token `append_token`，逐 token 判 `_maybe_finish`（EOS / max_tokens）提前截断并结束
-序列。注意：**投机产生的 token 不做 block hash**——前缀缓存只覆盖 prefill 阶段，
-避免被拒提案污染哈希表。EOS 截断发生在调度层，图内 cnt 不感知 → 统计口径对 E 有
-~0.2% 的轻微高估（可忽略）。
+逐个词追加，并逐个判断是否结束（遇到结束符或达到上限），提前截断并结束序列。注意：**投机
+产生的词不做块哈希**——前缀缓存只覆盖预填充阶段，避免被拒提案污染哈希表。截断发生在调度层，
+图内统计不到，因此对平均接受长度的统计有约 0.2% 的轻微高估（可忽略）。
 
-### 10.3 采样（`Sampler.forward_native`）
+### 10.3 采样
 
-- draft 侧 top_k 上限取 `draft_vocab_size`（ctopks），verify 侧取 target vocab；
-- 图内一律走 Gumbel fast path（top-k 掩码 + Gumbel-argmax，无动态 shape、无数据依赖
-  分支；PyTorch CUDA RNG 是 graph-safe 的，replay 每次产生新随机数）；
-  `fast_top_p=False` 可回退 legacy 全流水（host 属性分支，捕获时常量折叠）。
+- 草稿侧在**缩小的草稿词表**上做 top-k，核对侧在**主词表**上做；
+- 图内一律走 Gumbel 快路径（top-k 掩码 + Gumbel 取最大，无动态形状、无依赖数据的分支）；
+  随机数发生器在图内是安全的，每次回放都会产生新随机数；需要时可退回完整的 top-p 采样
+  （捕获时该分支折叠为常量）。
 
-### 10.4 残留 KV 的无害性
+### 10.4 残留 KV 为什么无害
 
-被拒提案 / padding 写入的 KV 槽位不清理，安全性由两个不变式保证：
-① 注意力读窗恒在 `context_len` / `cu_seqlens` 界内（链步读窗 = 提交前缀 + 自己的流槽）；
-② 任何位置在被读取前必然先被本轮有效写入覆盖（decode/prefill 先写后读）。
+被拒提案和填充写入的缓存槽位不清理，靠两个不变式保证安全：① 注意力读取范围始终在上下文的
+界内；② 任何位置在被读取前，一定先被本轮的写入覆盖。
 
 ---
 
 ## 11. 多后端适配（CUDA / CoreX / Ascend 310P）
 
-spec 对后端的依赖全部参数化（能力位 + 工厂方法，无 `torch.cuda.*` 直呼）：
+投机对后端的依赖全部参数化（能力声明 + 工厂方法，没有直接调用 CUDA 接口）：
 
-| 后端 | `supports_spec` | `supports_spec_graph` | slot dtype | KV 布局 | 说明 |
+| 后端 | 支持投机 | 支持整轮图 | 槽位数据类型 | KV 布局 | 说明 |
 |---|---|---|---|---|---|
-| CUDA | ✅ | ✅（实证） | int32 | BSHD | flash-attn varlen/with_kvcache + triton store（slot==-1 跳过写） |
-| CoreX | ✅ | ✅（实机验证：单图整轮一次捕获成功，E=2.050 / 103.7 tok/s） | **int64**（`graph_slot_mapping_dtype` 覆写） | HND | ixformer；meta blob 仍存 int64，图内 copy_ 自动转型 |
-| Ascend 310P | ❌ 引擎层干净拒绝 | 尝试+降级 | — | — | verify 恒传 block_tables → attention 走整池 4D 分支，TND 算子不消费；`supports_spec=False` 时出现 spec 配置直接报错 |
+| CUDA | 是 | 是（实证） | int32 | BSHD | flash-attn 变长与带缓存算子 + triton 写缓存（槽位 -1 跳过写） |
+| CoreX | 是 | 是（实机验证：整轮一次捕获成功，接受长度 2.050、103.7 tok/s） | **int64** | HND | ixformer；元数据缓冲仍按 int64 存，图内拷贝自动转型 |
+| Ascend 310P | **否，引擎层直接干净拒绝** | 尝试后降级 | — | — | 核对阶段总是传块表，注意力走整池分支，该算子不接受，所以一旦配置投机就直接报错 |
 
-其余接口面：`new_graph()` / `graph_ctx()`（图 API 工厂，Ascend = NPUGraph）、
-`NANOVLLM_SPEC_GRAPH` / `NANOVLLM_GRAPH_SAMPLE` 两个 env 覆盖后端默认。
-spec 路径的槽位类 buffer（chain_slots/v_slots/eager slots）统一走
-`graph_slot_mapping_dtype()`，两后端共用同一套 `_sg_*` 代码。
+其余接口：计算图的新建 / 上下文由工厂方法提供（Ascend 用 `NPUGraph`）；两个环境变量可
+覆盖后端默认。投机路径的槽位类缓冲统一走"按后端取数据类型"的接口，两种后端共用同一套实现。
 
 ---
 
-## 12. 已固化的口径事实（改动前必读，均经位等门验证）
+## 12. 已固化的口径（改动前必读，均经过逐位一致性验证）
 
-1. **embeds 必须过 `input_layernorm`**——去掉会崩到 E≈1.15；
-2. 链步 seed 用 **raw midlayer 输出**（与 vLLM 同）；
-3. EAGLE3 checkpoint **无 fc_norm / norm_before_fc**（纯 fc），aux 层默认 (2, n//2, n-3)
-   input-to-layer；
-4. **eager 轮链步 1 的 seed = fc(spec_hidden)（引导行输入，非其输出）**——与图轮稳态
-   （refill 行 m 输出）不同源，均为已验证现状，勿"统一"；
-5. **冷→图交接 `spec_carry = (采样行隐层, draft1)`**，refill 产物不跨 eager→图传递；
-6. 链步 i 的 embed token **恒为 `drafted_ids[i-1]`**（步 1 = draft1 = tok@l），绝不回退
-   last_token——C1 曾在此断裂（接受统计漂移而输出位等），靠 `drafted_ids` 缓冲天然保证；
-7. 被拒 draft 的 KV 槽位不清理，靠后续写入覆盖（读窗恒在界内，残留无害，§10.4）；
-8. 投机 token 不做 block hash（prefix cache 仅 prefill）；
-9. spec 图默认门同时要求 `graph_sample_default`；捕获失败降级 eager spec 轮是**特性**。
-
----
-
-## 13. 验证钩子与性能锚点
-
-- **基准内置 spec 统计**：`scripts/benchmark --spec-model` 汇总 Acceptance Length (E)、
-  token 接受率、逐位置接受率（脚本侧 monkey-patch `spec_round`，图/eager、冷/热四路
-  统一从 `_readback_spec_commit` 出数）；`--no-think` 控制 chat template 口径。
-- **锚点**（spec_bench coding，k=3，temp0，thinking-off）：
-  - RTX 4070 Laptop：E=2.095，spec 108.7 tok/s vs decode 66.2（1.64×）；
-  - CoreX 32GB：E=2.050，spec 图 103.7 tok/s（spec eager 仅 11.3——"spec 必须有图"）。
-- thinking-on 负载 E 会掉到 1.7~1.8（draft 可预测性低），属正常，勿与锚点直比（AGENTS.md）。
+1. **词嵌入必须过输入归一化**——去掉会让平均接受长度掉到约 1.15；
+2. 链式起草的种子用**中间层的原始输出**（与 vLLM 一致）；
+3. 权重里**没有**额外的归一化层（投影层是纯投影），辅助层默认取 `(2, n//2, n-3)` 的层输入；
+4. **逐算子轮第 1 步的种子是"投影后的辅助隐层"**（引导行的输入，不是输出）——与图轮稳定后
+   （重放第 m 行输出）来源不同，都是已验证现状，不要强行统一；
+5. **逐算子→图的接力状态是「第 m 行隐层, 首个草稿词」**，重放产物不跨这一交接传递；
+6. 第 i 步的输入词**恒为上一步的草稿词**（第 1 步即首个草稿词），绝不退回用最后一个已提交词
+   ——早期曾在此断裂（接受统计漂移而输出逐位不变），靠专门的缓冲天然保证；
+7. 被拒提案的缓存槽位不清理，靠后续写入覆盖（读窗始终在界内）；
+8. 投机产生的词**不做块哈希**（前缀缓存只覆盖预填充）；
+9. 整轮图默认还要求后端允许图内采样；**捕获失败退回逐算子执行是设计特性，不是故障**。
 
 ---
 
-## 14. 一次投机轮全流程速查（单序列，k=3）
+## 13. 验证方式与性能参考
+
+- **基准内置投机统计**：`scripts/benchmark --spec-model` 会打印平均接受长度、词接受率、
+  逐位置接受率（通过包装单轮编排取数，图 / 逐算子、冷 / 热统一口径）；`--no-think` 控制
+  对话模板口径。
+- **参考值**（spec_bench coding，k=3，贪心，关闭思考）：
+  - RTX 4070 Laptop：接受长度 2.095，投机 108.7 tok/s，不开投机 66.2 tok/s（1.64 倍）；
+  - CoreX 32GB：接受长度 2.050，成图 103.7 tok/s（逐算子仅 11.3——"投机必须有图"）。
+- 开启思考时接受长度会掉到 1.7~1.8（草稿更难预测），属正常，**不要与上面的参考值直接比较**
+  （见 [AGENTS.md](AGENTS.md)）。
+
+---
+
+## 14. 一轮速查（单序列，k=3）
 
 ```
-prefill  : target 前向(捕获 aux) → 首 token；draft 同 chunk 右移 prefill → draft KV@0..l-2
-           落 spec_hidden=aux@l-2, spec_cold=True
+预填充：主模型前向（捕获辅助隐层）→ 首个词；草稿同批右移预填充 → 草稿 KV
+        记录辅助隐层最后一行，标记冷启动
 
-第 1 轮(eager/冷):
-  引导   : fc(aux@l-2) + emb(tok@l-1) @ rope l-2 → row_m_hidden, draft1(tok@l)
-  链步1-2: seed=fc(aux@l-2)起步 → drafted_ids[1..2]（KV@l-1, l）
-  verify : [tok@l-1, d1, d2, d3] @ l-1..l+2 → t0..t3；KV(target)@l-1..l+2
-  接受   : m = 最长匹配(t_j vs d_j) → 提交 [d1..dm, t_m]（m+1 个）
-  refill : fc(aux@l-1+j) + emb(t_{j+1}) @ l-1+j（行 m = bonus）→ draft KV@l-1..l+2
-           行 m 输出 h_m → 采样 draft1' + carry_seed
-  读回   : commit_buf(D2H×1)；spec_carry=(h_m, draft1')；spec_cold=False
+第 1 轮（逐算子 / 冷启动）：
+  引导：投影(辅助隐层) + 词嵌入(最后已提交词) @ 位置 l-2 → 采样行隐层、首个草稿词
+  起草：以上一步输出为种子递推，得到草稿词 1..2
+  核对：[最后已提交词, 草稿词1..3] @ l-1..l+2 → 各行预测；写主模型 KV
+  接受：取最长匹配前缀 m → 提交 m 个草稿词 + 1 个主模型补采词
+  重放：用核对的位置 / 槽位 / 辅助隐层重放草稿（第 m 行改为补采词）→ 草稿 KV 回填
+        第 m 行输出 → 下一轮首个草稿词 + 接力种子
+  读回：取回提交结果；记录接力状态；清除冷启动标记
 
-第 2 轮(图): fill blob → 2×H2D → replay(scatter→链→verify→接受→refill) → 1×D2H
-  链步 1 : seed=carry_seed(=h_m), embed=draft1' @ rope l'-1（l' = l+m+1，即重写
-           上轮 refill 行 m+1 的流槽，流连续）
+第 2 轮（图）：填元数据 → 2 次主机→设备 → 回放（分发→起草→核对→接受→重放）→ 1 次读回
+  起草第 1 步：种子为上一轮接力种子，输入为上一轮采出的草稿词，接在重放行之后（流连续）
 ```
 
 ---

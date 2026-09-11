@@ -24,22 +24,23 @@ pip install tqdm flash-attn --no-build-isolation   # 这两个依赖未写进 py
 在线服务（OpenAI 兼容 API，需从仓库根目录以 `-m` 方式启动）：
 
 ```bash
-python3 -m scripts.openai_server /path/to/Qwen3-1.7B --port 8000 --max-model-len 2048
-
-# 开启投机解码：追加 --spec-model 草稿模型目录
+# Qwen3-1.7B + EAGLE3 投机解码
 python3 -m scripts.openai_server /path/to/Qwen3-1.7B \
-    --spec-model /path/to/Qwen3-1.7B-EAGLE3 --spec-num-tokens 3
+    --spec-model /path/to/Qwen3-1.7B-EAGLE3 --spec-num-tokens 3 \
+    --max-model-len 2048 --max-num-seqs 8 --port 8000 --no-think
 ```
 
-> 默认最大并发数为 8（小显存卡实测更优），需要更高并发时显式传 `--max-num-seqs`。
-> 服务端实时打印日志：`[req ]` 请求到达（token 数 / 采样参数 / 内容预览）、
-> `[done]` 请求完成（TTFT / 墙钟 / 单请求 TPS）、`[tps ]` 每秒窗口吞吐。
+> 默认并发 8（小显存卡实测更优）；prompt 超 `max_model_len` 时自动淘汰最旧历史。
+> 日志：`[REQ ]`/`[DONE]`/`[INFO]`/`[HTTP ]`（异常 `[WARN ]`/`[ERROR]`）。
 
 离线 benchmark（spec_bench question.jsonl 串行基准，吞吐 / 首字延迟）：
 
 ```bash
 python3 -m scripts.benchmark /path/to/Qwen3-1.7B --spec-model /path/to/Qwen3-1.7B-EAGLE3
 ```
+
+> 前缀缓存 A/B：加 `--no-prefix-cache` 对照；Agent 共享前缀数据集用
+> `--questions ../agent_prefix_bench/question.jsonl --category agent --seed -1`。
 
 Python API 离线推理：
 

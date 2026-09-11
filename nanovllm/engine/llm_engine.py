@@ -35,6 +35,13 @@ class LLMEngine:
         # hybrid GDN 状态槽：preempt 释放回调（engine 侧解耦注入；qwen3 路径
         # is_hybrid=False 恒短路，零开销）。finish 侧释放见 step()。
         self.scheduler.on_preempt = self._on_preempt_release
+        # 首请求冷启动预热：warmup_model 只跑 prefill，首个 decode / spec 轮会
+        # 触发 decode attention kernel（flash-attn with_kvcache）与图首放的一次性
+        # 初始化——实测同进程首轮 ~0.55s、其后 ~0.06s。此处跑一次极短生成
+        # （max_tokens=2 保证走满一次 decode / spec 轮）把该开销前移到启动期，
+        # 使首个真实请求 TTFT 与稳态一致（server 默认无 benchmark 的多次预热）。
+        self.generate(["warmup"], SamplingParams(temperature=0.0, max_tokens=2),
+                      use_tqdm=False)
         atexit.register(self.exit)
 
     def exit(self):

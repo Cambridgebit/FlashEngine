@@ -196,3 +196,6 @@ cython_debug/
 
 .omo/
 .codegraph/
+
+# Windows 交替数据流残留（WSL 下表现为普通文件）
+*:Zone.Identifier

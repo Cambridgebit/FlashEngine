@@ -776,6 +776,10 @@ class ModelRunner:
                     if n < bucket:
                         slots_v[n:bucket].fill_(-1)
                         ctx_v[n:bucket].zero_()
+                        # ids/pos 一并复位（旧值虽被 slot=-1/ctx=0 隔离，仍属
+                        # 残留脏数据；清零后 padding 行恒为合法 token 0/位置 0）。
+                        ids_v[n:bucket].zero_()
+                        pos_v[n:bucket].zero_()
                         bt[n:, :].fill_(-1)
                     self._graph_bs_active = bucket
                     if self.is_hybrid:
@@ -1811,8 +1815,13 @@ class ModelRunner:
     def _spec_round_graph(self, seqs: list[Sequence], bucket: int) -> list[list[int]]:
         n = self._fill_spec_meta(seqs)
 
-        # padding 复位（桶缩小时 blob 段补 -1/0，scatter 会覆盖图 buffer）
-        if bucket < self._spec_graph_active:
+        # padding 复位（n < bucket 时 blob 段补 -1/0，scatter 覆盖图 buffer）。
+        # 条件必须是 n < bucket（不再是 bucket < active）：后者漏「首次扩桶 /
+        # 同桶内含 padding」两个窗口，padding 行会带陈旧槽位写脏真实序列的 KV
+        # ——并发（n<桶）下 verify 行槽被清 -1 → 跳写 → NaN 零流 / 全 "！"。
+        # DFlash 版同款修复见 _df_round_graph。轴序 vs[n:, :]（seq 维在轴 0，
+        # 每序列占 rows 列）——旧 vs[:, n:] 清的是所有序列的列，属同类错位。
+        if n < bucket:
             k = self.config.spec_num_tokens
             rows = k + 1
             M, W = self._pin_M, self._pin_W
@@ -1826,7 +1835,7 @@ class ModelRunner:
             cp[:, n:].fill_(-1)
             cc[:, n:].zero_()
             cs[:, n:].fill_(-1)
-            vs[:, n:].fill_(-1)
+            vs[n:, :].fill_(-1)
             # padding 段 K 窗零长（cu 单调不降、kernel 跳过空段，杜绝旧算式的非单调 cu/负窗长隐患）
             cu_k[n + 1:] = cu_k[n]
             bt[n:, :].fill_(-1)

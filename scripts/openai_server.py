@@ -3,20 +3,26 @@
 端点：/v1/models、/v1/chat/completions、/v1/completions、/health（含无 /v1 前缀别名）。
 参数：max_tokens（未传 = 生成到上下文顶）/ temperature / top_p / top_k / stop（文本级截断并中止生成）/
 stream / stream_options.include_usage；n 仅支持 1。
+上下文淘汰：chat 请求 prompt 超出 max_model_len 时，保留 system + 最近轮次、从最旧历史起逐条丢弃
+（不再砍尾巴吞掉最新提问）；为客户未指定 max_tokens 的请求预留 --reserve-output（默认 512）token
+作为输出预算。completions 超长时保留尾部（最新内容）。
 并发模型：后台引擎驱动线程统一 step() 驱动所有排队请求（continuous batching），
 HTTP 线程只负责收发与流式推送。
 
-服务端日志：
-- [req ] 请求到达：id、端点、prompt token 数、采样参数、流式与否、内容预览；
-- [done] 请求完成：输出 token 数、TTFT、墙钟、单请求 TPS、本请求前缀缓存命中率、结束原因；
-- [tps ] 实时吞吐：后台线程每 TPS_INTERVAL 秒打印窗口 TPS（有 token 生成才打印）+ 累计前缀缓存命中率。
+服务端日志（固定 5 字符标签 + 毫秒时间戳；TTY 下自动上色；rid 贯穿 HTTP/REQ/DONE）：
+- [HTTP ] 传输层：rid/method/path/status/client/响应字节/耗时；
+- [REQ  ] 引擎受理（首次被调度时）：rid/端点/stream/prompt/max_out/采样/thinking/淘汰数/引擎调度等待 wait；
+- [DONE ] 单请求完成：rid/in(输入 prompt token)/out(输出 token)/E(平均接受长度)/TTFT(实际模型处理)/TPS/ctx(上下文占用)/cache(本请求命中)/finish；
+- [INFO ] 周期聚合（每 TPS_INTERVAL 秒，仅模型推理相关）：winTPS/active/cache_hit/avgE；
+- [WARN ] / [ERROR] 异常（同宽度）。
 
 用法（必须从仓库根目录以 -m 方式运行，直跑 scripts/X.py 会 ModuleNotFoundError）：
     python3 -m scripts.openai_server /path/to/Qwen3-1.7B [--port 8000]
-        [--spec-model <draft 目录>] [--spec-num-tokens k] [--eager] [--api-key xxx]
+        [--spec-model <draft 目录>] [--spec-num-tokens k] [--eager] [--no-think] [--reserve-output N] [--api-key xxx]
 """
 import argparse
 import json
+import sys
 import threading
 import time
 
@@ -38,13 +44,70 @@ _model_name = "nanovllm"
 _api_key = None
 _default_temperature = 0.7
 _max_model_len = 4096
+# chat template 的 enable_thinking 默认：None = 交给模板默认（Qwen3 = on）；
+# False = 显式关（--no-think，对齐 benchmark 历史 E 锚点口径）。每请求可用
+# chat_template_kwargs.enable_thinking 覆盖。
+_default_thinking = None
+# 上下文淘汰：客户端未显式给 max_tokens 时，为输出预留的 token 数（--reserve-output）。
+# prompt（system + 历史 + 最新）超出 max_model_len - reserve 时，从最旧历史起淘汰。
+_default_reserve = 512
+
+# ---- 日志（固定宽度标签 + 毫秒时间戳 + TTY 上色）----
+_TAG_W = 5
+_TAG_COLORS = {
+    "HTTP": "\033[90m", "REQ": "\033[94m", "DONE": "\033[92m",
+    "INFO": "\033[96m", "WARN": "\033[93m", "ERROR": "\033[91m",
+}
+_RESET = "\033[0m"
+_use_color = sys.stdout.isatty()
+
+
+def _ts():
+    return f"{time.strftime('%H:%M:%S')}.{(time.time_ns() // 1_000_000) % 1000:03d}"
+
+
+def _log(tag, msg):
+    """统一日志：`HH:MM:SS.mmm [TAG  ] msg`；标签内容固定 _TAG_W 宽，TTY 上色。"""
+    label = f"[{tag:<{_TAG_W}}]"
+    if _use_color:
+        color = _TAG_COLORS.get(tag)
+        if color:
+            label = f"{color}{label}{_RESET}"
+    print(f"{_ts()} {label} {msg}", flush=True)
+
+
+class _CountingWriter:
+    """包一层 wfile 以统计每次 HTTP 响应的字节数（[HTTP] 行用）。"""
+
+    def __init__(self, wfile, box):
+        self._wfile = wfile
+        self._box = box
+
+    def write(self, data):
+        self._box["n"] = self._box.get("n", 0) + len(data)
+        return self._wfile.write(data)
+
+    def flush(self):
+        return self._wfile.flush()
+
+    def writelines(self, lines):
+        for line in lines:
+            self.write(line)
+
+    def __getattr__(self, name):
+        return getattr(self._wfile, name)   # 透传 closed 等底层属性
+
+
+# 投机解码累计统计（[INFO] 的平均 E）；非 spec 恒 0。
+_spec_rounds = 0
+_spec_committed = 0
 
 engine_lock = threading.RLock()      # 保护 add / step / abort / _active
 _wakeup = threading.Event()          # 有请求加入 / 中止时唤醒 driver
 _shutdown = threading.Event()
 _active = {}                         # seq_id -> _Request
 
-TPS_INTERVAL = 1.0                   # [tps] 实时打印周期（秒）
+TPS_INTERVAL = 1.0                   # [INFO] 周期聚合打印间隔（秒）
 _gen_lock = threading.Lock()
 _gen_total = 0                       # 服务启动以来累计生成 token 数
 _gen_window = 0                      # 当前 TPS 统计窗口内的生成 token 数
@@ -58,8 +121,10 @@ class _Request:
         self.max_tokens = max_tokens
         self.rid = rid
         self.prompt_tokens = seq.num_prompt_tokens
-        self.t_start = time.perf_counter()
-        self.t_first = None          # 首个 token 产出时刻（driver 写入）
+        self.t_add = time.perf_counter()   # 入队（引擎受理）时刻
+        self.t_started = None              # 首次被引擎调度（开始处理）时刻
+        self.t_first = None                # 首个 token 产出时刻（driver 写入）
+        self.t_done = None                 # 完成时刻
         self.stats_before = None     # 入队时 BlockManager 统计快照（算本请求缓存命中用）
         self.tokens = deque()        # driver 追加已生成的 token（eos 已剔除）
         self.n_seen = 0
@@ -67,10 +132,23 @@ class _Request:
         self.finished = False
         self.finish_reason = None
         self.error = None
+        # 投机解码 per-request 统计（spec_round 埋点累计；非 spec 恒 0）
+        self.spec_rounds = 0
+        self.spec_committed = 0
+        # [REQ] 展示用元数据（_generate 填充）
+        self.endpoint = ""
+        self.stream = False
+        self.client = ""
+        self.temperature = 0.0
+        self.top_p = 1.0
+        self.top_k = 0
+        self.thinking = "on"
+        self.evicted = 0
+        self.preview = ""
 
 
 def _bump_tokens(n):
-    """driver 每产出 n 个 token 调用一次，供 [tps] 线程统计。"""
+    """driver 每产出 n 个 token 调用一次，供 [INFO] 聚合线程统计。"""
     global _gen_total, _gen_window
     with _gen_lock:
         _gen_total += n
@@ -78,12 +156,13 @@ def _bump_tokens(n):
 
 
 def _tps_loop():
-    """实时吞吐打印线程：窗口内有 token 生成才打印（空闲不刷屏）。"""
+    """[INFO] 周期聚合（每 TPS_INTERVAL 秒，仅模型推理相关；窗口无生成则跳过）。"""
     global _gen_window
     while not _shutdown.wait(TPS_INTERVAL):
         with _gen_lock:
             win, total = _gen_window, _gen_total
             _gen_window = 0
+            rounds, committed = _spec_rounds, _spec_committed
         if win == 0:
             continue
         with engine_lock:
@@ -91,8 +170,9 @@ def _tps_loop():
             s = engine.scheduler.block_manager.stats
             total_blocks = s["cached_blocks"] + s["new_blocks"]
         cache = f"{s['cached_blocks'] / total_blocks * 100:.0f}%" if total_blocks else "-"
-        print(f"[tps] {win / TPS_INTERVAL:7.1f} tok/s  "
-              f"(累计 {total} tok, 活跃 {n_active} req, 前缀缓存 {cache})", flush=True)
+        avg_e = f"{committed / rounds:.2f}" if rounds else "-"
+        _log("INFO", f"winTPS={win / TPS_INTERVAL:.0f} active={n_active} "
+                     f"cache_hit={cache} avgE={avg_e}")
 
 
 def _drain(queue):
@@ -118,20 +198,35 @@ def _abort(seq):
             pass
 
 
+def _log_request(st):
+    """[REQ] 引擎首次调度该请求时打印：含引擎调度等待（受理→被调度）。"""
+    wait_ms = (st.t_started - st.t_add) * 1000
+    _log("REQ", f"{st.rid} {st.endpoint} stream={'on' if st.stream else 'off'} "
+                f"client={st.client} prompt={st.prompt_tokens}tok max_out={st.max_tokens}tok "
+                f"temp={st.temperature:g} top_p={st.top_p:g} top_k={st.top_k} "
+                f"think={st.thinking} evict={st.evicted} wait={wait_ms:.0f}ms | {st.preview}")
+
+
 def _log_done(st, ct, reason):
-    """请求完成统计：输出 token 数 / TTFT / 墙钟 / 单请求 TPS / 本请求前缀缓存命中率。"""
+    """[DONE] 单请求完成：TTFT 为实际模型处理时间（被调度→首 token），不含引擎调度等待。"""
     now = time.perf_counter()
-    ttft = f"{(st.t_first - st.t_start) * 1000:.0f}ms" if st.t_first else "-"
-    speed = f"{ct / (now - st.t_first):.1f} tok/s" if st.t_first and now > st.t_first else "-"
+    st.t_done = now
+    prefill_ms = (st.t_first - st.t_started) * 1000 if (st.t_first and st.t_started) else 0.0
+    wall = now - st.t_add
+    tps = ct / wall if wall > 0 else 0.0
+    used = st.seq.num_tokens
+    used_pct = used / _max_model_len * 100 if _max_model_len else 0.0
+    e_str = f"{st.spec_committed / st.spec_rounds:.2f}" if st.spec_rounds else "-"
     cache = "-"
     if st.stats_before is not None:
         s = engine.scheduler.block_manager.stats
         cached = s["cached_blocks"] - st.stats_before["cached_blocks"]
         total = cached + (s["new_blocks"] - st.stats_before["new_blocks"])
         if total > 0:
-            cache = f"{cached / total * 100:.0f}%({cached}/{total} blk)"
-    print(f"[done] {st.rid} completion={ct} tok  TTFT={ttft}  "
-          f"wall={now - st.t_start:.2f}s  {speed}  cache={cache}  finish={reason}", flush=True)
+            cache = f"{cached / total * 100:.0f}%({cached}/{total}blk)"
+    _log("DONE", f"{st.rid} in={st.prompt_tokens}tok out={ct}tok E={e_str} "
+                 f"TTFT={prefill_ms:.0f}ms TPS={tps:.1f} ctx={used}/{_max_model_len}"
+                 f"({used_pct:.0f}%) cache={cache} finish={reason}")
 
 
 # ---------------------------------------------------------------------------
@@ -157,15 +252,21 @@ def _engine_loop():
                 done = []
                 for st in list(_active.values()):
                     seq = st.seq
-                    comp = seq.completion_token_ids
-                    if len(comp) > st.n_seen:
-                        new_tokens = [t for t in comp[st.n_seen:] if t != _eos]
+                    # 用 num_tokens（O(1)）算增量，只切新增尾部——避免每步全量拷贝
+                    # completion_token_ids（随输出长度线性增长的 host 开销）。
+                    n_comp = seq.num_tokens - seq.num_prompt_tokens
+                    if n_comp > st.n_seen:
+                        new_tokens = [t for t in seq.token_ids[
+                            seq.num_prompt_tokens + st.n_seen: seq.num_tokens]
+                            if t != _eos]
                         if new_tokens:
                             if st.t_first is None:
                                 st.t_first = time.perf_counter()
                             st.tokens.extend(new_tokens)
                             _bump_tokens(len(new_tokens))
-                        st.n_seen = len(comp)
+                            st.event.set()   # 立即唤醒 HTTP 线程（原先仅 finish 时 set，
+                                             # 生成期 _run_llm 只能 50ms 轮询 → 流式延迟地板）
+                        st.n_seen = n_comp
                     if seq.is_finished:
                         st.finish_reason = (
                             "length" if seq.num_completion_tokens >= st.max_tokens
@@ -277,7 +378,8 @@ def _run_llm(st, stop, emit):
     return prev_text, reason, len(gen)
 
 
-def _chat_prompt_ids(messages):
+def _normalize_messages(messages):
+    """OpenAI messages → 模板可用的 {role, content} 列表（多模态 content 取文本）。"""
     normalized = []
     for msg in messages:
         role = msg.get("role")
@@ -291,10 +393,42 @@ def _chat_prompt_ids(messages):
         if content is None:
             content = ""
         normalized.append({"role": role, "content": content})
+    return normalized
+
+
+def _template_ids(normalized, enable_thinking=None):
+    """套 chat template 并 encode。enable_thinking=None 时不传该 kwarg（tokenize 结果
+    与 benchmark 默认逐字节一致）；False 时显式关 thinking（模板插入空
+    <think></think> 直答）。"""
+    think_kwargs = {} if enable_thinking is None else {"enable_thinking": enable_thinking}
     out = _tokenizer.apply_chat_template(
-        normalized, tokenize=True, add_generation_prompt=True)
+        normalized, tokenize=True, add_generation_prompt=True, **think_kwargs)
     # 兼容旧 transformers（<4.44 return_dict=False 直接返回 list）
     return out if isinstance(out, (list, tuple)) else out["input_ids"]
+
+
+def _chat_prompt_ids(messages, enable_thinking=None):
+    return _template_ids(_normalize_messages(messages), enable_thinking)
+
+
+def _chat_prompt_ids_fit(messages, enable_thinking, prompt_cap):
+    """聊天感知的上下文淘汰：保留开头连续的 system 消息 + 最近的消息，从**最旧的
+    非 system 消息**开始逐条丢弃，直到 token 数 <= prompt_cap；始终保留最后一条
+    消息（最新提问）。若 system + 最新一条仍超预算（极端），保留 token 尾部（最新
+    内容），确保最新提问不被吞。返回 (prompt_ids, 丢弃的消息数)。"""
+    msgs = _normalize_messages(messages)
+    n_sys = 0
+    while n_sys < len(msgs) and msgs[n_sys].get("role") == "system":
+        n_sys += 1
+    system, convo = msgs[:n_sys], msgs[n_sys:]
+    keep = list(convo)
+    ids = _template_ids(system + keep, enable_thinking)
+    while len(ids) > prompt_cap and len(keep) > 1:
+        keep.pop(0)                      # 丢最旧的非 system 消息
+        ids = _template_ids(system + keep, enable_thinking)
+    if len(ids) > prompt_cap:
+        ids = ids[-prompt_cap:]          # 极端兜底：保尾部（最新提问）
+    return ids, len(convo) - len(keep)
 
 
 def _completion_prompt_ids(body):
@@ -384,8 +518,33 @@ class Handler(BaseHTTPRequestHandler):
 
     server_version = "nanovllm-openai/0.2"
 
+    def setup(self):
+        super().setup()
+        self._box = {"n": 0}
+        self.wfile = _CountingWriter(self.wfile, self._box)
+        self._t0 = time.perf_counter()
+        self._n0 = 0
+        self._status = 200
+        self._rid = None
+
     def log_message(self, fmt, *args):
-        print("[http]", self.address_string(), fmt % args, flush=True)
+        pass    # 默认访问日志由 [HTTP] 行取代
+
+    def send_response(self, code, message=None):
+        self._status = code
+        super().send_response(code, message)
+
+    def _http_begin(self):
+        self._t0 = time.perf_counter()
+        self._n0 = self._box["n"]
+        self._status = 200
+        self._rid = None
+
+    def _http_end(self):
+        dur_ms = (time.perf_counter() - self._t0) * 1000
+        nbytes = self._box["n"] - self._n0
+        _log("HTTP", f"{self._rid or '-'} {self.command} {self.path} {self._status} "
+                     f"client={self.client_address[0]} {nbytes}B {dur_ms:.0f}ms")
 
     # ---- CORS / 预检 ----
 
@@ -395,9 +554,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 
     def do_OPTIONS(self):
-        self.send_response(204)
-        self._cors()
-        self.end_headers()
+        self._http_begin()
+        try:
+            self.send_response(204)
+            self._cors()
+            self.end_headers()
+        finally:
+            self._http_end()
 
     # ---- 工具 ----
 
@@ -428,39 +591,47 @@ class Handler(BaseHTTPRequestHandler):
     # ---- 路由 ----
 
     def do_GET(self):
-        if self.path in ("/v1/models", "/models"):
-            self._json({
-                "object": "list",
-                "data": [{
-                    "id": _model_name,
-                    "object": "model",
-                    "created": 0,
-                    "owned_by": "nanovllm",
-                }],
-            })
-            return
-        if self.path in ("/health", "/v1/health"):
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"OK")
-            return
-        self._error(f"unknown path: {self.path}", 404)
+        self._http_begin()
+        try:
+            if self.path in ("/v1/models", "/models"):
+                self._json({
+                    "object": "list",
+                    "data": [{
+                        "id": _model_name,
+                        "object": "model",
+                        "created": 0,
+                        "owned_by": "nanovllm",
+                    }],
+                })
+                return
+            if self.path in ("/health", "/v1/health"):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"OK")
+                return
+            self._error(f"unknown path: {self.path}", 404)
+        finally:
+            self._http_end()
 
     def do_POST(self):
-        if self.path not in ("/v1/chat/completions", "/v1/completions"):
-            self._error(f"unknown path: {self.path}", 404)
-            return
-        if not self._check_auth():
-            self._error("invalid api key", 401)
-            return
+        self._http_begin()
         try:
-            body = self._read_body()
-        except Exception:
-            self._error("invalid json body", 400)
-            return
-        mode = "chat" if self.path == "/v1/chat/completions" else "completion"
-        self._generate(body, mode)
+            if self.path not in ("/v1/chat/completions", "/v1/completions"):
+                self._error(f"unknown path: {self.path}", 404)
+                return
+            if not self._check_auth():
+                self._error("invalid api key", 401)
+                return
+            try:
+                body = self._read_body()
+            except Exception:
+                self._error("invalid json body", 400)
+                return
+            mode = "chat" if self.path == "/v1/chat/completions" else "completion"
+            self._generate(body, mode)
+        finally:
+            self._http_end()
 
     # ---- 生成 ----
 
@@ -490,36 +661,64 @@ class Handler(BaseHTTPRequestHandler):
         stop = [s for s in stop if isinstance(s, str) and s]
         include_usage = bool((body.get("stream_options") or {}).get("include_usage", False))
 
+        # 上下文淘汰：先为输出预留 budget（客户端显式 max_tokens 优先，否则用
+        # --reserve-output），把 prompt 压进 max_model_len 的剩余窗口。
+        reserve = max_tokens if max_tokens >= 1 else _default_reserve
+        reserve = min(max(reserve, 1), _max_model_len - 1)
+        prompt_cap = _max_model_len - reserve
+        dropped = 0
         try:
-            prompt_ids = (_chat_prompt_ids(body["messages"]) if mode == "chat"
-                          else _completion_prompt_ids(body))
+            # thinking 口径优先级：请求 chat_template_kwargs.enable_thinking /
+            # 顶层 enable_thinking > --no-think > 模板默认（on）。
+            ctk = body.get("chat_template_kwargs") or {}
+            enable_thinking = ctk.get("enable_thinking", body.get("enable_thinking",
+                                                                  _default_thinking))
+            if mode == "chat":
+                # 保 system + 最近轮次，丢最旧中间历史（不再砍尾巴吞掉最新提问）。
+                prompt_ids, dropped = _chat_prompt_ids_fit(
+                    body["messages"], enable_thinking, prompt_cap)
+                if dropped:
+                    _log("WARN", f"context eviction: dropped {dropped} oldest message(s) "
+                                 f"(prompt<={prompt_cap}tok reserve={reserve} "
+                                 f"max_model_len={_max_model_len})")
+            else:
+                prompt_ids = _completion_prompt_ids(body)
+                if len(prompt_ids) > prompt_cap:
+                    dropped = len(prompt_ids) - prompt_cap
+                    prompt_ids = prompt_ids[-prompt_cap:]    # 保尾部（最新内容）
+                    _log("WARN", f"completion prompt truncated {dropped} oldest tokens "
+                                 f"(prompt<={prompt_cap}tok)")
         except Exception as exc:
             self._error(f"prompt build failed: {exc}", 400)
             return
 
-        if len(prompt_ids) >= _max_model_len:
-            print(f"[warn] prompt truncated to {_max_model_len - 1} tokens", flush=True)
-            prompt_ids = prompt_ids[:_max_model_len - 1]
-        if max_tokens < 1:
-            max_tokens = _max_model_len - len(prompt_ids)    # 长文本：到上下文顶为止（vLLM 语义）
+        # 输出预算：绝不超过剩余上下文（旧实现允许客户端 max_tokens 与历史叠加越界）。
+        remaining = _max_model_len - len(prompt_ids)
+        max_tokens = min(max_tokens, remaining) if max_tokens >= 1 else remaining
+        max_tokens = max(1, max_tokens)    # 长文本：到上下文顶为止（vLLM 语义）
 
         req_id = f"chatcmpl-{time.time_ns()}" if mode == "chat" else f"cmpl-{time.time_ns()}"
         rid = req_id[-6:]
+        self._rid = rid    # [HTTP] 行关联
 
         seq = Sequence(prompt_ids, SamplingParams(
             temperature=temperature, max_tokens=max_tokens, top_p=top_p, top_k=top_k))
         with engine_lock:
             engine.scheduler.add(seq)
             st = _Request(seq, max_tokens, rid)
+            st.endpoint = self.path
+            st.stream = stream
+            st.client = self.client_address[0]
+            st.temperature = temperature
+            st.top_p = top_p
+            st.top_k = top_k
+            st.thinking = "off" if enable_thinking is False else "on"
+            st.evicted = dropped
+            st.preview = _preview(body, mode)
             _active[seq.seq_id] = st
             st.stats_before = dict(engine.scheduler.block_manager.stats)
             _wakeup.set()
-
-        # [req] 请求到达 info：端点 / token 数 / 采样参数 / 流式 / 内容预览
-        print(f"[req ] {rid} {self.path} client={self.client_address[0]} stream={stream} "
-              f"prompt={st.prompt_tokens} tok max_tokens={max_tokens} "
-              f"temp={temperature:g} top_p={top_p:g} top_k={top_k} stop={len(stop)} "
-              f"| {_preview(body, mode)}", flush=True)
+        # [REQ] 行由 scheduler.schedule 钩子在首次被调度时打印（含引擎调度等待 wait=）。
 
         usage = {
             "prompt_tokens": st.prompt_tokens,
@@ -581,16 +780,60 @@ class Handler(BaseHTTPRequestHandler):
         except BrokenPipeError:
             pass    # 客户端断开：请求已在 _run_llm 内跑完/中止
         except Exception as exc:
-            print(f"[error] {rid} generation failed: {exc}", flush=True)
+            _log("ERROR", f"{rid} generation failed: {exc}")
             try:
                 self._error(f"generation failed: {exc}", 500)
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
 
 
+def _install_schedule_hook():
+    """挂 scheduler.schedule：记录每个请求首次被引擎调度的时刻，并在此时打 [REQ]
+    行（含引擎调度等待 wait=受理→被调度）。"""
+    sched = engine.scheduler
+    orig = sched.schedule
+
+    def wrapped():
+        seqs, is_prefill = orig()
+        now = time.perf_counter()
+        for seq in seqs:
+            st = _active.get(seq.seq_id)
+            if st is not None and st.t_started is None:
+                st.t_started = now
+                _log_request(st)
+        return seqs, is_prefill
+
+    sched.schedule = wrapped
+
+
+def _install_spec_stats():
+    """包 model_runner.spec_round：累计每请求/全局的投机轮数与提交 token 数（accept/E）。
+    非 spec 直通（rounds 恒 0 → DONE/INFO 显示 -）。"""
+    mr = engine.model_runner
+    if not getattr(mr, "spec_enabled", False):
+        return
+    orig = mr.spec_round
+
+    def wrapped(seqs):
+        out = orig(seqs)
+        global _spec_rounds, _spec_committed
+        with _gen_lock:
+            for seq, toks in zip(seqs, out):
+                n = len(toks)
+                st = _active.get(seq.seq_id)
+                if st is not None:
+                    st.spec_rounds += 1
+                    st.spec_committed += n
+                _spec_rounds += 1
+                _spec_committed += n
+        return out
+
+    mr.spec_round = wrapped
+
+
 def main():
     global engine, _tokenizer, _eos, _model_name, _api_key
-    global _default_temperature, _max_model_len
+    global _default_temperature, _max_model_len, _default_thinking, _default_reserve
 
     parser = argparse.ArgumentParser(description="nano-vLLM OpenAI-compatible server (TP=1)")
     parser.add_argument("model", help="model directory path")
@@ -611,6 +854,14 @@ def main():
     parser.add_argument("--spec-num-tokens", type=int, default=4,
                         help="每轮起草 token 数 k（draft depth）")
     parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--no-think", action="store_true",
+                        help="chat template 显式 enable_thinking=False（关闭 thinking，"
+                             "对齐 benchmark --no-think 的历史 E 锚点口径；默认交给模板"
+                             "=thinking on）。每请求可用 chat_template_kwargs.enable_thinking 覆盖")
+    parser.add_argument("--reserve-output", type=int, default=512,
+                        help="上下文淘汰时为客户未指定 max_tokens 的请求预留的输出 token 数"
+                             "（默认 512）：prompt（system+历史+最新）超出 max_model_len 减去"
+                             "该值后，从最旧历史起逐条淘汰")
     # KV 池按 (total*util - used) 贴地分配；空板卡（无桌面占用）需调低 util
     # 给图捕获/运行峰值留余量（32GB CoreX 卡贴地后仅剩 ~112MB，spec 图捕获必 OOM 降级）。
     parser.add_argument("--gpu-mem-util", type=float, default=0.9)
@@ -618,6 +869,8 @@ def main():
 
     _api_key = args.api_key
     _default_temperature = args.temperature
+    _default_thinking = False if args.no_think else None
+    _default_reserve = max(1, args.reserve_output)
 
     kwargs = dict(
         model=args.model,
@@ -645,10 +898,13 @@ def main():
     _eos = engine.scheduler.eos
     _max_model_len = engine.model_runner.config.max_model_len
     _model_name = args.model.rstrip("/").rsplit("/", 1)[-1]
+    _install_schedule_hook()
+    _install_spec_stats()
     spec_info = f"ON(k={args.spec_num_tokens}, {args.spec_model.rstrip('/').rsplit('/', 1)[-1]})" \
         if args.spec_model else "OFF"
     print(f"model '{_model_name}' ready | eos={_eos} | eager={args.eager} | spec={spec_info} | "
-          f"max_model_len={_max_model_len} | max_num_seqs={kwargs['max_num_seqs']}", flush=True)
+          f"max_model_len={_max_model_len} | max_num_seqs={kwargs['max_num_seqs']} | "
+          f"thinking={'off' if args.no_think else 'on'}", flush=True)
 
     threading.Thread(target=_engine_loop, daemon=True).start()
     threading.Thread(target=_tps_loop, daemon=True).start()
