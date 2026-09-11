@@ -13,6 +13,14 @@ class Scheduler:
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
         self.is_hybrid = config.is_hybrid
+        # 状态槽后端门控：hybrid（GDN 状态池）与 dense+dflash（draft ctx 稠密缓冲
+        # 槽）的 per-seq 状态槽都在 prefill 分配、decode 持有、finish/preempt 释放
+        # ——admission 必须保证「持有槽的序列总数 ≤ max_num_seqs」，否则排队请求
+        # 会在 decode 开始前把槽耗尽（dense+dflash 机械冒烟实测：ms=2 下 p2 仍占
+        # 槽时 p3/p4 被同一 prefill 批放行 → draft ctx 槽耗尽 RuntimeError）。
+        # qwen3+eagle3 无固定状态槽（spec_carry 按 seq_id 记账、finish 即释放），
+        # 门控关闭，行为零变化。
+        self.state_slots_gate = config.is_hybrid or config.spec_method == "dflash"
         # hybrid GDN 状态槽释放回调（llm_engine 注入为 model_runner.drop_seq_state
         # 的包装；回调解耦——scheduler 不持有 model_runner 引用。qwen3 路径恒
         # None，preempt 零开销直通）。
@@ -33,19 +41,19 @@ class Scheduler:
         num_batched_tokens = 0
 
         # prefill
-        # hybrid（Qwen3.5）admission 门控：GDN 状态槽数 = max_num_seqs（与 decode
-        # 并发同额，见 model_runner._alloc_gdn_state_pool）。已 prefill 的序列即使
-        # 在 prefill 批次间停滞（本引擎 prefill/decode 不同批）也持有槽位，若不限
-        # 制「持有槽的序列总数」，排队请求会在 decode 开始前把槽耗尽。故 hybrid 下
-        # 追加「步首 running + 本步新 prefill ≤ max_num_seqs」（vLLM MambaManager
-        # 同思路：无空闲状态槽不放行新请求；preempt/finish 缩减 running 后自然
-        # 放行）。注意用循环前快照：hybrid 整段 prefill 的序列在循环内同时进入
-        # running 与 scheduled_seqs，用实时 len(running) 会双计。
-        # qwen3 路径 `not self.is_hybrid` 短路恒真（快照变量不求值），条件与原式
-        # 等价，行为零变化。
+        # 状态槽后端 admission 门控（hybrid GDN 池 / dense+dflash draft ctx 槽）：
+        # 已 prefill 的序列即使在 prefill 批次间停滞（本引擎 prefill/decode 不同
+        # 批）也持有槽位，若不限制「持有槽的序列总数」，排队请求会在 decode 开始
+        # 前把槽耗尽。故门控后端下追加「步首 running + 本步新 prefill ≤
+        # max_num_seqs」（vLLM MambaManager 同思路：无空闲状态槽不放行新请求；
+        # preempt/finish 缩减 running 后自然放行）。注意用循环前快照：整段 prefill
+        # 的序列在循环内同时进入 running 与 scheduled_seqs，用实时 len(running)
+        # 会双计。
+        # 非门控后端（qwen3+eagle3 / 非 spec）短路恒真（快照变量不求值），条件与
+        # 原式等价，行为零变化。
         running_holders = len(self.running)
         while (self.waiting and len(scheduled_seqs) < self.max_num_seqs
-               and (not self.is_hybrid
+               and (not self.state_slots_gate
                     or running_holders + len(scheduled_seqs) < self.max_num_seqs)):
             seq = self.waiting[0]
             remaining = self.max_num_batched_tokens - num_batched_tokens

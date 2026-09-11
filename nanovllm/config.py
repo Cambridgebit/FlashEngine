@@ -128,14 +128,25 @@ class Config:
                 block = int(dfc.get("block_size", getattr(dc, "block_size", 16)))
                 if self.spec_num_tokens in (3, 4):
                     self.spec_num_tokens = block - 1
-                # aux 捕获层 = dflash_config.target_layer_ids（0-based 层输出口径，
-                # 与 qwen3_5 模型 aux 钩子语义一致，见计划 §3）。
+                # aux 捕获层 = dflash_config.target_layer_ids 经目标口径换算：
+                # - qwen3_5（hybrid）aux 钩子 = 0-based 层输出口径，直配；
+                # - qwen3 dense aux 钩子（qwen3.py）= 层输入口径，而层 l 输出 ≡
+                #   层 l+1 输入（同一残差流值），故 +1 换算——qwen3.py 零改动，
+                #   与 vllm qwen3 dense 的 dflash aux 转换同构（Qwen3-4B 的
+                #   [1,9,17,25,33] → (2,10,18,26,34)）。
                 if not self.spec_aux_layers:
-                    self.spec_aux_layers = tuple(dfc["target_layer_ids"])
+                    tli = tuple(dfc["target_layer_ids"])
+                    if self.is_hybrid:
+                        self.spec_aux_layers = tli
+                    else:
+                        self.spec_aux_layers = tuple(l + 1 for l in tli)
                 assert len(self.spec_aux_layers) == len(dfc["target_layer_ids"]), (
                     "DFlash draft fc 输入宽度与 aux 层数不一致："
                     f"spec_aux_layers={self.spec_aux_layers} vs "
                     f"target_layer_ids={dfc['target_layer_ids']}")
+                assert max(self.spec_aux_layers) < self.text_config.num_hidden_layers, (
+                    f"DFlash aux 捕获层越界：spec_aux_layers={self.spec_aux_layers} "
+                    f">= 目标层数 {self.text_config.num_hidden_layers}")
             elif not self.is_hybrid:
                 if not self.spec_aux_layers:
                     n = self.hf_config.num_hidden_layers

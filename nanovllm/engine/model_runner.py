@@ -166,17 +166,15 @@ class ModelRunner:
         # EAGLE3 投机解码（仅 TP=1，见 config 断言）。
         self.spec_enabled = bool(config.spec_model)
         if self.spec_enabled and self.is_hybrid and config.spec_method != "dflash":
-            # 阶段2 守卫（替换阶段1 的 NotImplementedError）：hybrid（Qwen3.5）
-            # 目标仅接受 DFlash——EAGLE3 的链式流/3 层 aux/层输入口径与 GDN 混合
-            # 架构不兼容（干净拒绝，勿静默走错路径）。
+            # 守卫（配对矩阵唯余此格拒绝）：hybrid（Qwen3.5）+ EAGLE3 未实现——
+            # EAGLE3 链式草稿的 GDN verify 分叉未接入 _sg 路径（接入前硬跑会
+            # 静默状态错乱，故干净拒绝）。四格矩阵现状：qwen3+eagle3（原路径）、
+            # qwen3_5+dflash（hybrid 基建）、qwen3+dflash（dense：_df 路径 GDN
+            # 触点已 is_hybrid 条件化）三者放行。
             raise RuntimeError(
                 'Qwen3.5（hybrid）目标仅支持 DFlash 投机解码（spec_method=dflash）：'
                 'EAGLE3 draft 的链式起草与 3 层 aux 口径不适用于 GDN 混合架构，'
                 '请改用含 dflash_config 的 DFlash draft checkpoint')
-        if self.spec_enabled and not self.is_hybrid and config.spec_method == "dflash":
-            raise RuntimeError(
-                'DFlash 仅支持 Qwen3.5（hybrid）目标模型：纯 Qwen3 target 请使用 '
-                'EAGLE3 draft（DFlash 的上下文注入与 GDN verify 分叉依赖 hybrid 基建）')
         if self.spec_enabled and not self.backend.supports_spec:
             # spec 全路径不可用的后端在此干净拒绝（能力位裁决，不做 name 字符串
             # 判断）：310P 上 verify 恒传 block_tables → attention 层走整池 4D
@@ -350,6 +348,10 @@ class ModelRunner:
                     # 全静态化，见 _df_round_body / capture_df_spec_cudagraph）。
                     # 图门与 EAGLE3 同款（supports_spec_graph + graph_sample_default，
                     # NANOVLLM_SPEC_GRAPH 显式覆盖）；失败自动降级 eager spec 轮。
+                    # dense（Qwen3+dflash）与 hybrid 同门：图路径的 GDN 静态段已
+                    # is_hybrid 条件化（dense 无 GDN 状态分叉，df_carry 段留零不
+                    # 消费），CUDA/CoreX 均尝试捕获——CoreX 是 dense+dflash 图的
+                    # 主目标形态（EAGLE 整轮图实机已证 ixformer verify 可捕获）。
                     _env_spec = os.environ.get("NANOVLLM_SPEC_GRAPH")
                     if (self.world_size == 1 and self.backend.supports_spec_graph
                             and (_env_spec != "0" if _env_spec is not None
@@ -441,13 +443,15 @@ class ModelRunner:
             # 零初始化 prefill，旧值永不被读，见 drop_seq_state）。
             self.gdn_slots.clear()
             self._gdn_free_slots = set(range(self.config.max_num_seqs))
-            if self.config.spec_method == "dflash":
-                # DFlash：预热 dummy 序列的 spec 状态同口径全量回收
-                # （pending aux / GDN carry 记账 / draft 上下文槽）。
-                self.spec_ctx_pending.clear()
-                self.gdn_spec_carry.clear()
-                self.draft_ctx_slots.clear()
-                self._df_ctx_free = set(range(self.config.max_num_seqs))
+        if self.config.spec_method == "dflash":
+            # DFlash：预热 dummy 序列的 spec 状态同口径全量回收（pending aux /
+            # GDN carry 记账 / draft 上下文槽）。hybrid 与 dense（qwen3+dflash）
+            # 都需要——原实现嵌在 is_hybrid 块内，dense 首次机械冒烟实测 warmup
+            # 假槽不回收 → 首个真实 prefill 槽耗尽 RuntimeError，故提出块外。
+            self.spec_ctx_pending.clear()
+            self.gdn_spec_carry.clear()
+            self.draft_ctx_slots.clear()
+            self._df_ctx_free = set(range(self.config.max_num_seqs))
 
     def allocate_kv_cache(self):
         config = self.config
@@ -1216,10 +1220,12 @@ class ModelRunner:
 
         与 _sg_verify 同构（同一批 _sg 静态缓冲），差异仅 GDN 上下文：'row' 模式
         + 写基址/ carry 槽——EAGLE3 路径零触碰红线，故独立成方法而非加参。
-        GDN 元数据（host 逐 seq 解析，跨轮槽位按 seq_id 记账）：
+        GDN 元数据（host 逐 seq 解析，跨轮槽位按 seq_id 记账；仅 hybrid）：
         - 写基址 base_i = max_num_seqs + i×(k+1)（池静态布局，行 0..k 逐行落槽）；
         - 行 0 读槽 = gdn_spec_carry[seq]（后续轮 = 上轮 base+m）或 gdn_slots[seq]
           （首轮 = prefill 终态主槽）。
+        dense（Qwen3+DFlash）无 GDN：上下文 kwargs 整组缺省，_df_bases 仍记录
+        （读回侧 is_hybrid 门控，恒不消费）。
         """
         g = self._sg
         k = self.config.spec_num_tokens
@@ -1227,9 +1233,12 @@ class ModelRunner:
         n = len(seqs)
         ms = self.config.max_num_seqs
         bases = [ms + i * rows for i in range(n)]
-        carries = [self.gdn_spec_carry.get(s.seq_id, self.gdn_slots[s.seq_id]) for s in seqs]
-        base_dev = torch.tensor(bases, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
-        carry_dev = torch.tensor(carries, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
+        gdn_extra: dict = {}
+        if self.is_hybrid:
+            carries = [self.gdn_spec_carry.get(s.seq_id, self.gdn_slots[s.seq_id]) for s in seqs]
+            base_dev = torch.tensor(bases, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
+            carry_dev = torch.tensor(carries, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
+            gdn_extra = dict(gdn_state_slots=base_dev, gdn_carry_slots=carry_dev, gdn_state_mode='row')
         # max_seqlen_k 用 max_model_len 上界（同 _sg_verify 的 varlen grid 口径）
         set_context(True,
                     cu_seqlens_q=g['v_cu_q'][:n + 1],
@@ -1239,9 +1248,7 @@ class ModelRunner:
                     slot_mapping=g['v_slots'][:n * rows],
                     block_tables=g['v_btables'][:n],
                     block_size=self.block_size,
-                    gdn_state_slots=base_dev,
-                    gdn_carry_slots=carry_dev,
-                    gdn_state_mode='row')
+                    **gdn_extra)
         hidden, aux = self.model(g['v_input_ids'][:n * rows], g['v_positions'][:n * rows])
         logits = F.linear(hidden, self.model.lm_head.weight)
         g['v_token_ids'][:n * rows] = self.sampler.forward_native(
@@ -1266,8 +1273,9 @@ class ModelRunner:
             results.append(row[:c])
             # 下一轮上下文追加行：v_aux 行 0..c-1（GPU 常驻 clone）
             self.spec_ctx_pending[seq.seq_id] = g['v_aux'][i * rows:i * rows + c].clone()
-            # GDN carry = 本轮行 m 槽（c-1 = m ≥ 0）；下轮行 0 读此槽
-            self.gdn_spec_carry[seq.seq_id] = self._df_bases[i] + (c - 1)
+            # GDN carry = 本轮行 m 槽（c-1 = m ≥ 0）；下轮行 0 读此槽（仅 hybrid）
+            if self.is_hybrid:
+                self.gdn_spec_carry[seq.seq_id] = self._df_bases[i] + (c - 1)
             # 回滚未提交的调度计数（同 _readback_spec_commit）
             seq.num_scheduled_tokens = 0
         return results
@@ -1368,8 +1376,10 @@ class ModelRunner:
             p = self.spec_ctx_pending.get(seq.seq_id)
             c[i] = 0 if p is None else p.size(0)
             cs[i] = self.draft_ctx_slots[seq.seq_id]
-            # 行 0 读槽：与 eager _df_verify 同源（carry 优先，回落 prefill 主槽）
-            cy[i] = self.gdn_spec_carry.get(seq.seq_id, self.gdn_slots[seq.seq_id])
+            # 行 0 读槽：与 eager _df_verify 同源（carry 优先，回落 prefill 主槽）。
+            # dense（Qwen3+dflash）无 GDN：df_carry 段留零，_df_verify_graph 不消费。
+            if self.is_hybrid:
+                cy[i] = self.gdn_spec_carry.get(seq.seq_id, self.gdn_slots[seq.seq_id])
 
     def _df_load_ctx_aux(self, seqs: list[Sequence], bs: int):
         """上下文追加的 aux 暂存装载（图外 host 步，GPU→GPU）：spec_ctx_pending
@@ -1437,15 +1447,22 @@ class ModelRunner:
 
     def _df_verify_graph(self, bs: int):
         """③ target verify（图内静态化）：与 _df_verify 同构（同一批 _sg 静态
-        buffer），差异仅在 GDN 元数据的图安全来源——写基址 host 常量列表
-        （gdn_row_bases，capture 期烘进图）+ 行 0 读槽 df_carry 静态 buffer
-        （_df_scatter 每轮分发），取代 eager 版的两次 torch.tensor H2D（捕获期
-        会把值烘焙成常量，carry 必须走 blob）。padding 行 base 指向各自行槽区。"""
+        buffer），差异仅在 GDN 元数据的图安全来源（仅 hybrid）——写基址 host
+        常量列表（gdn_row_bases，capture 期烘进图）+ 行 0 读槽 df_carry 静态
+        buffer（_df_scatter 每轮分发），取代 eager 版的两次 torch.tensor H2D
+        （捕获期会把值烘焙成常量，carry 必须走 blob）。padding 行 base 指向各
+        自行槽区。dense（Qwen3+dflash）无 GDN：上下文 kwargs 整组缺省。"""
         g = self._sg
         k = self.config.spec_num_tokens
         rows = k + 1
-        ms = self.config.max_num_seqs
-        bases = [ms + i * rows for i in range(bs)]
+        gdn_extra: dict = {}
+        if self.is_hybrid:
+            ms = self.config.max_num_seqs
+            bases = [ms + i * rows for i in range(bs)]
+            gdn_extra = dict(gdn_state_mode='row',
+                             gdn_carry_slots=g['df_carry'][:bs],
+                             gdn_row_bases=bases,
+                             gdn_row_seg=rows)
         # max_seqlen_k 用 max_model_len 上界（同 _sg_verify/_df_verify 的 varlen
         # grid 口径，避免 capture 烘焙随轮次变化的 python int）
         set_context(True,
@@ -1456,10 +1473,7 @@ class ModelRunner:
                     slot_mapping=g['v_slots'][:bs * rows],
                     block_tables=g['v_btables'][:bs],
                     block_size=self.block_size,
-                    gdn_state_mode='row',
-                    gdn_carry_slots=g['df_carry'][:bs],
-                    gdn_row_bases=bases,
-                    gdn_row_seg=rows)
+                    **gdn_extra)
         hidden, aux = self.model(g['v_input_ids'][:bs * rows], g['v_positions'][:bs * rows])
         logits = F.linear(hidden, self.model.lm_head.weight)
         g['v_token_ids'][:bs * rows] = self.sampler.forward_native(
