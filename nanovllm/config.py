@@ -2,6 +2,8 @@ import os
 from dataclasses import dataclass
 from transformers import AutoConfig
 
+from nanovllm.backends import detect_backend
+
 
 @dataclass(slots=True)
 class Config:
@@ -35,6 +37,14 @@ class Config:
     # 拼接后经 draft fc(3*hidden -> hidden)。必须与 draft 训练时的捕获层一致；
     # 默认 (2, n//2, n-3) 与官方 EAGLE 仓库 / vLLM 的 Qwen3 捕获点一致。
     spec_aux_layers: tuple[int, ...] = ()
+    # ---- hybrid（Qwen3.5）派生标记（__post_init__ 填充；qwen3 恒 False/None）----
+    # Qwen3.5 = 18×GDN 线性注意力 + 6×全注意力的混合架构（model_type=qwen3_5，
+    # text 形状在嵌套 text_config；纯文本 checkpoint 顶层可能直接是 qwen3_5_text，
+    # 一并识别）。引擎所有 hybrid 分支（状态池/图/spec 门控）以此为准。
+    is_hybrid: bool = False
+    # text 侧形状配置便捷访问：qwen3_5 取嵌套 text_config，qwen3 即 hf_config 本身
+    # （引擎统一经 config.text_config 取形状，qwen3 路径取值与原 hf_config 直取逐字节相同）。
+    text_config: AutoConfig | None = None
 
     def __post_init__(self):
         if self.backend != "auto":
@@ -46,13 +56,58 @@ class Config:
         assert self.kvcache_block_size & (self.kvcache_block_size - 1) == 0
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)
-        self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
+        # hybrid 识别 + text_config 便捷访问（qwen3 的 text_config 即 hf_config）。
+        model_type = getattr(self.hf_config, "model_type", "")
+        self.is_hybrid = model_type in ("qwen3_5", "qwen3_5_text")
+        self.text_config = self.hf_config.text_config if self.is_hybrid else self.hf_config
+        # max_model_len clamp 经 text_config（qwen3 路径行为不变）。
+        self.max_model_len = min(self.max_model_len, self.text_config.max_position_embeddings)
+        if self.is_hybrid:
+            # ---- hybrid 门控（阶段1 范围）----
+            # 1) 强制关闭前缀缓存：GDN 状态随序列连续推进，无法按 block hash 复用，
+            #    保留开关只会白付每步 hash 开销。
+            if self.enable_prefix_cache:
+                print('[nano-vllm] hybrid 模型（Qwen3.5）强制关闭前缀缓存：GDN 状态不支持 block 级复用', flush=True)
+                self.enable_prefix_cache = False
+            # 2) 禁 chunked prefill：GDN 状态只能整段一次推进（分段 prefill 需要
+            #    中间态落池/回填，阶段1 不做）。做法：prefill 批预算封顶到
+            #    max_model_len——单步 prefill 至多一条满长序列（短 prompt 仍可
+            #    多条同批）。这同时把 warmup 批自动压到 1×seq_len，使「warmup
+            #    预留的峰值显存」与「运行时最坏 GDN 前向瞬时」严格一致：8GB 卡上
+            #    按 8×2048 批预留会把 KV 池预算直接挤到 0 块（实测 warmup 峰值
+            #    5029 MiB vs current 4131 MiB，碎片 ~1GB）。调度器「仅首序列可
+            #    切分」分支在 mnbt >= mml 下不可达（核实注释见 scheduler.schedule）。
+            if self.max_num_batched_tokens > self.max_model_len:
+                print(f'[nano-vllm] hybrid 模型（Qwen3.5）prefill 批预算 '
+                      f'max_num_batched_tokens {self.max_num_batched_tokens} -> {self.max_model_len}'
+                      '（禁 chunked prefill，单步至多一条满长序列，同时压低 GDN 前向峰值）', flush=True)
+                self.max_num_batched_tokens = self.max_model_len
+            assert self.max_num_batched_tokens >= self.max_model_len, (
+                f'hybrid 模型（Qwen3.5）禁用 chunked prefill：max_num_batched_tokens'
+                f'({self.max_num_batched_tokens}) 必须 >= max_model_len({self.max_model_len})')
+            # 3) 仅 CUDA 后端：GDN 走纯 torch 实现，但状态池/图/spec 语义只在
+            #    CUDA 验证。经 detect_backend() 取名（与 backend.name 同源；config
+            #    阶段不实例化后端单例，避免 fork/spawn 前的隐式设备初始化）。
+            backend_name = detect_backend()
+            if backend_name != "cuda":
+                raise RuntimeError(
+                    f'hybrid 模型（Qwen3.5）当前仅支持 cuda 后端（当前后端：{backend_name}），'
+                    f'CoreX/Ascend 的 hybrid 支持不在本阶段范围')
+            # 4) 阶段1 仅 TP=1：GDN 状态槽按 seq_id 在各 rank 独立分配，而 Sequence
+            #    的跨进程 pickle 不携带 seq_id，槽一致性不在本阶段范围（GDN 的 TP
+            #    分片本身也待模型侧验证）。
+            assert self.tensor_parallel_size == 1, \
+                'hybrid 模型（Qwen3.5）阶段1 仅支持 tensor_parallel_size == 1'
         if self.spec_model:
             # spec 解码路径依赖 rank0 上的 draft 状态（h_seed），仅支持 TP=1。
             assert self.tensor_parallel_size == 1, "speculative decoding requires tensor_parallel_size == 1"
             assert os.path.isdir(self.spec_model)
             assert self.spec_num_tokens >= 1
-            if not self.spec_aux_layers:
-                n = self.hf_config.num_hidden_layers
-                self.spec_aux_layers = (2, n // 2, n - 3)
-            assert len(self.spec_aux_layers) == 3, "EAGLE3 draft fc 输入为 3 个 aux 隐层拼接"
+            if not self.is_hybrid:
+                if not self.spec_aux_layers:
+                    n = self.hf_config.num_hidden_layers
+                    self.spec_aux_layers = (2, n // 2, n - 3)
+                assert len(self.spec_aux_layers) == 3, "EAGLE3 draft fc 输入为 3 个 aux 隐层拼接"
+            # hybrid + spec_model：EAGLE3 的 aux 断言不适用（DFlash 消费 5 层 aux），
+            # 默认捕获层计算也会踩不到 hf_config.num_hidden_layers——本阶段干净拒绝
+            # 在 model_runner（NotImplementedError，DFlash 适配在阶段2 提供）。

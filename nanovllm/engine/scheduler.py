@@ -12,6 +12,11 @@ class Scheduler:
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
+        self.is_hybrid = config.is_hybrid
+        # hybrid GDN 状态槽释放回调（llm_engine 注入为 model_runner.drop_seq_state
+        # 的包装；回调解耦——scheduler 不持有 model_runner 引用。qwen3 路径恒
+        # None，preempt 零开销直通）。
+        self.on_preempt = None
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size,
                                           config.enable_prefix_cache)
         self.waiting: deque[Sequence] = deque()
@@ -28,7 +33,20 @@ class Scheduler:
         num_batched_tokens = 0
 
         # prefill
-        while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
+        # hybrid（Qwen3.5）admission 门控：GDN 状态槽数 = max_num_seqs（与 decode
+        # 并发同额，见 model_runner._alloc_gdn_state_pool）。已 prefill 的序列即使
+        # 在 prefill 批次间停滞（本引擎 prefill/decode 不同批）也持有槽位，若不限
+        # 制「持有槽的序列总数」，排队请求会在 decode 开始前把槽耗尽。故 hybrid 下
+        # 追加「步首 running + 本步新 prefill ≤ max_num_seqs」（vLLM MambaManager
+        # 同思路：无空闲状态槽不放行新请求；preempt/finish 缩减 running 后自然
+        # 放行）。注意用循环前快照：hybrid 整段 prefill 的序列在循环内同时进入
+        # running 与 scheduled_seqs，用实时 len(running) 会双计。
+        # qwen3 路径 `not self.is_hybrid` 短路恒真（快照变量不求值），条件与原式
+        # 等价，行为零变化。
+        running_holders = len(self.running)
+        while (self.waiting and len(scheduled_seqs) < self.max_num_seqs
+               and (not self.is_hybrid
+                    or running_holders + len(scheduled_seqs) < self.max_num_seqs)):
             seq = self.waiting[0]
             remaining = self.max_num_batched_tokens - num_batched_tokens
             if remaining == 0:
@@ -40,6 +58,10 @@ class Scheduler:
                 num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
             else:
                 num_tokens = seq.num_tokens - seq.num_cached_tokens
+            # hybrid 核实（阶段1b）：config 断言 max_num_batched_tokens >=
+            # max_model_len 下，首序列 remaining 即 ≥ 任意整段 prompt，min() 不截断、
+            # 本分支「仅首序列可切分」不可达 → hybrid prefill 恒整段（无 chunk）。
+            # （prompt 超过 max_model_len 属用户错误，非本断言保护范围。）
             if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
                 break
             if not seq.block_table:
@@ -77,6 +99,10 @@ class Scheduler:
         seq.status = SequenceStatus.WAITING
         seq.is_prefill = True
         self.block_manager.deallocate(seq)
+        if self.on_preempt is not None:
+            # hybrid：抢占即丢 GDN 状态槽（正确性优先——状态与 KV 一同作废，
+            # 重 prefill 时零初始化重建）。回调由 llm_engine 注入，见 __init__。
+            self.on_preempt(seq)
         self.waiting.appendleft(seq)
 
     def prepare_spec_round(self, num_draft_tokens: int) -> list[Sequence]:

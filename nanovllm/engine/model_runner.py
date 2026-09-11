@@ -14,10 +14,11 @@ from nanovllm.backends import get_backend
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.qwen3_5 import Qwen3_5ForCausalLM
 from nanovllm.models.eagle3 import Eagle3DraftModel, load_eagle3_draft
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
-from nanovllm.utils.loader import load_model
+from nanovllm.utils.loader import load_model, iter_safetensors
 
 
 def _bucket(table, n):
@@ -152,10 +153,22 @@ class ModelRunner:
         self.event = event
         self.backend = get_backend()
         # 设备语义串与 dtype 解析：后端强制 dtype（如 310P 仅 fp16）优先于 hf_config。
+        # dtype 取 text_config：qwen3_5 外层多模态壳无顶层 dtype（实测 None），
+        # text 侧才有；qwen3 的 text_config 即 hf_config，逐字节同值。
         self.device = self.backend.device_name
-        self.dtype = self.backend.default_dtype or hf_config.dtype
+        self.dtype = self.backend.default_dtype or config.text_config.dtype
+        # hybrid（Qwen3.5）总开关：GDN 状态池/槽生命周期/图与 spec 门控统一由此
+        # 分支（qwen3 路径恒 False，所有 hybrid 分支不可达，行为零变化）。
+        self.is_hybrid = config.is_hybrid
+        # GDN 状态池字节数（hybrid 下由 _alloc_gdn_state_pool 填充；qwen3 恒 0）。
+        self._gdn_state_bytes = 0
         # EAGLE3 投机解码（仅 TP=1，见 config 断言）。
         self.spec_enabled = bool(config.spec_model)
+        if self.spec_enabled and self.is_hybrid:
+            # 阶段1 守卫：Qwen3.5 目标的投机解码（DFlash）在阶段2 提供，干净拒绝
+            # （先于 draft 构建与 EAGLE3 检查；hybrid 的 spec_method 分发也是阶段2）。
+            raise NotImplementedError(
+                'Qwen3.5 目标的投机解码（DFlash）将在阶段2 提供，当前请去掉 spec_model 配置')
         if self.spec_enabled and not self.backend.supports_spec:
             # spec 全路径不可用的后端在此干净拒绝（能力位裁决，不做 name 字符串
             # 判断）：310P 上 verify 恒传 block_tables → attention 层走整池 4D
@@ -202,13 +215,32 @@ class ModelRunner:
         dist.init_process_group(self.backend.dist_name, f"tcp://localhost:{config.hccl_port}", world_size=self.world_size, rank=rank)
         self.backend.set_device(rank)
         default_dtype = torch.get_default_dtype()
-        if self.backend.default_dtype is not None and self.backend.default_dtype != hf_config.dtype:
+        if self.backend.default_dtype is not None and self.backend.default_dtype != config.text_config.dtype:
             print(f'[nano-vllm] 后端 {self.backend.name} 强制 dtype={self.backend.default_dtype}'
-                  f'（hf_config 为 {hf_config.dtype}），权重将在加载时隐式转换', flush=True)
+                  f'（hf_config 为 {config.text_config.dtype}），权重将在加载时隐式转换', flush=True)
         torch.set_default_dtype(self.dtype)
         torch.set_default_device(self.backend.device_name)
-        self.model = Qwen3ForCausalLM(hf_config)
-        load_model(self.model, config.model)
+        # 模型分发：qwen3_5（hybrid）→ Qwen3_5ForCausalLM（text 形状自取
+        # hf_config.text_config）；qwen3 路径原样不动。
+        if self.is_hybrid:
+            self.model = Qwen3_5ForCausalLM(hf_config)
+        else:
+            self.model = Qwen3ForCausalLM(hf_config)
+        # 模型自带 load_weights（Qwen3.5：多模态壳前缀剥离 + GDN in_proj/conv/A_log
+        # 特例装配，见 qwen3_5.load_weights）优先；qwen3 走通用 loader，路径不变。
+        if hasattr(self.model, "load_weights"):
+            self.model.load_weights(iter_safetensors(config.model))
+        else:
+            load_model(self.model, config.model)
+        if self.is_hybrid:
+            # 契约核对：模型侧 is_hybrid 必须与 config 判定一致（防两处口径漂移）。
+            assert getattr(self.model.model, "is_hybrid", False) is True, \
+                '模型未声明 is_hybrid（qwen3_5 契约：model.model.is_hybrid=True）'
+            # GDN 状态池在 warmup 之前分配：GDN forward（含预热轮）需要真实的
+            # conv/ssm 缓存（Attention 的 k_cache 靠 numel()==0 跳过预热写，GDN
+            # 无此占位语义）。其字节数此后已包含在 mem_get_info 的 used 里，
+            # allocate_kv_cache 的预算循环自动计入（勿再显式扣除，避免双重计费）。
+            self._alloc_gdn_state_pool()
         if self.spec_enabled:
             # aux 隐层捕获必须在 warmup 前打开（prefill 前向开始返回 (hidden, aux)）。
             self.model.model.aux_hidden_state_layers = tuple(config.spec_aux_layers)
@@ -244,7 +276,12 @@ class ModelRunner:
         self._spec_graph_active = 0
         if not self.enforce_eager:
             if not self.spec_enabled:
-                self.capture_cudagraph()
+                if self.is_hybrid:
+                    # 阶段1：hybrid decode 图不做——GDN 状态槽读写的图内静态分发
+                    # 待阶段3 图适配；decode 全走 eager 前向，enforce_eager 语义不变。
+                    print('[nano-vllm] Qwen3.5 阶段1 暂不走 decode 图（GDN 状态的图内分发待阶段3 适配）', flush=True)
+                else:
+                    self.capture_cudagraph()
             else:
                 # spec 解码路径图捕获（draft 链图 + verify 图，仅 TP=1）。spec 图
                 # 无条件录 Gumbel 采样（forward_native），默认门同时要求
@@ -325,13 +362,28 @@ class ModelRunner:
         else:
             self.run(seqs, True)
         self.backend.empty_cache()
+        if self.is_hybrid:
+            # 预热 dummy 序列占用的 GDN 状态槽全量回收：清映射、槽位全数归还
+            # （池数据不擦除——槽重用后的首次消费恒为 has_initial=False 的
+            # 零初始化 prefill，旧值永不被读，见 drop_seq_state）。
+            self.gdn_slots.clear()
+            self._gdn_free_slots = set(range(self.config.max_num_seqs))
 
     def allocate_kv_cache(self):
         config = self.config
         hf_config = config.hf_config
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * self.dtype.itemsize
+        # 形状统一取 text_config（qwen3 的 text_config 即 hf_config，逐字节同值）。
+        tc = config.text_config
+        if self.is_hybrid:
+            # hybrid：只有全注意力层进 KV 池（GDN 无 KV cache，状态在独立池，
+            # 见 _alloc_gdn_state_pool）。层数显式取模型声明（契约字段
+            # num_attention_layers），避免从 layer_types 二次推导产生口径漂移。
+            num_attn_layers = self.model.model.num_attention_layers
+        else:
+            num_attn_layers = hf_config.num_hidden_layers
+        num_kv_heads = tc.num_key_value_heads // self.world_size
+        head_dim = getattr(tc, "head_dim", tc.hidden_size // tc.num_attention_heads)
+        block_bytes = 2 * num_attn_layers * self.block_size * num_kv_heads * head_dim * self.dtype.itemsize
         if self.spec_enabled:
             # draft KV cache 与 target 共用同一 block_table/slot 布局，预算一并扣除。
             # 布局一致性由 backend.get_kv_cache_shape 保证（cuda/ascend=BSHD、corex=HND，
@@ -342,6 +394,8 @@ class ModelRunner:
             block_bytes += 2 * d.num_hidden_layers * self.block_size * draft_kv_heads * draft_head_dim * self.dtype.itemsize
         # WSL 下上一进程退出后驱动回收显存存在数秒延迟，`used` 可能虚高；
         # 预算不足时短暂等待重测，而非直接断言崩溃。
+        # 状态池（hybrid）在 warmup 前已分配，其字节数包含在下面的 used 里、
+        # 随本预算循环自动计入——勿再显式扣除（已占用的显存扣两次即双重计费）。
         for _ in range(6):
             free, total = self.backend.mem_get_info()
             used = total - free
@@ -353,23 +407,41 @@ class ModelRunner:
             time.sleep(5)
         else:
             raise RuntimeError(
-                f"kvcache 显存预算不足：需 {block_bytes / 2**20:.1f} MiB/block，"
-                f"按 gpu_memory_utilization={config.gpu_memory_utilization} 计算可用块数为 0"
-                "（可调低 max_model_len / block_size，或检查其他进程的显存占用）")
+                f"kvcache 显存预算不足：需 {block_bytes / 2**20:.1f} MiB/block"
+                + (f"（GDN 状态池已占 {self._gdn_state_bytes / 2**20:.1f} MiB）" if self.is_hybrid else "")
+                + f"，按 gpu_memory_utilization={config.gpu_memory_utilization} 计算可用块数为 0"
+                f"（used={used / 2**20:.0f} MiB / peak={peak / 2**20:.0f} MiB / current={current / 2**20:.0f} MiB /"
+                f" 预算 {total * config.gpu_memory_utilization / 2**20:.0f} MiB——"
+                "可调低 max_model_len / block_size，或检查其他进程的显存占用")
         shape = self.backend.get_kv_cache_shape(
-            num_layers=hf_config.num_hidden_layers,
+            num_layers=num_attn_layers,
             num_blocks=config.num_kvcache_blocks,
             block_size=self.block_size,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
         )
         self.kv_cache = torch.empty(shape)
-        layer_id = 0
-        for module in self.model.modules():
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
-                layer_id += 1
+        if self.is_hybrid:
+            # KV wiring（hybrid）：显式按注意力序号映射（计划 1b 要求）。核实结论：
+            # 模块树序 = decoder 层序 = attention_layer_ids 升序，故「按模块序递增」
+            # 对 qwen3_5 本也算正确；但池切片索引与全局层号是两个概念（读写都经
+            # module 上的池切片句柄，无需换算全局层号），这里按注意力序 0..5 显式
+            # 枚举并断言模块数，防未来模型结构调整时静默错位。
+            attn_mods = [m for m in self.model.modules()
+                         if hasattr(m, "k_cache") and hasattr(m, "v_cache")]
+            assert len(attn_mods) == num_attn_layers, (
+                f'全注意力模块数({len(attn_mods)})与 KV 池层数({num_attn_layers})不符'
+                f'（qwen3_5 契约：全注意力复用现有 Attention 类，k_cache/v_cache 占位）')
+            for attn_ord, module in enumerate(attn_mods):
+                module.k_cache = self.kv_cache[0, attn_ord]
+                module.v_cache = self.kv_cache[1, attn_ord]
+        else:
+            layer_id = 0
+            for module in self.model.modules():
+                if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                    module.k_cache = self.kv_cache[0, layer_id]
+                    module.v_cache = self.kv_cache[1, layer_id]
+                    layer_id += 1
         if self.spec_enabled:
             d = self.draft_config
             draft_kv_heads = d.num_key_value_heads // self.world_size
@@ -389,6 +461,88 @@ class ModelRunner:
     def drop_spec_state(self, seq_id: int):
         self.spec_hidden.pop(seq_id, None)
         self.spec_carry.pop(seq_id, None)
+
+    def _alloc_gdn_state_pool(self):
+        """hybrid（Qwen3.5）：GDN 线性注意力状态池分配 + 模块注入 + 槽生命周期初始化。
+
+        在 warmup 之前调用（GDN forward 含预热轮都需要真实缓存）；KV 池预算
+        （allocate_kv_cache 的 mem_get_info 重试循环）在本函数之后执行，状态池
+        字节数经 used 自动计入，无需显式扣除。
+
+        池形状（阶段1）：[num_gdn_layers, slots, *state_shape]，slots = max_num_seqs；
+        阶段2 spec 槽扩展（slots × (1+spec_num_tokens)，verify 行分叉槽）只改本函数
+        的 slots 来源与 fill/读侧语义。
+        """
+        spec = self.model.model.get_gdn_state_spec()
+        tc = self.config.text_config
+        n_gdn = tc.num_hidden_layers - self.model.model.num_attention_layers
+        slots = self.config.max_num_seqs
+        # 形状键名双兼容：模型侧实际返回 conv_shape/ssm_shape（阶段1b 契约文本
+        # 写作 conv/ssm），以模型落地为准、两键名都认，防任一侧改动即炸。
+        conv_shape = spec.get("conv_shape") or spec["conv"]
+        ssm_shape = spec.get("ssm_shape") or spec["ssm"]
+        # conv 状态用模型 dtype、ssm 状态 fp32——形状与 dtype 均以 get_gdn_state_spec()
+        # 声明为准（勿在引擎侧硬编码，模型侧按 text_config 计算口径唯一）。
+        self.conv_pool = torch.empty((n_gdn, slots) + tuple(conv_shape), dtype=spec["conv_dtype"])
+        self.ssm_pool = torch.empty((n_gdn, slots) + tuple(ssm_shape), dtype=spec["ssm_dtype"])
+        self._gdn_state_bytes = (self.conv_pool.numel() * self.conv_pool.element_size()
+                                 + self.ssm_pool.numel() * self.ssm_pool.element_size())
+        # GDN 模块识别：优先用模型侧声明的 gdn_layers（按 GDN 层序的权威模块
+        # 引用，模型侧契约字段）；未暴露时退回与 k_cache/v_cache 同款鸭子类型
+        # （契约：GDN 模块自带 conv_cache/ssm_cache 占位属性等待注入）。
+        gdn_mods = getattr(self.model.model, "gdn_layers", None)
+        if gdn_mods is None:
+            gdn_mods = [m for m in self.model.modules()
+                        if hasattr(m, "conv_cache") and hasattr(m, "ssm_cache")]
+        assert len(gdn_mods) == n_gdn, (
+            f'GDN 模块识别数({len(gdn_mods)})与层数({n_gdn})不符：模型侧需以 '
+            f'gdn_layers 或 conv_cache/ssm_cache 占位属性声明 GDN 模块（引擎按此注入状态池切片）')
+        for gdn_ord, module in enumerate(gdn_mods):
+            # 注入该层的池切片 [slots, *state_shape]：模块 forward 用
+            # context.gdn_state_slots[row] 在 slot 维索引读写。
+            module.conv_cache = self.conv_pool[gdn_ord]
+            module.ssm_cache = self.ssm_pool[gdn_ord]
+        # 槽生命周期（host 侧）：seq_id → slot 映射 + 空闲槽集合。分配在
+        # prepare_prefill/prepare_decode 兜底（get_or_alloc，warmup 直构 Sequence
+        # 绕过 scheduler 也由此覆盖）；释放在 finish（llm_engine）/ preempt
+        # （scheduler 回调）——见 drop_seq_state。
+        self.gdn_slots: dict[int, int] = {}
+        self._gdn_free_slots: set[int] = set(range(slots))
+        # 每步 GDN 元数据的 pinned host + device twin（图友好静态段：阶段3 图捕获
+        # 直接消费 device twin 固定地址 + 图内 scatter）。长度取 max_num_seqs
+        # （本 buffer 阶段1 不进图桶，无需对齐 _graph_max_bs；阶段3 再统一）。
+        N = self.config.max_num_seqs
+        self._gdn_slots_pin = torch.zeros(N, dtype=torch.int32, device='cpu', pin_memory=True)
+        self._gdn_init_pin = torch.zeros(N, dtype=torch.bool, device='cpu', pin_memory=True)
+        self._gdn_slots_dev = torch.zeros(N, dtype=torch.int32)
+        self._gdn_init_dev = torch.zeros(N, dtype=torch.bool)
+
+    def _gdn_get_or_alloc_slot(self, seq: Sequence) -> int:
+        """GDN 状态槽 get_or_alloc（prepare_prefill/prepare_decode 兜底调用）。
+
+        新分配的槽内容无脏读风险：该序列的首次消费恒为 has_initial=False 的
+        零初始化 prefill（重用槽的残留值不会被读，之后被终态覆盖）。
+        """
+        slot = self.gdn_slots.get(seq.seq_id)
+        if slot is None:
+            try:
+                slot = self._gdn_free_slots.pop()
+            except KeyError:
+                # 调度门控（scheduler 的 hybrid admission）保证 live 序列数
+                # ≤ max_num_seqs；此断言炸穿即门控失效。
+                raise RuntimeError(
+                    f'GDN 状态槽耗尽：并发序列数超过 max_num_seqs={self.config.max_num_seqs}'
+                    '（scheduler 的 hybrid admission 门控应保证不发生）') from None
+            self.gdn_slots[seq.seq_id] = slot
+        return slot
+
+    def drop_seq_state(self, seq_id: int):
+        """hybrid GDN 状态槽释放（finish / preempt 时经 llm_engine 调用，与
+        drop_spec_state 同模式）。阶段1 不擦池数据：释放即断开映射，槽位重用时
+        由 has_initial=False 的零初始化 prefill 覆盖写入，旧值永不被读。"""
+        slot = self.gdn_slots.pop(seq_id, None)
+        if slot is not None:
+            self._gdn_free_slots.add(slot)
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -440,13 +594,28 @@ class ModelRunner:
                 slot_mapping.extend(range(slot_start, slot_end))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
+        # hybrid：GDN 状态槽元数据（pinned host → device twin 非阻塞 H2D，静态段，
+        # 模仿 _dblob 写法）。整段 prefill（hybrid 禁 chunk）：每序列一个槽；
+        # has_initial 恒 False——零初始化、终态写主槽，preempt 后重 prefill 同口径
+        # 重建。host 缓冲的跨步覆写安全性同 _dblob：每步收尾必有 D2H 同步
+        # （token_ids.tolist()），覆写时上一步 H2D 已完成。
+        gdn_extra = {}
+        if self.is_hybrid:
+            n_seqs = len(seqs)
+            for i, seq in enumerate(seqs):
+                self._gdn_slots_pin[i] = self._gdn_get_or_alloc_slot(seq)
+                self._gdn_init_pin[i] = False
+            self._gdn_slots_dev[:n_seqs].copy_(self._gdn_slots_pin[:n_seqs], non_blocking=True)
+            self._gdn_init_dev[:n_seqs].copy_(self._gdn_init_pin[:n_seqs], non_blocking=True)
+            gdn_extra = dict(gdn_state_slots=self._gdn_slots_dev[:n_seqs],
+                             gdn_has_initial=self._gdn_init_dev[:n_seqs])
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
         # 槽位 dtype 由后端决定（CUDA int32 / CoreX int64），cu_seqlens 两后端均为 int32。
         slot_mapping = torch.tensor(slot_mapping, dtype=self.backend.graph_slot_mapping_dtype(), pin_memory=True).to(self.device, non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, block_size=self.block_size)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, block_size=self.block_size, **gdn_extra)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -464,10 +633,17 @@ class ModelRunner:
             ctx_v[i] = len(seq)
             slots_v[i] = seq.block_table[-1] * block_size + seq.last_block_num_tokens - 1
             self._fill_bt_row(bt, i, seq.block_table)
+            if self.is_hybrid:
+                # GDN 状态槽（host 侧先行填写）：decode 每行槽 + has_initial=True
+                # ——单行消费主槽、写回主槽（计划 §3 语义）。
+                self._gdn_slots_pin[i] = self._gdn_get_or_alloc_slot(seq)
+                self._gdn_init_pin[i] = True
         # graph 直通：host 填 blob → run_model 2 次 H2D → 图内 scatter 分发。
         # gv buffer 是 capture 时（inference mode）创建的 inference tensor，
         # 相关写入须在 inference mode 内进行。
-        if self.graphs is not None:
+        # （防御性排除 hybrid：阶段1 不捕获图、graphs 恒 None，本分支不可达；
+        # 显式排除防未来误开——图内尚未组装 GDN 元数据段。）
+        if self.graphs is not None and not self.is_hybrid:
             gv = self.graph_vars
             bucket = _bucket(self.graph_bs, n)
             if bucket is not None:
@@ -493,12 +669,21 @@ class ModelRunner:
             slot_mapping = slots_v[:n].to(self.device, non_blocking=True).to(slot_dtype)
             context_lens = ctx_v[:n].to(self.device, non_blocking=True).to(torch.int32)
             block_tables = bt[:n].to(self.device, non_blocking=True).to(torch.int32)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables, max_context_len=self.config.max_model_len, block_size=self.block_size)
+        # hybrid：GDN 状态槽元数据 H2D（pinned host → device twin 非阻塞拷贝；
+        # 阶段3 图捕获直接消费 twin 固定地址）。跨步覆写安全性同 prepare_prefill。
+        gdn_extra = {}
+        if self.is_hybrid:
+            self._gdn_slots_dev[:n].copy_(self._gdn_slots_pin[:n], non_blocking=True)
+            self._gdn_init_dev[:n].copy_(self._gdn_init_pin[:n], non_blocking=True)
+            gdn_extra = dict(gdn_state_slots=self._gdn_slots_dev[:n],
+                             gdn_has_initial=self._gdn_init_dev[:n])
+        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables, max_context_len=self.config.max_model_len, block_size=self.block_size, **gdn_extra)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence], is_prefill: bool = False):
         """返回 (temperatures, top_ps, top_ks) 张量；top_k 不生效时传词表大小（掩码恒假）。"""
-        vocab = self.config.hf_config.vocab_size
+        # 词表大小取 text_config（qwen3_5 外层多模态壳无 vocab_size；qwen3 同值）。
+        vocab = self.config.text_config.vocab_size
         n = len(seqs)
         blob = self._dblob
         M = self._pin_M

@@ -32,6 +32,9 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        # hybrid GDN 状态槽：preempt 释放回调（engine 侧解耦注入；qwen3 路径
+        # is_hybrid=False 恒短路，零开销）。finish 侧释放见 step()。
+        self.scheduler.on_preempt = self._on_preempt_release
         atexit.register(self.exit)
 
     def exit(self):
@@ -53,6 +56,19 @@ class LLMEngine:
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
 
+    def _on_preempt_release(self, seq):
+        """hybrid GDN 状态槽释放（scheduler.preempt 回调）：抢占即丢状态+KV，
+        后续重 prefill 零初始化重建（正确性优先）。"""
+        if self.model_runner.is_hybrid:
+            self.model_runner.call("drop_seq_state", seq.seq_id)
+
+    def _drop_finished_gdn_state(self, seqs):
+        """hybrid：本步内结束的序列释放 GDN 状态槽（沿用 finish 后 call
+        drop_spec_state 的既有模式；qwen3 路径由 is_hybrid 门控，不进本函数）。"""
+        for seq in seqs:
+            if seq.is_finished:
+                self.model_runner.call("drop_seq_state", seq.seq_id)
+
     def step(self):
         if self.model_runner.spec_enabled:
             return self.step_spec()
@@ -60,6 +76,10 @@ class LLMEngine:
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        if self.model_runner.is_hybrid:
+            # hybrid：序列 finish 即释放 GDN 状态槽（spec 与 hybrid 互斥，见
+            # model_runner 的 spec 守卫，故两条 drop 路径不会同时生效）。
+            self._drop_finished_gdn_state(seqs)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens
 
