@@ -277,10 +277,15 @@ class ModelRunner:
                 # 分配在 warmup 之前（预热 prefill 即写入），字节数随 mem_get_info
                 # 自动计入 KV 池预算（勿再显式扣除）。
                 hd = getattr(d, "head_dim", d.hidden_size // d.num_attention_heads)
-                ctx_shape = (config.max_num_seqs, config.max_model_len,
+                # 槽多配 1 个（_df_pad_ctx_slot = ms）：spec 图 padding 序列的
+                # append 零写专用——padding 行若指向 0 号真实槽，会把运行序列的
+                # prompt 上下文前 rows 位清零（verify bonus 仍正确、输出不受损，
+                # 但该序列后续轮提案全废、E 受损），专用槽从分配上杜绝。
+                ctx_shape = (config.max_num_seqs + 1, config.max_model_len,
                              d.num_hidden_layers, d.num_key_value_heads, hd)
                 self.draft_model.ctx_k_cache = torch.zeros(ctx_shape, dtype=self.dtype)
                 self.draft_model.ctx_v_cache = torch.zeros(ctx_shape, dtype=self.dtype)
+                self._df_pad_ctx_slot = config.max_num_seqs
                 # 槽生命周期镜像 GDN 主槽（get_or_alloc / drop_seq_state 双路径清理）
                 self.draft_ctx_slots: dict[int, int] = {}
                 self._df_ctx_free = set(range(config.max_num_seqs))
@@ -311,29 +316,45 @@ class ModelRunner:
             rows = k + 1
             M, W = self._pin_M, self._pin_W
             # spec 热路径 pinned 元数据 blob（段名/顺序/尺寸与旧 _meta_off/_metaf_off
-            # 逐一对应；每轮 2 次 H2D，零 cudaHostAlloc）。
+            # 逐一对应；每轮 2 次 H2D，零 cudaHostAlloc）。dflash 专段追加在尾部
+            # （eagle3 不声明，既有段偏移逐字节不变）：
+            #   df_l1      = 各 seq 的 L-1（anchor 位置 = 块查询位置基址 = ctx_len）；
+            #   df_c       = 上轮提交行数（pending 长度，append 位置回推 L-1-c）；
+            #   df_ctxslot = draft 上下文稠密缓冲槽号；
+            #   df_carry   = GDN verify 行 0 读槽（gdn_spec_carry 或主槽）。
+            df_segments = ([('df_l1', M), ('df_c', M), ('df_ctxslot', M), ('df_carry', M)]
+                           if self.config.spec_method == "dflash" else [])
             self._sblob = MetaBlob(
                 [('chain_tokens', M), ('chain_pos', k * M), ('chain_ctxlen', k * M),
                  ('chain_slots', k * M), ('v_pos', rows * M), ('v_slots', rows * M),
-                 ('v_cu_k', M + 1), ('ctopks', M), ('v_topks', rows * M), ('btables', M * W)],
+                 ('v_cu_k', M + 1), ('ctopks', M), ('v_topks', rows * M), ('btables', M * W)]
+                + df_segments,
                 [('ctemps', M), ('ctopps', M), ('v_temps', rows * M), ('v_topps', rows * M)])
             self._sg = self._alloc_spec_graph_vars(self._graph_max_bs, rows, k)
+            if self.config.spec_method == "dflash":
+                # dflash 专段静态缓冲（阶段3 图轮；eagle3 不分配，字节布局零变化）。
+                self._sg.update(self._alloc_df_graph_vars(self._graph_max_bs, rows))
         self.spec_graphs = None
         self.spec_graph_pool = None
         self._spec_graph_active = 0
         if not self.enforce_eager:
             if not self.spec_enabled:
-                if self.is_hybrid:
-                    # 阶段1：hybrid decode 图不做——GDN 状态槽读写的图内静态分发
-                    # 待阶段3 图适配；decode 全走 eager 前向，enforce_eager 语义不变。
-                    print('[nano-vllm] Qwen3.5 阶段1 暂不走 decode 图（GDN 状态的图内分发待阶段3 适配）', flush=True)
-                else:
-                    self.capture_cudagraph()
+                # hybrid（Qwen3.5）与 qwen3 同构捕获 decode 图（阶段3 解除阶段1
+                # 门控）：GDN 单步（_forward_decode）本身无 host 同步/动态 shape，
+                # 状态槽经 context 的 device twin 静态段消费（见 _alloc_gdn_state_pool
+                # 与 prepare_decode 的图分支）；捕获失败仍走 try/except 优雅降级。
+                self.capture_cudagraph()
             else:
                 if self.config.spec_method == "dflash":
-                    # 阶段2：DFlash spec 图留阶段3（上下文追加/块草稿/verify 的
-                    # 固定形状捕获待适配）；decode 图同 hybrid 阶段1 策略跳过。
-                    print('[nano-vllm] DFlash 阶段2 暂不走 CUDA 图（spec 图留阶段3），全 eager', flush=True)
+                    # DFlash spec 单图整轮捕获（阶段3：上下文追加/块草稿/verify
+                    # 全静态化，见 _df_round_body / capture_df_spec_cudagraph）。
+                    # 图门与 EAGLE3 同款（supports_spec_graph + graph_sample_default，
+                    # NANOVLLM_SPEC_GRAPH 显式覆盖）；失败自动降级 eager spec 轮。
+                    _env_spec = os.environ.get("NANOVLLM_SPEC_GRAPH")
+                    if (self.world_size == 1 and self.backend.supports_spec_graph
+                            and (_env_spec != "0" if _env_spec is not None
+                                 else self.backend.graph_sample_default)):
+                        self.capture_df_spec_cudagraph()
                 else:
                     # spec 解码路径图捕获（draft 链图 + verify 图，仅 TP=1）。spec 图
                     # 无条件录 Gumbel 采样（forward_native），默认门同时要求
@@ -563,6 +584,15 @@ class ModelRunner:
             # §3 写 slots = ms×(k+1)，实现取 ms×(k+2)，多出的 ms 槽即主槽区
             # （@ms8 ≈ +8MB ssm，正确性必需）。
             slots = self.config.max_num_seqs * (self.config.spec_num_tokens + 2)
+        # 阶段3 图 padding 保留槽（池尾 +1）：decode 图按桶回放时 padding 行的 GDN
+        # 读写需要一个「可安全弄脏」的槽——GDN 的 conv/ssm 读写是设备侧高级索引
+        # （idx=-1 会回绕到末槽写真实状态，不能用 -1 哨兵），padding 行统一指向本
+        # 保留槽：has_initial=False 零化 ssm 读、conv 读垃圾（输出丢弃）、写全落
+        # 保留槽（不脏任何可分配槽——空闲集只覆盖主槽区 [0, ms)）。spec 图 verify
+        # 的 padding 行写各自 base 行槽区（池静态布局互斥），同样不消费保留槽。
+        # 代价 ≤1 槽 ssm（fp32 ~1MB），enforce_eager 下闲置无害。
+        slots += 1
+        self._gdn_pad_slot = slots - 1
         # 形状键名双兼容：模型侧实际返回 conv_shape/ssm_shape（阶段1b 契约文本
         # 写作 conv/ssm），以模型落地为准、两键名都认，防任一侧改动即炸。
         conv_shape = spec.get("conv_shape") or spec["conv"]
@@ -595,12 +625,16 @@ class ModelRunner:
         self.gdn_slots: dict[int, int] = {}
         self._gdn_free_slots: set[int] = set(range(slots))
         # 每步 GDN 元数据的 pinned host + device twin（图友好静态段：阶段3 图捕获
-        # 直接消费 device twin 固定地址 + 图内 scatter）。长度取 max_num_seqs
-        # （本 buffer 阶段1 不进图桶，无需对齐 _graph_max_bs；阶段3 再统一）。
+        # 直接消费 device twin 固定地址。长度取 max_num_seqs（≥ _graph_max_bs，
+        # eager 路径覆盖全部并发；图桶在范围内）。host 槽位缓冲初始化为保留槽：
+        # 图 padding 行在「首次收窄前」读到的恒是 pad 槽而非初始 0（0 是真实主槽，
+        # padding 写会脏掉运行序列的状态——与 KV 池 slot_mapping 首扩桶 padding 行
+        # 写槽 0 的隐患同源，这里从分配上杜绝）。
         N = self.config.max_num_seqs
-        self._gdn_slots_pin = torch.zeros(N, dtype=torch.int32, device='cpu', pin_memory=True)
+        self._gdn_slots_pin = torch.full((N,), self._gdn_pad_slot, dtype=torch.int32,
+                                         device='cpu', pin_memory=True)
         self._gdn_init_pin = torch.zeros(N, dtype=torch.bool, device='cpu', pin_memory=True)
-        self._gdn_slots_dev = torch.zeros(N, dtype=torch.int32)
+        self._gdn_slots_dev = torch.full((N,), self._gdn_pad_slot, dtype=torch.int32)
         self._gdn_init_dev = torch.zeros(N, dtype=torch.bool)
 
     def _gdn_get_or_alloc_slot(self, seq: Sequence) -> int:
@@ -729,19 +763,31 @@ class ModelRunner:
                 self._gdn_init_pin[i] = True
         # graph 直通：host 填 blob → run_model 2 次 H2D → 图内 scatter 分发。
         # gv buffer 是 capture 时（inference mode）创建的 inference tensor，
-        # 相关写入须在 inference mode 内进行。
-        # （防御性排除 hybrid：阶段1 不捕获图、graphs 恒 None，本分支不可达；
-        # 显式排除防未来误开——图内尚未组装 GDN 元数据段。）
-        if self.graphs is not None and not self.is_hybrid:
+        # 相关写入须在 inference mode 内进行。hybrid（阶段3）与 qwen3 同构：
+        # GDN 元数据消费 device twin 固定地址（capture 时经 set_context 烘焙进图，
+        # 每步 H2D 刷新内容即可，无需图内 scatter——twin 本身就是静态段）。
+        if self.graphs is not None:
             gv = self.graph_vars
             bucket = _bucket(self.graph_bs, n)
             if bucket is not None:
                 with torch.inference_mode():
-                    if bucket < self._graph_bs_active:
+                    # padding 复位：n < bucket 即需（含首次扩桶——blob 初始为 0，
+                    # padding 行 slot=0 会写脏 block 0/主槽 0；旧条件 bucket <
+                    # active 漏掉首扩与同桶缩行两个窗口，属共享路径的隐患修复，
+                    # qwen3 行为只增不减：padding 行从「写真实槽」变为「跳写」）。
+                    if n < bucket:
                         slots_v[n:bucket].fill_(-1)
                         ctx_v[n:bucket].zero_()
                         bt[n:, :].fill_(-1)
                     self._graph_bs_active = bucket
+                    if self.is_hybrid:
+                        # GDN padding 行 → 保留槽 + has_initial=False（host 侧
+                        # 复位，随下方 H2D 一起上卡）；真实行已在上面循环写好。
+                        # 随后 twin 整段 H2D [:bucket]（图捕获消费 twin 固定地址）。
+                        self._gdn_slots_pin[n:bucket] = self._gdn_pad_slot
+                        self._gdn_init_pin[n:bucket] = False
+                        self._gdn_slots_dev[:bucket].copy_(self._gdn_slots_pin[:bucket], non_blocking=True)
+                        self._gdn_init_dev[:bucket].copy_(self._gdn_init_pin[:bucket], non_blocking=True)
                     set_context(False,
                                 slot_mapping=gv['slot_mapping'][:n],
                                 context_lens=gv['context_lens'][:n],
@@ -878,10 +924,16 @@ class ModelRunner:
         """一轮投机解码（入口）：有捕获图、桶足够且全部序列已有 carry 时走 CUDA
         Graph，否则 eager（冷启动轮在 eager 内补齐 carry）。
 
-        DFlash（阶段2）：分发到 _df_round_eager（图分支留阶段3）；commit_buf
-        契约与 EAGLE3 完全一致（committed = row[:row[rows]]，benchmark 的
-        spec_round monkey-patch 统计依赖此入口与契约，勿改）。"""
+        DFlash：分发到 _df_round_graph（图）/ _df_round_eager（eager）；dflash 无
+        链式 carry 依赖——prefill 后首轮（pending=None，append 全 padding 行零写、
+        块草稿全量读 prefill 上下文）同样可走图，故不需要 EAGLE 的 spec_cold 门。
+        commit_buf 契约与 EAGLE3 完全一致（committed = row[:row[rows]]，benchmark
+        的 spec_round monkey-patch 统计依赖此入口与契约，勿改）。"""
         if self.config.spec_method == "dflash":
+            if self.spec_graphs is not None and seqs:
+                bucket = _bucket(self.spec_graph_bs, len(seqs))
+                if bucket is not None:
+                    return self._df_round_graph(seqs, bucket)
             return self._df_round_eager(seqs)
         if (self.spec_graphs is not None and seqs
                 and not any(seq.spec_cold for seq in seqs)):
@@ -1258,6 +1310,268 @@ class ModelRunner:
         # ---- ④ 读回提交 + 更新 pending / carry ----
         return self._df_readback_commit(seqs)
 
+    # ---- DFlash spec CUDA Graph（阶段3）----
+    # capture_spec_cudagraph（EAGLE3）的 dflash 等价物：EAGLE 骨架零触碰红线，
+    # 故独立成方法族而非参数化复用（两 body 结构同构：scatter → 起草 → verify
+    # 输入组装 → verify → 图内接受；差异 = dflash 无链式循环/refill，前置一段
+    # 上下文追加）。每桶一张图覆盖整轮，每轮仅一次 D2H（commit_buf 读回）。
+    #
+    # 图内静态化三要点（与 eager _df_* 的对应关系）：
+    # a) 上下文追加（_df_append_context_graph）：待追加行数 c = m+1 每 seq 变长
+    #    → 按 rows=k+1 行 padding：无效行 aux 清零（_df_load_ctx_aux 装载时清）
+    #    → fc/norm/k_norm/rope 对零向量恒产出零 → 写入 ctx 缓冲的是零特征。写位
+    #    置 = (L-1-c)+j 连续延展到 [L-1, L-1-c+rows)：这些位置本round的块草稿读
+    #    不到（ctx 读窗恒 0..L-2），且下轮 append 恰从 L-1 起以真 aux 逐位覆盖
+    #    （不变式：ctx[0..L-2] 全真、ctx[L-1..] 无所谓——归纳可证，与「被拒提案
+    #    残留无害」同一口径）；即使下轮 seq 结束也不再有任何读。故零写后无读，
+    #    无需 mask。
+    # b) 块草稿（_df_draft_block_graph）：ctx gather 固定 max_model_len 宽
+    #    （eager 为批内最大 ctx_len）——gather 形状静态，越界 padding 由 -inf
+    #    mask 屏蔽（forward_block 既有逻辑，掩码后零贡献精确不扰动求和）；块前
+    #    向固定 [bs, k+1] 形状。padding 行消费 chain_tokens/df_l1 的陈旧值（恒
+    #    为合法 token id / < max_model_len 的位置，产出垃圾提案被丢弃，不写任何
+    #    KV/状态）。
+    # c) verify（_df_verify_graph）：沿用 _sg 静态缓冲 + _sg_scatter；GDN 'row'
+    #    模式在图内——写基址改为 host 常量列表注入（gdn_row_bases，按池静态布局
+    #    只依赖批内序号，bake 进图即正确），行 0 读槽走 df_carry 静态 buffer
+    #    （blob 每轮分发，动态值）；python 循环（逐 seq × 逐行）捕获期按常量
+    #    展开（次数只依赖 bs 桶与 k+1）。padding 行写各自 base 行槽区（互斥），
+    #    行 0 读 df_carry=0 号槽（只读不脏）。
+
+    def _alloc_df_graph_vars(self, max_bs: int, rows: int) -> dict:
+        """dflash 图轮专段静态缓冲（_sg 之外的补充段；eagle3 不分配）。"""
+        # aux 宽度取 text_config（qwen3_5 外层壳无顶层 hidden_size）。
+        aux_width = self.config.text_config.hidden_size * len(self.config.spec_aux_layers)
+        return dict(
+            # 上下文追加的 aux 暂存：host 每轮从 spec_ctx_pending（GPU clone）
+            # 装载有效行、其余清零；图内 project_context_kv 消费固定 [bs*rows] 形状。
+            df_ctx_aux=torch.zeros(max_bs * rows, aux_width, dtype=self.dtype),
+            # GDN verify 写基址：桶静态常量 base_i = max_num_seqs + i*rows
+            # （_alloc_gdn_state_pool 的行槽区布局），capture 期烘进图。
+            df_bases=(self.config.max_num_seqs
+                      + torch.arange(max_bs, dtype=torch.int32) * rows),
+            # GDN verify 行 0 读槽：每轮经 _df_scatter 从 blob 孪生分发（动态）。
+            df_carry=torch.zeros(max_bs, dtype=torch.int32),
+        )
+
+    def _fill_df_meta(self, seqs: list[Sequence]):
+        """dflash 图轮专段填充（_fill_spec_meta 之后调用，host 写 pinned blob）：
+        L-1 / pending 行数 / ctx 槽 / GDN 行 0 读槽。chain 段（chain_pos/ctxlen/
+        slots）dflash 不消费、写而不读（与 eager 轮同口径）。"""
+        blob = self._sblob
+        l1 = blob.view_i64('df_l1')
+        c = blob.view_i64('df_c')
+        cs = blob.view_i64('df_ctxslot')
+        cy = blob.view_i64('df_carry')
+        for i, seq in enumerate(seqs):
+            l1[i] = len(seq) - 1
+            p = self.spec_ctx_pending.get(seq.seq_id)
+            c[i] = 0 if p is None else p.size(0)
+            cs[i] = self.draft_ctx_slots[seq.seq_id]
+            # 行 0 读槽：与 eager _df_verify 同源（carry 优先，回落 prefill 主槽）
+            cy[i] = self.gdn_spec_carry.get(seq.seq_id, self.gdn_slots[seq.seq_id])
+
+    def _df_load_ctx_aux(self, seqs: list[Sequence], bs: int):
+        """上下文追加的 aux 暂存装载（图外 host 步，GPU→GPU）：spec_ctx_pending
+        逐序列拷入静态段 [i*rows, i*rows+c)，段内其余行与 padding 序列清零。
+        装载即消费——pop 掉 pending（本轮 replay 的 append 消费；下轮 pending 由
+        _df_readback_commit 重写）。"""
+        g = self._sg
+        rows = self.config.spec_num_tokens + 1
+        buf = g['df_ctx_aux']
+        buf[:bs * rows].zero_()
+        for i, seq in enumerate(seqs):
+            p = self.spec_ctx_pending.pop(seq.seq_id, None)
+            if p is not None:
+                buf[i * rows:i * rows + p.size(0)].copy_(p)
+
+    def _df_scatter(self, bs: int):
+        """dflash 专段 blob → 静态 buffer 的图内分发（_sg_scatter 的 df 等价物；
+        df_l1/df_c/df_ctxslot 为 int64 直通，图体直接消费 blob 孪生，无需中转）。"""
+        g = self._sg
+        g['df_carry'][:bs].copy_(self._sblob.device_view_i64('df_carry')[:bs])
+
+    def _df_append_context_graph(self, bs: int):
+        """① 上下文追加（图内静态化）：project_context_kv 全链（fc → hidden_norm
+        → 融合 k/v GEMM → 逐层 k_norm → rope → 高级索引写稠密缓冲）无 host 同步、
+        循环次数 = draft 层数常量，图安全。位置/槽位来自 blob 孪生（固定地址），
+        padding 行 aux=0 → 写零特征（无害性论证见本节头注释 a）。"""
+        g = self._sg
+        blob = self._sblob
+        rows = self.config.spec_num_tokens + 1
+        aux = g['df_ctx_aux'][:bs * rows]
+        l1 = blob.device_view_i64('df_l1')[:bs]
+        c = blob.device_view_i64('df_c')[:bs]
+        ar = torch.arange(rows, device=aux.device)
+        # 追加位置 = [L-1-c, L-1-c+rows)（连续展平，与 eager 的逐 seq arange 拼接
+        # 同值域；padding 行落在 [L-1, ...) 无读区）
+        pos = ((l1 - c)[:, None] + ar[None, :]).reshape(-1)
+        slots = blob.device_view_i64('df_ctxslot')[:bs].repeat_interleave(rows)
+        self.draft_model.project_context_kv(aux, pos, slots)
+
+    def _df_draft_block_graph(self, bs: int):
+        """② block 草稿（图内静态化）：dflash.forward_block 原样复用——其内部
+        （embed gather / ctx gather / arange mask / sdpa / 逐层循环）全部静态形状
+        无 host 同步，只需调用方传静态 buffer：gather 宽度固定 max_model_len
+        （eager 为批内 max，掩码屏蔽越界段，有效段数值一致）、ctx_lens = df_l1
+        （= L-1）、块查询位置 = df_l1 + arange(rows)。采样参数复用 _sg_scatter
+        产物 chain_temps/topps/topks（ctopks 的 draft_vocab 上界对 dflash = target
+        词表，与 eager _df_draft_block 的 vocab 上界逐值相同）。"""
+        g = self._sg
+        blob = self._sblob
+        k = self.config.spec_num_tokens
+        rows = k + 1
+        l1 = blob.device_view_i64('df_l1')[:bs]
+        ar = torch.arange(rows, device=l1.device)
+        block_pos = l1[:, None] + ar[None, :]          # [bs, rows] = L-1..L-1+k
+        logits = self.draft_model.forward_block(
+            g['chain_tokens'][:bs], block_pos,
+            blob.device_view_i64('df_ctxslot')[:bs], l1,
+            self.config.max_model_len, rows)
+        ids = self.sampler.forward_native(
+            logits,
+            g['chain_temps'][:bs].repeat_interleave(k),
+            g['chain_topps'][:bs].repeat_interleave(k),
+            g['chain_topks'][:bs].repeat_interleave(k))
+        g['drafted_ids'][:k, :bs] = ids.view(bs, k).t()
+
+    def _df_verify_graph(self, bs: int):
+        """③ target verify（图内静态化）：与 _df_verify 同构（同一批 _sg 静态
+        buffer），差异仅在 GDN 元数据的图安全来源——写基址 host 常量列表
+        （gdn_row_bases，capture 期烘进图）+ 行 0 读槽 df_carry 静态 buffer
+        （_df_scatter 每轮分发），取代 eager 版的两次 torch.tensor H2D（捕获期
+        会把值烘焙成常量，carry 必须走 blob）。padding 行 base 指向各自行槽区。"""
+        g = self._sg
+        k = self.config.spec_num_tokens
+        rows = k + 1
+        ms = self.config.max_num_seqs
+        bases = [ms + i * rows for i in range(bs)]
+        # max_seqlen_k 用 max_model_len 上界（同 _sg_verify/_df_verify 的 varlen
+        # grid 口径，避免 capture 烘焙随轮次变化的 python int）
+        set_context(True,
+                    cu_seqlens_q=g['v_cu_q'][:bs + 1],
+                    cu_seqlens_k=g['v_cu_k'][:bs + 1],
+                    max_seqlen_q=rows,
+                    max_seqlen_k=self.config.max_model_len,
+                    slot_mapping=g['v_slots'][:bs * rows],
+                    block_tables=g['v_btables'][:bs],
+                    block_size=self.block_size,
+                    gdn_state_mode='row',
+                    gdn_carry_slots=g['df_carry'][:bs],
+                    gdn_row_bases=bases,
+                    gdn_row_seg=rows)
+        hidden, aux = self.model(g['v_input_ids'][:bs * rows], g['v_positions'][:bs * rows])
+        logits = F.linear(hidden, self.model.lm_head.weight)
+        g['v_token_ids'][:bs * rows] = self.sampler.forward_native(
+            logits, g['v_temps'][:bs * rows], g['v_topps'][:bs * rows], g['v_topks'][:bs * rows])
+        g['v_aux'][:bs * rows].copy_(aux)
+
+    def _df_round_body(self, bs: int):
+        """DFlash spec 单图整轮 body（capture 预热与图捕获共用，全静态算子）：
+        scatter → 上下文追加 → block 草稿 → verify 输入组装 → verify → 图内接受。
+        无 EAGLE 的链式循环/refill；提交组装复用 _sg_acceptance（纯张量验收，
+        commit_buf 契约与 EAGLE3 一致）。"""
+        g = self._sg
+        k = self.config.spec_num_tokens
+        rows = k + 1
+        self._sg_scatter(bs)
+        self._df_scatter(bs)
+        self._df_append_context_graph(bs)
+        self._df_draft_block_graph(bs)
+        v = g['v_input_ids'][:bs * rows].view(bs, rows)
+        v[:, 0] = g['chain_tokens'][:bs]
+        v[:, 1:].copy_(g['drafted_ids'][:k, :bs].t())
+        self._df_verify_graph(bs)
+        self._sg_acceptance(bs)
+
+    @torch.inference_mode()
+    def capture_df_spec_cudagraph(self):
+        """DFlash spec 单图整轮捕获（capture_spec_cudagraph 的 dflash 等价物，
+        结构同构、body 换 _df_round_body；EAGLE 捕获函数逐字节未动）。"""
+        max_bs = self._graph_max_bs
+        self.spec_graph_bs = _graph_buckets(max_bs)
+        g = self._sg    # 缓冲已在 __init__ 分配（spec 启用即存在，eager 轮共用）
+        self.spec_graphs = {}
+        try:
+            for bs in reversed(self.spec_graph_bs):
+                # warmup：kernel lazy init 必须在 capture 前完成；warmup 数据用
+                # 全零静态 buffer（token 0 / 槽 0 / 位置 0 合法，ctx 追加写零特征、
+                # 块草稿/verify 产出垃圾输出但写入的是哑槽/被丢弃）。
+                g['v_cu_k'][:bs + 1] = g['v_cu_q'][:bs + 1]
+                self._df_round_body(bs)
+                reset_context()
+                self.backend.synchronize()
+                graph = self.backend.new_graph()
+                with self.backend.graph_ctx(graph, pool=self.spec_graph_pool):
+                    self._df_round_body(bs)
+                if self.spec_graph_pool is None:
+                    self.spec_graph_pool = graph.pool()
+                self.spec_graphs[bs] = graph
+                reset_context()
+                self.backend.synchronize()
+        except Exception as e:
+            # 与 EAGLE 同款优雅降级：spec_round 自动回落 _df_round_eager（阶段2
+            # 已验收的 eager 全链路），功能不受影响。
+            print(f'[nano-vllm] DFlash spec CUDA Graph 捕获失败，降级为 eager spec 轮：'
+                  f'{type(e).__name__}: {e}', flush=True)
+            traceback.print_exc()
+            reset_context()
+            self.backend.synchronize()
+            self.spec_graphs = None
+            self.spec_graph_pool = None
+            self.backend.empty_cache()
+
+    @torch.inference_mode()
+    def _df_round_graph(self, seqs: list[Sequence], bucket: int) -> list[list[int]]:
+        """DFlash spec 图轮回放（_spec_round_graph 的 dflash 等价物）：fill meta
+        → padding 复位 → 装载 append 暂存 → H2D → 单图 replay → 读回。"""
+        n = self._fill_spec_meta(seqs)
+        self._fill_df_meta(seqs)
+        rows = self.config.spec_num_tokens + 1
+
+        # padding 复位：n < bucket 即需（含首次使用/扩桶——blob 初始为 0，padding
+        # 行 v_slots=0 会把 verify KV 写进 0 号槽、cu_k 尾段 0 会造成非单调 cu/
+        # 负窗长；EAGLE 版 _spec_round_graph 的「仅桶收缩复位」条件存在同源隐患，
+        # 本 dflash 版从条件上杜绝，EAGLE 路径红线未动）。EAGLE 版同款段（v_slots/
+        # cu_k/btables）语义一致；chain_pos/ctxlen/slots dflash 不消费，不复位；
+        # v_pos padding 行保持陈旧值（恒 < max_model_len 的合法位置，垃圾输出被
+        # 丢弃——与 EAGLE 版不复位 v_pos 同口径）。df 专段复位：l1/c=0 → append
+        # 位置从 0 起、写零特征；ctxslot → 专用 pad 槽（零写不碰真实序列上下文）；
+        # carry=0 只读（垃圾进垃圾出，输出丢弃）。padding 行产出全丢弃且不脏任何
+        # 运行序列状态。
+        if n < bucket:
+            M, W = self._pin_M, self._pin_W
+            blob = self._sblob
+            vs = blob.view_i64('v_slots', (M, rows))
+            cu_k = blob.view_i64('v_cu_k')
+            bt = blob.view_i64('btables', (M, W))
+            # 注意轴序：v_slots 视图 (M, rows) 的 seq 维在轴 0——复位必须切
+            # vs[n:, :]（padding 序列的全部行）。切错轴（vs[:, n:]）会把真实
+            # 序列 verify 行 n..k 的槽位清成 -1 → store_kvcache 跳写 → 这些行
+            # 读到陈旧/捕获期垃圾 KV → 行 3+（首个读到未写位置的行）输出 NaN
+            # （实测 layer11 起 NaN、vt[3:]=0、并发序列全零流）。
+            vs[n:, :].fill_(-1)
+            # padding 段 K 窗零长（cu 单调不降、kernel 跳过空段）
+            cu_k[n + 1:] = cu_k[n]
+            bt[n:, :].fill_(-1)
+            blob.view_i64('df_l1')[n:].zero_()
+            blob.view_i64('df_c')[n:].zero_()
+            # padding 序列 ctx 槽 → 专用 pad 槽（append 零写落 pad 槽，不碰任何
+            # 真实序列的上下文；块草稿对 padding 行 gather pad 槽零特征，掩码屏蔽）
+            blob.view_i64('df_ctxslot')[n:].fill_(self._df_pad_ctx_slot)
+            blob.view_i64('df_carry')[n:].zero_()
+        self._spec_graph_active = bucket
+
+        # ---- 装载 append 暂存 → H2D → 单图回放 → 读回 ----
+        # 写基址 host 侧同步重算（图内不跑 python，_df_verify_graph 的 bases 只在
+        # 捕获期存在；读回更新 GDN carry 需要与本桶一致的 host 值——桶静态布局，
+        # 公式即真值）。
+        self._df_bases = [self.config.max_num_seqs + i * rows for i in range(n)]
+        self._df_load_ctx_aux(seqs, bucket)
+        self._push_spec_meta()
+        self.spec_graphs[bucket].replay()
+        return self._df_readback_commit(seqs)
+
     # ---- spec 解码 CUDA Graph ----
     # 每桶一张图覆盖整轮：draft 链式起草 → target verify → 图内接受/提交/种子
     # → refill（用 verify 的 target aux 回填 draft KV）。每轮仅一次 D2H。
@@ -1520,7 +1834,10 @@ class ModelRunner:
     def capture_cudagraph(self):
         try:
             config = self.config
-            hf_config = config.hf_config
+            # 形状取 text_config（qwen3_5 外层多模态壳无顶层 hidden_size/vocab_size，
+            # 实测 None——原 hf_config 直取在 hybrid 下会 TypeError 进降级分支；
+            # qwen3 的 text_config 即 hf_config，逐字节同值，行为零变化）。
+            tc = config.text_config
             max_bs = self._graph_max_bs
             # + 1：runtime block_tables 宽度可能比 capture 时更宽
             # （nano-vLLM 公开 bug），static buffer 直接留出余量（_pin_W）。
@@ -1536,10 +1853,10 @@ class ModelRunner:
             input_ids, positions = io[:max_bs], io[max_bs:]
             slot_mapping, context_lens = sc, ctx
             block_tables = torch.full((max_bs, max_num_blocks), -1, dtype=torch.int32)
-            outputs = torch.zeros(max_bs, hf_config.hidden_size, dtype=self.dtype)
+            outputs = torch.zeros(max_bs, tc.hidden_size, dtype=self.dtype)
             temperatures = torch.ones(max_bs, dtype=torch.float32)
             top_ps = torch.ones(max_bs, dtype=torch.float32)
-            top_ks = torch.full((max_bs,), hf_config.vocab_size, dtype=torch.int64)
+            top_ks = torch.full((max_bs,), tc.vocab_size, dtype=torch.int64)
             token_ids = torch.zeros(max_bs, dtype=torch.int64)
             self.graph_bs = _graph_buckets(max_bs)
             self.graphs = {}
@@ -1569,6 +1886,14 @@ class ModelRunner:
                 graph = self.backend.new_graph()
                 # Graph Context 必须静态：max_context_len 用 config.max_model_len，
                 # 不要用 context_lens.max().item()（capture 后不可变 python 整数）。
+                # hybrid：GDN 状态槽元数据走 device twin 固定地址（prepare_decode
+                # 每步 H2D 刷新 twin 内容，replay 原样读取；capture 期 twin 为
+                # pad 槽/False 的哑值，仅占位——replay 不运行 python，元数据不经
+                # context 传递而是经 twin 内存）。qwen3 路径不注入（恒 None）。
+                gdn_graph_extra = (
+                    dict(gdn_state_slots=self._gdn_slots_dev[:bs],
+                         gdn_has_initial=self._gdn_init_dev[:bs])
+                    if self.is_hybrid else {})
                 set_context(
                     False,
                     slot_mapping=slot_mapping[:bs],
@@ -1577,6 +1902,7 @@ class ModelRunner:
                     max_context_len=config.max_model_len,
                     use_cuda_graph=True,
                     block_size=self.block_size,
+                    **gdn_graph_extra,
                 )
                 # Warmup：IXFormer kernel lazy init / workspace / torch.compile
                 # 必须在正式 capture 前完成。graph_sample 路径把 lm_head + sampler

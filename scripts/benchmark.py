@@ -125,14 +125,8 @@ def main():
     args = parser.parse_args()
 
     qs = load_questions(args.questions, args.category, args.num_prompts, args.seed)
-    spec = f"spec(k={args.spec_num_tokens})" if args.spec_model else "decode"
     thinking = "off" if args.no_think else "on(default)"
     pcache = "off" if args.no_prefix_cache else "on"
-    print(f"prompts: {len(qs)} (category={args.category}, seed={args.seed}) "
-          f"x repeats={args.num_repeats} | mode={spec} | prefix_cache={pcache} | "
-          f"max_tokens={args.max_tokens} | temp={TEMPERATURE} | thinking={thinking} | "
-          f"口径=vllm bench serve 对齐\n",
-          flush=True)
 
     kwargs = dict(enforce_eager=args.eager, tensor_parallel_size=1, backend=args.backend,
                   max_model_len=args.max_model_len, max_num_seqs=args.max_num_seqs,
@@ -142,6 +136,15 @@ def main():
     if args.spec_model:
         kwargs.update(spec_model=args.spec_model, spec_num_tokens=args.spec_num_tokens)
     llm = LLM(args.model, **kwargs)
+    # 表头在引擎构造后打印：k 取引擎实际生效值（dflash 按 draft config block_size-1
+    # 自动派生，CLI 默认 3 会被覆盖——在派生前打印会显示错误的 k）。
+    spec = f"spec(k={llm.model_runner.config.spec_num_tokens})" if args.spec_model else "decode"
+    print(f"prompts: {len(qs)} (category={args.category}, seed={args.seed}) "
+          f"x repeats={args.num_repeats} | mode={spec} | prefix_cache={pcache} | "
+          f"max_tokens={args.max_tokens} | temp={TEMPERATURE} | thinking={thinking} | "
+          f"口径=vllm bench serve 对齐\n",
+          flush=True)
+
     try:
         sp = SamplingParams(temperature=TEMPERATURE, max_tokens=args.max_tokens)
 

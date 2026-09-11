@@ -381,10 +381,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         if ctx.gdn_state_mode == "row":
             # DFlash verify 逐行落槽（阶段2）：slots=写基址、carry_slots=行 0 读槽
-            # （has_initial 不消费，见 _forward_rows docstring）。
-            assert ctx.gdn_state_slots is not None and ctx.gdn_carry_slots is not None, (
-                "'row' 模式需注入 context.gdn_state_slots（写基址）与 "
-                "context.gdn_carry_slots（行 0 读槽）")
+            # （has_initial 不消费，见 _forward_rows docstring）。图捕获静态模式
+            # （阶段3）：gdn_row_bases 非 None 时写基址/段界由引擎以 host 常量注入
+            # （省 tolist host 同步——捕获期禁止 D2H），此时不要求 gdn_state_slots。
+            assert ctx.gdn_carry_slots is not None and (
+                ctx.gdn_state_slots is not None or ctx.gdn_row_bases is not None), (
+                "'row' 模式需注入 context.gdn_carry_slots（行 0 读槽）与 "
+                "context.gdn_state_slots（eager 写基址）或 gdn_row_bases（图捕获 "
+                "host 静态写基址）之一")
             core = self._forward_rows(mixed_qkv, b, a, ctx)
         else:
             # GDN 状态槽元数据由引擎注入 context（阶段 1b 契约字段）
@@ -535,10 +539,25 @@ class Qwen3_5GatedDeltaNet(nn.Module):
           「末 3」）写对应槽（行 j 终态 = x_ext[:, :, j+1:j+4]，与 decode 单步的
           raw 窗口右移语义一致）。
         段长 = cu_seqlens_q 差（DFlash verify 恒为 k+1=16）。
+
+        图捕获静态模式（阶段3，context.gdn_row_bases 非 None）：段界 cu 与写基址
+        base_l 由引擎以 host 常量注入（verify 段长恒 k+1、基址 = max_num_seqs +
+        i*(k+1) 按池静态布局、只依赖批内序号——bake 进图即正确），省去 eager 路径
+        的 cu_seqlens_q.tolist()/gdn_state_slots.tolist() 两次 host 同步（CUDA
+        Graph 捕获期禁止 D2H）。静态模式下循环体与 eager 逐字节一致（同 op 同序、
+        conv/ssm 写槽为 host int 常量切片=静态地址，正是图内所需），仅段界/基址
+        的来源不同；行 0 读槽仍走 gdn_carry_slots 设备张量（每轮经 blob 分发，
+        动态值图安全）。
         """
-        cu = ctx.cu_seqlens_q.tolist()
-        base_l = ctx.gdn_state_slots.tolist()
-        n_seqs = len(cu) - 1
+        if ctx.gdn_row_bases is not None:
+            seg = ctx.gdn_row_seg
+            base_l = ctx.gdn_row_bases
+            n_seqs = len(base_l)
+            cu = [i * seg for i in range(n_seqs + 1)]
+        else:
+            cu = ctx.cu_seqlens_q.tolist()
+            base_l = ctx.gdn_state_slots.tolist()
+            n_seqs = len(cu) - 1
         core = torch.empty(
             mixed_qkv.size(0), self.num_v_heads, self.head_v_dim,
             dtype=mixed_qkv.dtype, device=mixed_qkv.device,

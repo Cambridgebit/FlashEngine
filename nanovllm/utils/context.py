@@ -34,15 +34,24 @@ class Context:
     # qwen3 / 非 spec hybrid 路径不设置（恒 None），行为不变。
     gdn_state_mode: str | None = None
     gdn_carry_slots: torch.Tensor | None = None
+    # ---- DFlash verify 'row' 模式的图捕获静态段（阶段3）----
+    # gdn_row_bases：host list[int]，图捕获期各序列的写基址（= max_num_seqs +
+    # i*(k+1)，按池静态布局、只依赖批内序号 i 与桶常量——bake 进图即正确，replay
+    # 时 python 不再运行）；gdn_row_seg：int，图捕获期段长（= k+1，常量）。
+    # 二者非 None/非零时 _forward_rows 走静态模式（跳过 cu_seqlens/槽位的
+    # tolist host 同步——图捕获期禁止 D2H）；eager 路径不设置（恒 None），
+    # 循环体逐位一致，行为零变化。
+    gdn_row_bases: list | None = None
+    gdn_row_seg: int = 0
 
 _CONTEXT = Context()
 
 def get_context():
     return _CONTEXT
 
-def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None, context_lens=None, block_tables=None, max_context_len=None, use_cuda_graph=False, block_size=0, gdn_state_slots=None, gdn_has_initial=None, gdn_state_mode=None, gdn_carry_slots=None):
+def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None, context_lens=None, block_tables=None, max_context_len=None, use_cuda_graph=False, block_size=0, gdn_state_slots=None, gdn_has_initial=None, gdn_state_mode=None, gdn_carry_slots=None, gdn_row_bases=None, gdn_row_seg=0):
     global _CONTEXT
-    _CONTEXT = Context(is_prefill, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, context_lens, block_tables, max_context_len, use_cuda_graph, block_size, gdn_state_slots, gdn_has_initial, gdn_state_mode, gdn_carry_slots)
+    _CONTEXT = Context(is_prefill, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, context_lens, block_tables, max_context_len, use_cuda_graph, block_size, gdn_state_slots, gdn_has_initial, gdn_state_mode, gdn_carry_slots, gdn_row_bases, gdn_row_seg)
 
 def reset_context():
     global _CONTEXT
