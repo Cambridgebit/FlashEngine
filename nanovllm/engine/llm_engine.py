@@ -61,6 +61,11 @@ class LLMEngine:
         后续重 prefill 零初始化重建（正确性优先）。"""
         if self.model_runner.is_hybrid:
             self.model_runner.call("drop_seq_state", seq.seq_id)
+            if self.model_runner.config.spec_method == "dflash":
+                # dflash（hybrid+spec）：抢占同步清 spec_ctx_pending / draft ctx 槽
+                # / GDN carry 记账（drop_seq_state 内部已调 _df_drop_state，此处
+                # 显式补一次 drop_spec_state 走全量 spec 清理，幂等安全）。
+                self.model_runner.call("drop_spec_state", seq.seq_id)
 
     def _drop_finished_gdn_state(self, seqs):
         """hybrid：本步内结束的序列释放 GDN 状态槽（沿用 finish 后 call
@@ -110,6 +115,11 @@ class LLMEngine:
         for seq in seqs:
             if seq.is_finished:
                 self.model_runner.call("drop_spec_state", seq.seq_id)
+                if self.model_runner.is_hybrid:
+                    # dflash（hybrid+spec）：finish 同步释放 GDN 主槽——step_spec
+                    # 原本只清 spec 状态，eagle3（qwen3 target）is_hybrid=False
+                    # 不进此分支，行为零变化。
+                    self.model_runner.call("drop_seq_state", seq.seq_id)
 
     def _collect_outputs(self, seqs):
         return [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]

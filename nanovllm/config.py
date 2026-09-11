@@ -37,6 +37,13 @@ class Config:
     # 拼接后经 draft fc(3*hidden -> hidden)。必须与 draft 训练时的捕获层一致；
     # 默认 (2, n//2, n-3) 与官方 EAGLE 仓库 / vLLM 的 Qwen3 捕获点一致。
     spec_aux_layers: tuple[int, ...] = ()
+    # spec 方法派生（__post_init__ 按 draft checkpoint 填充）："eagle3" / "dflash"。
+    # 判据：draft config 含 dflash_config 键或 architectures 含 DFlash → dflash，
+    # 否则 eagle3（官方 EAGLE3 checkpoint 不含这两者，判定不受影响）。
+    spec_method: str = ""
+    # draft 的 AutoConfig（spec_model 设置时统一在此加载一次，model_runner 复用，
+    # 避免二次 IO）。qwen3_5 的 dflash_config.target_layer_ids 亦从此读取。
+    draft_config: AutoConfig | None = None
     # ---- hybrid（Qwen3.5）派生标记（__post_init__ 填充；qwen3 恒 False/None）----
     # Qwen3.5 = 18×GDN 线性注意力 + 6×全注意力的混合架构（model_type=qwen3_5，
     # text 形状在嵌套 text_config；纯文本 checkpoint 顶层可能直接是 qwen3_5_text，
@@ -103,11 +110,36 @@ class Config:
             assert self.tensor_parallel_size == 1, "speculative decoding requires tensor_parallel_size == 1"
             assert os.path.isdir(self.spec_model)
             assert self.spec_num_tokens >= 1
-            if not self.is_hybrid:
+            # draft config 统一在此加载一次（model_runner / dflash 模型复用）。
+            self.draft_config = AutoConfig.from_pretrained(self.spec_model)
+            dc = self.draft_config
+            dfc = getattr(dc, "dflash_config", None) or {}
+            archs = getattr(dc, "architectures", None) or []
+            # spec_method 派生（计划 §4-2b）：dflash_config 键或 architectures 含
+            # DFlash → dflash；官方 EAGLE3 checkpoint 两者皆无 → eagle3（原判路）。
+            self.spec_method = "dflash" if (dfc or any("DFlash" in str(a) for a in archs)) else "eagle3"
+            if self.spec_method == "dflash":
+                # k = block_size - 1 自动派生（z-lab 语义：block = 1 anchor + k 个
+                # mask 查询行）。spec_num_tokens 无法在 Config 层区分「用户显式传」
+                # 与「默认值」：值 ∈ {4（本 dataclass 默认）, 3（benchmark/
+                # openai_server 的 CLI 默认）} 一律视为未显式指定而派生；其余值
+                # 尊重用户（注：显式传 3/4 也会被派生覆盖，block=16 的 DFlash 用
+                # k=3/4 属误用，help 注明）。
+                block = int(dfc.get("block_size", getattr(dc, "block_size", 16)))
+                if self.spec_num_tokens in (3, 4):
+                    self.spec_num_tokens = block - 1
+                # aux 捕获层 = dflash_config.target_layer_ids（0-based 层输出口径，
+                # 与 qwen3_5 模型 aux 钩子语义一致，见计划 §3）。
+                if not self.spec_aux_layers:
+                    self.spec_aux_layers = tuple(dfc["target_layer_ids"])
+                assert len(self.spec_aux_layers) == len(dfc["target_layer_ids"]), (
+                    "DFlash draft fc 输入宽度与 aux 层数不一致："
+                    f"spec_aux_layers={self.spec_aux_layers} vs "
+                    f"target_layer_ids={dfc['target_layer_ids']}")
+            elif not self.is_hybrid:
                 if not self.spec_aux_layers:
                     n = self.hf_config.num_hidden_layers
                     self.spec_aux_layers = (2, n // 2, n - 3)
                 assert len(self.spec_aux_layers) == 3, "EAGLE3 draft fc 输入为 3 个 aux 隐层拼接"
-            # hybrid + spec_model：EAGLE3 的 aux 断言不适用（DFlash 消费 5 层 aux），
-            # 默认捕获层计算也会踩不到 hf_config.num_hidden_layers——本阶段干净拒绝
-            # 在 model_runner（NotImplementedError，DFlash 适配在阶段2 提供）。
+            # hybrid + spec_model 的方法匹配守卫在 model_runner（原 NotImplementedError
+            # 位置替换为 spec_method 分派检查；eagle3+hybrid / dflash+qwen3 均干净拒绝）。

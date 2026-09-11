@@ -369,11 +369,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     @torch.compiler.disable
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         ctx = get_context()
-        # GDN 状态槽元数据由引擎注入 context（阶段 1b 契约字段）
-        slots = ctx.gdn_state_slots
-        has_initial = ctx.gdn_has_initial
-        assert slots is not None and has_initial is not None, (
-            "引擎未注入 GDN 状态槽元数据（context.gdn_state_slots / gdn_has_initial，阶段 1b 契约）")
 
         # ---- 投影（整批一次）----
         qkvz = self.in_proj_qkvz(hidden_states)
@@ -384,10 +379,23 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         z = z.view(-1, self.num_v_heads, self.head_v_dim)
         b, a = ba.chunk(2, dim=-1)  # [n, H]，检查点顺序 [b, a]
 
-        if ctx.is_prefill:
-            core = self._forward_prefill(mixed_qkv, b, a, slots, has_initial, ctx)
+        if ctx.gdn_state_mode == "row":
+            # DFlash verify 逐行落槽（阶段2）：slots=写基址、carry_slots=行 0 读槽
+            # （has_initial 不消费，见 _forward_rows docstring）。
+            assert ctx.gdn_state_slots is not None and ctx.gdn_carry_slots is not None, (
+                "'row' 模式需注入 context.gdn_state_slots（写基址）与 "
+                "context.gdn_carry_slots（行 0 读槽）")
+            core = self._forward_rows(mixed_qkv, b, a, ctx)
         else:
-            core = self._forward_decode(mixed_qkv, b, a, slots, has_initial)
+            # GDN 状态槽元数据由引擎注入 context（阶段 1b 契约字段）
+            slots = ctx.gdn_state_slots
+            has_initial = ctx.gdn_has_initial
+            assert slots is not None and has_initial is not None, (
+                "引擎未注入 GDN 状态槽元数据（context.gdn_state_slots / gdn_has_initial，阶段 1b 契约）")
+            if ctx.is_prefill:
+                core = self._forward_prefill(mixed_qkv, b, a, slots, has_initial, ctx)
+            else:
+                core = self._forward_decode(mixed_qkv, b, a, slots, has_initial)
         # 输出归一化：逐 (token, v-head) 的 RMSNormGated（norm(o) * silu(z)）→ out_proj
         core = self.norm(core, z)
         return self.out_proj(core.flatten(1, -1))
@@ -502,6 +510,83 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         out = (state * q.unsqueeze(-1)).sum(dim=-2)  # [n, H, V]
         self.ssm_cache[idx] = state
         return out.to(mixed_qkv.dtype)
+
+    def _forward_rows(
+        self,
+        mixed_qkv: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        ctx,
+    ) -> torch.Tensor:
+        """DFlash verify 逐行落槽（'row' 模式，阶段2）：每序列一段连续 token，
+        GDN 逐行递归推进，行 j 终态写状态槽 base_i+j。
+
+        语义出处（计划 §3「GDN 状态 × spec 轮语义」）：
+        - 写槽：行 j 终态写 gdn_state_slots[i] + j（base_i 由引擎按批内序号静态
+          布局给出，见 model_runner._alloc_gdn_state_pool / _df_round_eager）；
+        - 读槽：行 0 初始态读 gdn_carry_slots[i]（首轮 = prefill 终态主槽，后续轮
+          = 上轮 base+m）。「读后写同槽安全」由两级次序保证：① 全批 carry 在任何
+          写槽前完成 gather（防跨序列槽区交叠时读到被覆盖的 carry）；② 单序列内
+          递归先读后写（行 j 写槽在行 0 读槽之后）；
+        - 单步递归公式与 _forward_decode 逐字相同（位等关键：verify 的逐行推进与
+          非 spec decode 单步在同状态同输入下产出逐位一致的状态/输出）；
+        - conv：段内一次窗口卷积——cat(行 0 读槽的 raw 窗口 3 + 段输入) → conv1d
+          （输出对齐段内各 token），每 token 的 conv 终态（其后 3 个 raw 输入窗口，
+          「末 3」）写对应槽（行 j 终态 = x_ext[:, :, j+1:j+4]，与 decode 单步的
+          raw 窗口右移语义一致）。
+        段长 = cu_seqlens_q 差（DFlash verify 恒为 k+1=16）。
+        """
+        cu = ctx.cu_seqlens_q.tolist()
+        base_l = ctx.gdn_state_slots.tolist()
+        n_seqs = len(cu) - 1
+        core = torch.empty(
+            mixed_qkv.size(0), self.num_v_heads, self.head_v_dim,
+            dtype=mixed_qkv.dtype, device=mixed_qkv.device,
+        )
+        conv_w = self.conv1d.weight  # [conv_dim, 1, K]
+        state_len = self.conv_kernel_size - 1
+        # ---- 全批 carry 先 gather（关键次序①：写槽前完成全部读）----
+        carry_idx = ctx.gdn_carry_slots.to(torch.long)  # int32 契约 → long 高级索引
+        ssm_carry = self.ssm_cache[carry_idx]    # [n, H, K, V] fp32
+        conv_carry = self.conv_cache[carry_idx]  # [n, conv_dim, K-1]
+        for i in range(n_seqs):
+            s0, s1 = cu[i], cu[i + 1]
+            seg = s1 - s0
+            # ---- conv：cat(carry raw 窗口, 段输入) 一次 valid 卷积 ----
+            x_ext = torch.cat([conv_carry[i], mixed_qkv[s0:s1].transpose(0, 1)],
+                              dim=-1).unsqueeze(0)  # [1, conv_dim, K-1+seg]
+            conv_out = F.conv1d(x_ext, conv_w, groups=self.conv_dim)
+            conv_out = self._act(conv_out).squeeze(0).transpose(0, 1)  # [seg, conv_dim]
+            # 每 token 的 conv 终态（raw 窗口右移，与 decode 同语义）批量写槽
+            conv_states = torch.stack(
+                [x_ext[0, :, j + 1:j + 1 + state_len] for j in range(seg)])
+            self.conv_cache[base_l[i]:base_l[i] + seg] = conv_states.to(self.conv_cache.dtype)
+            # ---- 拆 q/k/v 并按头展开（与 prefill 同构）----
+            q, k, v = conv_out.split([self.key_dim, self.key_dim, self.value_dim], dim=-1)
+            q = q.view(seg, self.num_k_heads, self.head_k_dim)
+            k = k.view(seg, self.num_k_heads, self.head_k_dim)
+            v = v.view(seg, self.num_v_heads, self.head_v_dim)
+            if self.gqa_ratio > 1:
+                q = q.repeat_interleave(self.gqa_ratio, dim=1)
+                k = k.repeat_interleave(self.gqa_ratio, dim=1)
+            g, beta = _gdn_gating(a[s0:s1], b[s0:s1], self.A_log, self.dt_bias)
+            # ---- 逐行递归（单步公式 = _forward_decode 循环体，fp32）----
+            q = _l2norm(q).float() * self.head_k_dim ** -0.5  # [seg, H, K]
+            k = _l2norm(k).float()
+            v = v.float()
+            state = ssm_carry[i]  # [H, K, V] fp32（读槽①已 gather）
+            states, outs = [], []
+            for j in range(seg):
+                state = state * g[j].exp().unsqueeze(-1).unsqueeze(-1)
+                kv_mem = (state * k[j].unsqueeze(-1)).sum(dim=-2)
+                delta = (v[j] - kv_mem) * beta[j].unsqueeze(-1)
+                state = state + k[j].unsqueeze(-1) * delta.unsqueeze(-2)
+                outs.append((state * q[j].unsqueeze(-1)).sum(dim=-2))
+                states.append(state)
+            # 行终态批量落槽（base_i..base_i+seg-1 连续 → 一次切片写）
+            self.ssm_cache[base_l[i]:base_l[i] + seg] = torch.stack(states)
+            core[s0:s1] = torch.stack(outs).to(core.dtype)
+        return core
 
 
 class Qwen3_5DecoderLayer(nn.Module):

@@ -16,6 +16,7 @@ from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.models.qwen3_5 import Qwen3_5ForCausalLM
 from nanovllm.models.eagle3 import Eagle3DraftModel, load_eagle3_draft
+from nanovllm.models.dflash import DFlashDraftModel, load_dflash_draft
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model, iter_safetensors
@@ -164,11 +165,18 @@ class ModelRunner:
         self._gdn_state_bytes = 0
         # EAGLE3 投机解码（仅 TP=1，见 config 断言）。
         self.spec_enabled = bool(config.spec_model)
-        if self.spec_enabled and self.is_hybrid:
-            # 阶段1 守卫：Qwen3.5 目标的投机解码（DFlash）在阶段2 提供，干净拒绝
-            # （先于 draft 构建与 EAGLE3 检查；hybrid 的 spec_method 分发也是阶段2）。
-            raise NotImplementedError(
-                'Qwen3.5 目标的投机解码（DFlash）将在阶段2 提供，当前请去掉 spec_model 配置')
+        if self.spec_enabled and self.is_hybrid and config.spec_method != "dflash":
+            # 阶段2 守卫（替换阶段1 的 NotImplementedError）：hybrid（Qwen3.5）
+            # 目标仅接受 DFlash——EAGLE3 的链式流/3 层 aux/层输入口径与 GDN 混合
+            # 架构不兼容（干净拒绝，勿静默走错路径）。
+            raise RuntimeError(
+                'Qwen3.5（hybrid）目标仅支持 DFlash 投机解码（spec_method=dflash）：'
+                'EAGLE3 draft 的链式起草与 3 层 aux 口径不适用于 GDN 混合架构，'
+                '请改用含 dflash_config 的 DFlash draft checkpoint')
+        if self.spec_enabled and not self.is_hybrid and config.spec_method == "dflash":
+            raise RuntimeError(
+                'DFlash 仅支持 Qwen3.5（hybrid）目标模型：纯 Qwen3 target 请使用 '
+                'EAGLE3 draft（DFlash 的上下文注入与 GDN verify 分叉依赖 hybrid 基建）')
         if self.spec_enabled and not self.backend.supports_spec:
             # spec 全路径不可用的后端在此干净拒绝（能力位裁决，不做 name 字符串
             # 判断）：310P 上 verify 恒传 block_tables → attention 层走整池 4D
@@ -244,10 +252,49 @@ class ModelRunner:
         if self.spec_enabled:
             # aux 隐层捕获必须在 warmup 前打开（prefill 前向开始返回 (hidden, aux)）。
             self.model.model.aux_hidden_state_layers = tuple(config.spec_aux_layers)
-            from transformers import AutoConfig
-            self.draft_config = AutoConfig.from_pretrained(config.spec_model)
-            self.draft_model = Eagle3DraftModel(self.draft_config, self.model.model.embed_tokens)
-            load_eagle3_draft(self.draft_model, config.spec_model)
+            # draft config 由 config.py 统一加载（避免二次 IO），语义不变。
+            self.draft_config = config.draft_config
+            if getattr(self.draft_config, "draft_vocab_size", None) is None:
+                # dflash 无独立 draft 词表（= target 词表，无 d2t）——_fill_spec_meta
+                # 的 top_k 截断上界按 target 词表取值（vllm DFlashQwen3ForCausalLM
+                # 构造时同款回填）。
+                self.draft_config.draft_vocab_size = config.text_config.vocab_size
+            if config.spec_method == "dflash":
+                d = self.draft_config
+                # DFlash draft：embed/lm_head 共享 target（构造传入）；rope 的
+                # max_position 按 max_model_len 收紧（位置恒 < max_model_len，
+                # 省 262144 全长 cos/sin 缓存的开销）。
+                self.draft_model = DFlashDraftModel(
+                    d, self.model.model.embed_tokens,
+                    target_lm_head_weight=self.model.lm_head.weight,
+                    max_position=config.max_model_len)
+                load_dflash_draft(self.draft_model, config.spec_model)
+                self.draft_model._build_fused_kv_buffers()
+                # draft 上下文 KV 稠密缓冲：[slots, max_model_len, L, kvh, hd]×2
+                # bf16（~84MB@ms8/mml2048；不进 block manager——上下文 KV 由 aux
+                # 重投影而来，与分页 token KV 是两种内容）。零初始化：块草稿读取
+                # 以 ctx_len 右界 + -inf mask 屏蔽界外残留，有限值保证无 NaN 传播。
+                # 分配在 warmup 之前（预热 prefill 即写入），字节数随 mem_get_info
+                # 自动计入 KV 池预算（勿再显式扣除）。
+                hd = getattr(d, "head_dim", d.hidden_size // d.num_attention_heads)
+                ctx_shape = (config.max_num_seqs, config.max_model_len,
+                             d.num_hidden_layers, d.num_key_value_heads, hd)
+                self.draft_model.ctx_k_cache = torch.zeros(ctx_shape, dtype=self.dtype)
+                self.draft_model.ctx_v_cache = torch.zeros(ctx_shape, dtype=self.dtype)
+                # 槽生命周期镜像 GDN 主槽（get_or_alloc / drop_seq_state 双路径清理）
+                self.draft_ctx_slots: dict[int, int] = {}
+                self._df_ctx_free = set(range(config.max_num_seqs))
+                # DFlash 每轮状态（按 seq_id 记账，batch 组成每轮可变）：
+                # spec_ctx_pending = 上轮 verify 已提交行的 aux（GPU 常驻——每轮
+                # ≤16 行×10KB，省 D2H/H2D；CPU 常驻则每轮多两次拷贝，取舍取 GPU）；
+                # gdn_spec_carry = 上轮 verify 行 m 的 GDN 槽号（绝对值）。
+                self.spec_ctx_pending: dict[int, torch.Tensor | None] = {}
+                self.gdn_spec_carry: dict[int, int] = {}
+            else:
+                self.draft_model = Eagle3DraftModel(self.draft_config, self.model.model.embed_tokens)
+                load_eagle3_draft(self.draft_model, config.spec_model)
+            # 本轮 verify 的 GDN 写基址（host int，读回更新 carry 用；仅 dflash 写）
+            self._df_bases: list[int] = []
         if config.compile:
             # torch.compile：CoreX 上 qkv/rope/attention 区域的 Inductor 融合会产出
             # 错误结果，Qwen3Attention.forward 已 @torch.compiler.disable 保持 eager，
@@ -283,15 +330,20 @@ class ModelRunner:
                 else:
                     self.capture_cudagraph()
             else:
-                # spec 解码路径图捕获（draft 链图 + verify 图，仅 TP=1）。spec 图
-                # 无条件录 Gumbel 采样（forward_native），默认门同时要求
-                # graph_sample_default（RNG 图安全性未验证的后端不默认尝试）；
-                # NANOVLLM_SPEC_GRAPH 显式设置优先后端默认，可实验性覆盖。
-                _env_spec = os.environ.get("NANOVLLM_SPEC_GRAPH")
-                if (self.world_size == 1 and self.backend.supports_spec_graph
-                        and (_env_spec != "0" if _env_spec is not None
-                             else self.backend.graph_sample_default)):
-                    self.capture_spec_cudagraph()
+                if self.config.spec_method == "dflash":
+                    # 阶段2：DFlash spec 图留阶段3（上下文追加/块草稿/verify 的
+                    # 固定形状捕获待适配）；decode 图同 hybrid 阶段1 策略跳过。
+                    print('[nano-vllm] DFlash 阶段2 暂不走 CUDA 图（spec 图留阶段3），全 eager', flush=True)
+                else:
+                    # spec 解码路径图捕获（draft 链图 + verify 图，仅 TP=1）。spec 图
+                    # 无条件录 Gumbel 采样（forward_native），默认门同时要求
+                    # graph_sample_default（RNG 图安全性未验证的后端不默认尝试）；
+                    # NANOVLLM_SPEC_GRAPH 显式设置优先后端默认，可实验性覆盖。
+                    _env_spec = os.environ.get("NANOVLLM_SPEC_GRAPH")
+                    if (self.world_size == 1 and self.backend.supports_spec_graph
+                            and (_env_spec != "0" if _env_spec is not None
+                                 else self.backend.graph_sample_default)):
+                        self.capture_spec_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -368,6 +420,13 @@ class ModelRunner:
             # 零初始化 prefill，旧值永不被读，见 drop_seq_state）。
             self.gdn_slots.clear()
             self._gdn_free_slots = set(range(self.config.max_num_seqs))
+            if self.config.spec_method == "dflash":
+                # DFlash：预热 dummy 序列的 spec 状态同口径全量回收
+                # （pending aux / GDN carry 记账 / draft 上下文槽）。
+                self.spec_ctx_pending.clear()
+                self.gdn_spec_carry.clear()
+                self.draft_ctx_slots.clear()
+                self._df_ctx_free = set(range(self.config.max_num_seqs))
 
     def allocate_kv_cache(self):
         config = self.config
@@ -384,10 +443,12 @@ class ModelRunner:
         num_kv_heads = tc.num_key_value_heads // self.world_size
         head_dim = getattr(tc, "head_dim", tc.hidden_size // tc.num_attention_heads)
         block_bytes = 2 * num_attn_layers * self.block_size * num_kv_heads * head_dim * self.dtype.itemsize
-        if self.spec_enabled:
+        if self.spec_enabled and self.config.spec_method == "eagle3":
             # draft KV cache 与 target 共用同一 block_table/slot 布局，预算一并扣除。
             # 布局一致性由 backend.get_kv_cache_shape 保证（cuda/ascend=BSHD、corex=HND，
             # 两模型同后端必同布局）；draft 槽位写入与 target 走同一 _slot_of 映射。
+            # dflash 不进此分支：上下文 KV 走独立稠密缓冲（ctx_k/v_cache，已在
+            # __init__ 分配），块查询行 KV 仅本轮 transient，无 paged draft cache。
             d = self.draft_config
             draft_kv_heads = d.num_key_value_heads // self.world_size
             draft_head_dim = getattr(d, "head_dim", d.hidden_size // d.num_attention_heads)
@@ -442,7 +503,8 @@ class ModelRunner:
                     module.k_cache = self.kv_cache[0, layer_id]
                     module.v_cache = self.kv_cache[1, layer_id]
                     layer_id += 1
-        if self.spec_enabled:
+        if self.spec_enabled and self.config.spec_method == "eagle3":
+            # EAGLE3 draft 的 paged KV cache（dflash 无此结构，见上方预算分支注释）
             d = self.draft_config
             draft_kv_heads = d.num_key_value_heads // self.world_size
             draft_head_dim = getattr(d, "head_dim", d.hidden_size // d.num_attention_heads)
@@ -458,9 +520,22 @@ class ModelRunner:
             attn.k_cache = self.draft_kv_cache[0, 0]
             attn.v_cache = self.draft_kv_cache[1, 0]
 
+    def _df_drop_state(self, seq_id: int):
+        """DFlash spec 状态清理（幂等；finish 的 drop_spec_state 与 preempt 的
+        drop_seq_state 双路径共用）：pending aux、draft 上下文槽、GDN carry 记账。
+        非 dflash 直通（qwen3+eagle3 / 非 spec hybrid 零开销）。"""
+        if self.config.spec_method != "dflash":
+            return
+        self.spec_ctx_pending.pop(seq_id, None)
+        self.gdn_spec_carry.pop(seq_id, None)
+        slot = self.draft_ctx_slots.pop(seq_id, None)
+        if slot is not None:
+            self._df_ctx_free.add(slot)
+
     def drop_spec_state(self, seq_id: int):
         self.spec_hidden.pop(seq_id, None)
         self.spec_carry.pop(seq_id, None)
+        self._df_drop_state(seq_id)
 
     def _alloc_gdn_state_pool(self):
         """hybrid（Qwen3.5）：GDN 线性注意力状态池分配 + 模块注入 + 槽生命周期初始化。
@@ -477,6 +552,17 @@ class ModelRunner:
         tc = self.config.text_config
         n_gdn = tc.num_hidden_layers - self.model.model.num_attention_layers
         slots = self.config.max_num_seqs
+        if self.config.spec_method == "dflash":
+            # DFlash（阶段2）：池扩为「主槽区 ms + verify 行槽区 ms×(k+1)」。
+            # verify 行槽静态布局：批内序号 i 的写基址 base_i = ms + i×(k+1)
+            # （行 0..k 逐行落槽，见 qwen3_5._forward_rows / _df_verify）。
+            # 主槽（prefill 终态 / 非 spec decode）保持 [0, ms) 的 get_or_alloc
+            # 语义不变——必须与全部行槽区互斥：prefill 与 verify 是不同引擎步、
+            # 批内序号在两步间可变，若 prefill 写进「本步批序号对应」的行槽区，
+            # 会被其他序列的 verify 行覆盖（carry 读到脏状态）。偏差说明：计划
+            # §3 写 slots = ms×(k+1)，实现取 ms×(k+2)，多出的 ms 槽即主槽区
+            # （@ms8 ≈ +8MB ssm，正确性必需）。
+            slots = self.config.max_num_seqs * (self.config.spec_num_tokens + 2)
         # 形状键名双兼容：模型侧实际返回 conv_shape/ssm_shape（阶段1b 契约文本
         # 写作 conv/ssm），以模型落地为准、两键名都认，防任一侧改动即炸。
         conv_shape = spec.get("conv_shape") or spec["conv"]
@@ -543,6 +629,9 @@ class ModelRunner:
         slot = self.gdn_slots.pop(seq_id, None)
         if slot is not None:
             self._gdn_free_slots.add(slot)
+        # dflash：preempt 路径同步清 spec 状态（finish 路径由 drop_spec_state 清，
+        # _df_drop_state 幂等，双路径重复调用安全）。
+        self._df_drop_state(seq_id)
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -750,12 +839,14 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_prefill_spec(self, seqs: list[Sequence]) -> list[int]:
-        """spec 模式 prefill 步：target 前向（返回 aux 隐层）+ draft 同 chunk 前向。
+        """spec 模式 prefill 步：target 前向（返回 aux 隐层）+ draft 侧状态初始化。
 
-        draft prefill 复用同一 context（token 布局/槽位完全一致），为 prompt 的
-        每个位置写入 draft KV。已完成 prefill 的序列记录 h_seed（aux 最后一行，
-        即预测首个采样 token 的隐层）。
+        EAGLE3：draft 同 chunk 前向（复用同一 context，为 prompt 每个位置写入
+        draft KV），已完成 prefill 的序列记录 h_seed（aux 最后一行）。
+        DFlash：走 _run_prefill_spec_dflash（aux 全行投影写上下文稠密缓冲）。
         """
+        if self.config.spec_method == "dflash":
+            return self._run_prefill_spec_dflash(seqs)
         assert self.rank == 0
         input_ids, positions = self.prepare_prefill(seqs)
         hidden, aux = self.model(input_ids, positions)
@@ -785,7 +876,13 @@ class ModelRunner:
     @torch.inference_mode()
     def spec_round(self, seqs: list[Sequence]) -> list[list[int]]:
         """一轮投机解码（入口）：有捕获图、桶足够且全部序列已有 carry 时走 CUDA
-        Graph，否则 eager（冷启动轮在 eager 内补齐 carry）。"""
+        Graph，否则 eager（冷启动轮在 eager 内补齐 carry）。
+
+        DFlash（阶段2）：分发到 _df_round_eager（图分支留阶段3）；commit_buf
+        契约与 EAGLE3 完全一致（committed = row[:row[rows]]，benchmark 的
+        spec_round monkey-patch 统计依赖此入口与契约，勿改）。"""
+        if self.config.spec_method == "dflash":
+            return self._df_round_eager(seqs)
         if (self.spec_graphs is not None and seqs
                 and not any(seq.spec_cold for seq in seqs)):
             bucket = _bucket(self.spec_graph_bs, len(seqs))
@@ -803,7 +900,9 @@ class ModelRunner:
         blob = self._sblob
         M, W = self._pin_M, self._pin_W
         draft_vocab = self.draft_config.draft_vocab_size
-        vocab = self.config.hf_config.vocab_size
+        # vocab 取 text_config：qwen3_5 外层多模态壳无顶层 vocab_size（实测）；
+        # qwen3 的 text_config 即 hf_config，取值逐字节相同（行为零变化）。
+        vocab = self.config.text_config.vocab_size
         chain_tokens = blob.view_i64('chain_tokens')
         ctopks = blob.view_i64('ctopks')
         ctemps = blob.view_f32('ctemps')
@@ -937,13 +1036,237 @@ class ModelRunner:
             seq.spec_cold = False
         return results
 
+    # ---- DFlash 块草稿投机（阶段2，eager；CUDA 图留阶段3）----
+    # 轮次结构（z-lab dflash 语义，对齐 vllm DFlashProposer/DFlashSpeculator）：
+    # ① 上下文追加（上轮 v_aux 已提交行 → fc+norm → k/v proj → rope → 稠密缓冲）
+    # ② block 草稿（anchor+mask×k 单次非因果前向 → target 词表采样 [n, k]）
+    # ③ verify（复用 EAGLE 骨架的 _sg 缓冲与验收口径；GDN 走 'row' 逐行落槽）
+    # ④ 读回提交 + 更新 spec_ctx_pending / GDN carry（无链式 carry / refill）。
+
+    def _df_ctx_get_or_alloc(self, seq: Sequence) -> int:
+        """draft 上下文 KV 稠密缓冲的槽 get_or_alloc（prefill 时分配）。
+
+        新槽内容无脏读风险：prefill 全量重写 0..P-1；块草稿读取恒以
+        ctx_len = len-1 为右界 + -inf mask 屏蔽界外残留（缓冲零初始化，无 NaN）。
+        """
+        slot = self.draft_ctx_slots.get(seq.seq_id)
+        if slot is None:
+            try:
+                slot = self._df_ctx_free.pop()
+            except KeyError:
+                raise RuntimeError(
+                    f'draft 上下文槽耗尽：并发序列数超过 max_num_seqs={self.config.max_num_seqs}'
+                    '（scheduler admission 门控应保证不发生）') from None
+            self.draft_ctx_slots[seq.seq_id] = slot
+        return slot
+
+    @torch.inference_mode()
+    def _run_prefill_spec_dflash(self, seqs: list[Sequence]) -> list[int]:
+        """DFlash prefill 步：target 前向（aux 5 层捕获）+ 首 token 采样 + prefill
+        aux 全行（位置 0..P-1）投影写入 draft 上下文 KV 稠密缓冲。
+
+        与 EAGLE3 prefill 的差异：无 draft 流式 prefill（dflash 无链式流——draft
+        上下文 = aux 重投影，块查询行每轮由 embed 现算）；spec_ctx_pending 置 None
+        （上下文已落盘，首轮块草稿的 ctx_len = P 恰为 anchor 前的全部位置）。
+        """
+        assert self.rank == 0
+        input_ids, positions = self.prepare_prefill(seqs)
+        hidden, aux = self.model(input_ids, positions)
+        logits = self.model.compute_logits(hidden)
+        token_ids = self.sampler(logits, *self.prepare_sample(seqs)).tolist()
+        reset_context()
+        offsets = list(accumulate([0] + [seq.num_scheduled_tokens for seq in seqs]))
+        for i, seq in enumerate(seqs):
+            if seq.num_cached_tokens + seq.num_scheduled_tokens != seq.num_tokens:
+                continue  # hybrid 禁 chunked prefill（config 断言），防御分支
+            slot = self._df_ctx_get_or_alloc(seq)
+            p0, p1 = offsets[i], offsets[i + 1]
+            # prefill aux 全行（0-based 层输出口径）→ 投影写缓冲（位置 0..P-1）
+            self.draft_model.project_context_kv(
+                aux[p0:p1], positions[p0:p1],
+                torch.full((p1 - p0,), slot, dtype=torch.int64, device=self.device))
+            # 首 verify 的 GDN carry = prefill 终态主槽（gdn_slots），清 preempt 残留
+            self.gdn_spec_carry.pop(seq.seq_id, None)
+            self.spec_ctx_pending[seq.seq_id] = None
+        return token_ids
+
+    def _df_append_context(self, seqs: list[Sequence]):
+        """① 上下文追加：spec_ctx_pending（上轮 v_aux 已提交行）→ 投影写稠密缓冲。
+
+        行语义（对齐 vllm _prepare_dflash_inputs_kernel：上下文 = verify 前 m+1 个
+        有效行 = [last_token, d_0..d_{m-1}]，位置 L-1..L+m-1）：上轮 verify 的
+        v_aux 行 0..m 恰为这批新可得已提交 token 的 aux——行 0 = 本轮 last_token
+        （上轮 bonus，其 aux 由上轮 verify 行 0 首次算出）、行 1..m = 被接受的提案。
+        上下文覆盖不变式 = 已提交 token 位置 0..L-2 的真 aux（anchor 位置 L-1 不入
+        上下文，由块查询行自身的 KV 表示）。注：任务书草案「行 1..m+1」有偏——
+        行 m+1 是被拒提案的 aux（内容错位），行 0 不追加则 L-1 位永久空洞；以
+        vllm 口径为准实现（偏差已记入报告，门B 以 E 数值佐证）。
+        pending 行数 c 的位置可由长度反推：[L-1-c, L-2]（提交只增长度）。
+        """
+        rows = [(s, p) for s in seqs
+                if (p := self.spec_ctx_pending.get(s.seq_id)) is not None]
+        if not rows:
+            return
+        aux = torch.cat([p for _, p in rows], dim=0)              # [T, aux宽] GPU
+        lens = [p.size(0) for _, p in rows]
+        slot_list = [self.draft_ctx_slots[s.seq_id] for s, _ in rows]
+        # 位置 = [L-1-c, L-1)（device int64）
+        pos = torch.cat([
+            torch.arange(len(s) - 1 - c, len(s) - 1, dtype=torch.int64, device=self.device)
+            for (s, _), c in zip(rows, lens)])
+        slots = torch.cat([
+            torch.full((c,), slot, dtype=torch.int64, device=self.device)
+            for slot, c in zip(slot_list, lens)])
+        self.draft_model.project_context_kv(aux, pos, slots)
+        for s, _ in rows:
+            self.spec_ctx_pending[s.seq_id] = None
+
+    def _df_draft_block(self, seqs: list[Sequence]) -> torch.Tensor:
+        """② block 草稿：anchor+mask×k 单次非因果前向，逐 mask 行采样提案。
+
+        返回 [n, k] target 词表 id（draft 词表 = target，无 d2t 映射）。采样参数
+        按序列展开（temp0 → argmax 确定性提案；top_k 上界 = target 词表），
+        logits 行序 (i, j) → i*k+j 与 repeat_interleave(k) 对齐。
+        """
+        k = self.config.spec_num_tokens
+        rows = k + 1
+        n = len(seqs)
+        Ls = [len(seq) for seq in seqs]
+        # 块查询位置 = [l'-1, ..., l'+k-1]（anchor = 最后已提交 token，l' = 序列长）
+        positions = torch.cat([
+            torch.arange(L - 1, L - 1 + rows, dtype=torch.int64, device=self.device)
+            for L in Ls]).view(n, rows)
+        last = torch.tensor([seq.last_token for seq in seqs], dtype=torch.int64,
+                            pin_memory=True).to(self.device, non_blocking=True)
+        # 上下文读窗：ctx_len = L-1（覆盖 0..L-2），右 padding 至批内最大（host int）
+        ctx_lens = torch.tensor([L - 1 for L in Ls], dtype=torch.int64,
+                                pin_memory=True).to(self.device, non_blocking=True)
+        max_ctx = max(L - 1 for L in Ls)
+        ctx_slots = torch.tensor([self.draft_ctx_slots[seq.seq_id] for seq in seqs],
+                                 dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
+        logits = self.draft_model.forward_block(last, positions, ctx_slots, ctx_lens,
+                                                max_ctx, rows)
+        vocab = self.config.text_config.vocab_size
+        temps = torch.tensor([seq.temperature for seq in seqs], dtype=torch.float32,
+                             pin_memory=True).to(self.device, non_blocking=True)
+        topps = torch.tensor([seq.top_p for seq in seqs], dtype=torch.float32,
+                             pin_memory=True).to(self.device, non_blocking=True)
+        topks = torch.tensor([seq.top_k if 0 < seq.top_k < vocab else vocab for seq in seqs],
+                             dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
+        ids = self.sampler.forward_native(
+            logits, temps.repeat_interleave(k), topps.repeat_interleave(k),
+            topks.repeat_interleave(k))
+        return ids.view(n, k)
+
+    def _df_verify(self, seqs: list[Sequence]):
+        """③ target verify：[last_token, d1..dk] 一次前向，行 j 预测位置 L+j，
+        图外采样并暂存 aux。
+
+        与 _sg_verify 同构（同一批 _sg 静态缓冲），差异仅 GDN 上下文：'row' 模式
+        + 写基址/ carry 槽——EAGLE3 路径零触碰红线，故独立成方法而非加参。
+        GDN 元数据（host 逐 seq 解析，跨轮槽位按 seq_id 记账）：
+        - 写基址 base_i = max_num_seqs + i×(k+1)（池静态布局，行 0..k 逐行落槽）；
+        - 行 0 读槽 = gdn_spec_carry[seq]（后续轮 = 上轮 base+m）或 gdn_slots[seq]
+          （首轮 = prefill 终态主槽）。
+        """
+        g = self._sg
+        k = self.config.spec_num_tokens
+        rows = k + 1
+        n = len(seqs)
+        ms = self.config.max_num_seqs
+        bases = [ms + i * rows for i in range(n)]
+        carries = [self.gdn_spec_carry.get(s.seq_id, self.gdn_slots[s.seq_id]) for s in seqs]
+        base_dev = torch.tensor(bases, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
+        carry_dev = torch.tensor(carries, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
+        # max_seqlen_k 用 max_model_len 上界（同 _sg_verify 的 varlen grid 口径）
+        set_context(True,
+                    cu_seqlens_q=g['v_cu_q'][:n + 1],
+                    cu_seqlens_k=g['v_cu_k'][:n + 1],
+                    max_seqlen_q=rows,
+                    max_seqlen_k=self.config.max_model_len,
+                    slot_mapping=g['v_slots'][:n * rows],
+                    block_tables=g['v_btables'][:n],
+                    block_size=self.block_size,
+                    gdn_state_slots=base_dev,
+                    gdn_carry_slots=carry_dev,
+                    gdn_state_mode='row')
+        hidden, aux = self.model(g['v_input_ids'][:n * rows], g['v_positions'][:n * rows])
+        logits = F.linear(hidden, self.model.lm_head.weight)
+        g['v_token_ids'][:n * rows] = self.sampler.forward_native(
+            logits, g['v_temps'][:n * rows], g['v_topps'][:n * rows], g['v_topks'][:n * rows])
+        g['v_aux'][:n * rows].copy_(aux)
+        self._df_bases = bases  # 供读回更新 carry（host int）
+
+    def _df_readback_commit(self, seqs: list[Sequence]) -> list[list[int]]:
+        """④ 统一读回（每轮唯一一次 D2H；commit_buf 契约与 EAGLE3 完全一致：
+        committed = row[:row[rows]]，cnt 打包在最后一列）：
+        提取提交 token + 更新 spec_ctx_pending（v_aux 行 0..m = 新可得已提交位置
+        L-1..L+m-1，供下轮上下文追加）与 GDN carry（本轮行 m 的槽 base_i+m）。
+        """
+        g = self._sg
+        rows = self.config.spec_num_tokens + 1
+        n = len(seqs)
+        rows_out = g['commit_buf'][:n].tolist()
+        results = []
+        for i, seq in enumerate(seqs):
+            row = rows_out[i]
+            c = row[rows]
+            results.append(row[:c])
+            # 下一轮上下文追加行：v_aux 行 0..c-1（GPU 常驻 clone）
+            self.spec_ctx_pending[seq.seq_id] = g['v_aux'][i * rows:i * rows + c].clone()
+            # GDN carry = 本轮行 m 槽（c-1 = m ≥ 0）；下轮行 0 读此槽
+            self.gdn_spec_carry[seq.seq_id] = self._df_bases[i] + (c - 1)
+            # 回滚未提交的调度计数（同 _readback_spec_commit）
+            seq.num_scheduled_tokens = 0
+        return results
+
+    @torch.inference_mode()
+    def _df_round_eager(self, seqs: list[Sequence]) -> list[list[int]]:
+        """DFlash 一轮投机（eager 全量体；CUDA 图留阶段3）。
+
+        verify 段复用 _sg 静态缓冲与 _sg_acceptance（纯张量验收，零上下文依赖）；
+        提案写入 g['drafted_ids'] 后验收口径与 EAGLE3 逐位一致。
+        """
+        assert self.rank == 0
+        n = len(seqs)
+        if n == 0:
+            return []
+        k = self.config.spec_num_tokens
+        rows = k + 1
+        # ---- ① 上下文追加 ----
+        self._df_append_context(seqs)
+        # ---- ② block 草稿 ----
+        drafted = self._df_draft_block(seqs)   # [n, k] target 词表 id
+        # ---- ③ verify：填 meta（复用 _fill_spec_meta，chain 段写而不读）→
+        #      组装 v_input_ids = [last_token, d1..dk] → target 前向（GDN row）----
+        self._fill_spec_meta(seqs)
+        # 与 EAGLE3 eager 流程对齐的元数据分发：_fill_spec_meta 只写 pinned host
+        # blob，_df_verify 消费的是 _sg 静态 buffer（v_positions/v_slots/v_cu_k/
+        # v_temps/v_topps/v_topks/v_btables/chain_tokens）——须经 _push_spec_meta
+        # （2 次 H2D 到设备孪生）+ _sg_scatter（孪生 → 静态 buffer）才生效。缺了
+        # 这两步会读到初始化零值（实测 verify 行 0 被喂 token 0、KV 全写槽 0，
+        # 整轮垃圾 → E≈1 且输出全错）。
+        self._push_spec_meta()
+        self._sg_scatter(n)
+        g = self._sg
+        v = g['v_input_ids'][:n * rows].view(n, rows)
+        v[:, 0] = g['chain_tokens'][:n]        # = 各 seq.last_token
+        v[:, 1:] = drafted                     # d1..dk（target 词表，无映射）
+        g['drafted_ids'][:k, :n] = drafted.t()  # 验收缓冲（_sg_acceptance 消费）
+        self._df_verify(seqs)
+        self._sg_acceptance(n)
+        # ---- ④ 读回提交 + 更新 pending / carry ----
+        return self._df_readback_commit(seqs)
+
     # ---- spec 解码 CUDA Graph ----
     # 每桶一张图覆盖整轮：draft 链式起草 → target verify → 图内接受/提交/种子
     # → refill（用 verify 的 target aux 回填 draft KV）。每轮仅一次 D2H。
 
     def _alloc_spec_graph_vars(self, max_bs: int, rows: int, k: int) -> dict:
-        hf_config = self.config.hf_config
-        vocab = hf_config.vocab_size
+        # 形状取 text_config（qwen3_5 外层壳无顶层 vocab_size/hidden_size；qwen3
+        # 路径 text_config 即 hf_config，逐字节同值，行为零变化）。
+        tc = self.config.text_config
+        vocab = tc.vocab_size
         draft_vocab = self.draft_config.draft_vocab_size
         # bt 宽度含 +1 余量，与 decode 图捕获的 block_tables 一致（_pin_W）。
         max_num_blocks = self._pin_W
@@ -953,7 +1276,7 @@ class ModelRunner:
         return dict(
             # draft 链静态 buffer；carry_seed 为上一轮 refill 采样行（row k）的
             # midlayer 输出（TTT 链种子），drafted_ids[0] 为其采样的首个提案。
-            carry_seed=torch.zeros(max_bs, hf_config.hidden_size, dtype=self.dtype),
+            carry_seed=torch.zeros(max_bs, tc.hidden_size, dtype=self.dtype),
             chain_tokens=torch.zeros(max_bs, dtype=torch.int64),
             drafted_ids=torch.zeros(k, max_bs, dtype=torch.int64),
             chain_pos=torch.zeros(k, max_bs, dtype=torch.int64),
@@ -974,7 +1297,9 @@ class ModelRunner:
             v_temps=torch.ones(max_bs * rows, dtype=torch.float32),
             v_topps=torch.ones(max_bs * rows, dtype=torch.float32),
             v_topks=torch.full((max_bs * rows,), vocab, dtype=torch.int64),
-            v_aux=torch.zeros(max_bs * rows, hf_config.hidden_size * 3, dtype=self.dtype),
+            # aux 宽度按捕获层数参数化（原硬编码 *3 = EAGLE3 的 3 层；dflash 为
+            # 5 层）。eagle3 下 len==3，宽度与旧硬编码逐位一致（行为零变化）。
+            v_aux=torch.zeros(max_bs * rows, tc.hidden_size * len(self.config.spec_aux_layers), dtype=self.dtype),
             v_token_ids=torch.zeros(max_bs * rows, dtype=torch.int64),
             # 接受/提交输出（cnt 打包在最后一列，每轮仅一次 D2H）
             commit_buf=torch.full((max_bs, rows + 1), -1, dtype=torch.int64),

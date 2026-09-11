@@ -168,7 +168,11 @@ def main():
         # 四路统一从 _readback_spec_commit 出）。预热后安装，仅计主跑。
         spec_stats = None
         if args.spec_model:
-            k_stat = args.spec_num_tokens
+            # 统计口径取引擎实际生效的 k（config.spec_num_tokens）：dflash 会按
+            # draft config block_size-1 自动派生（CLI 默认 3 被视为未显式指定），
+            # 直接用 args 值会按 3 建直方图而在 c>4 时越界；eagle3 下 config 与
+            # args 恒等，行为不变（阶段2 最小适配，统计逻辑本身未动）。
+            k_stat = llm.model_runner.config.spec_num_tokens
             spec_stats = {"rounds": 0, "committed": 0, "pos": [0] * k_stat}
             orig_spec_round = llm.model_runner.spec_round
 
@@ -234,7 +238,7 @@ def main():
     if spec_stats is not None and spec_stats["rounds"]:
         rounds = spec_stats["rounds"]
         accepted = spec_stats["committed"] - rounds   # Σ 每轮接受 draft 数（提交数 - bonus）
-        k = args.spec_num_tokens
+        k = k_stat
         print(f"Acceptance length (E) = {spec_stats['committed'] / rounds:.3f}   "
               f"(avg committed/round = 1 bonus + accepted/rounds)")
         print(f"Token acceptance rate = {accepted / (rounds * k):.1%}   "

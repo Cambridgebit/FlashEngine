@@ -26,15 +26,23 @@ class Context:
     # qwen3 路径不设置（恒 None），注意力层无读者，行为不变。
     gdn_state_slots: torch.Tensor | None = None
     gdn_has_initial: torch.Tensor | None = None
+    # ---- DFlash verify 的 GDN 'row' 模式（阶段2）----
+    # gdn_state_mode：None/'final' = 现状语义（prefill 只写末态 / decode 单步读写
+    # 同槽）；'row' = verify 逐行落槽（段内每行终态写 状态槽 = gdn_state_slots[i]
+    # + 行内偏移，行 0 从 gdn_carry_slots[i] 读初始态）。
+    # gdn_carry_slots：int32 [n_seqs]，'row' 模式行 0 的读槽（'final' 模式忽略）。
+    # qwen3 / 非 spec hybrid 路径不设置（恒 None），行为不变。
+    gdn_state_mode: str | None = None
+    gdn_carry_slots: torch.Tensor | None = None
 
 _CONTEXT = Context()
 
 def get_context():
     return _CONTEXT
 
-def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None, context_lens=None, block_tables=None, max_context_len=None, use_cuda_graph=False, block_size=0, gdn_state_slots=None, gdn_has_initial=None):
+def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None, context_lens=None, block_tables=None, max_context_len=None, use_cuda_graph=False, block_size=0, gdn_state_slots=None, gdn_has_initial=None, gdn_state_mode=None, gdn_carry_slots=None):
     global _CONTEXT
-    _CONTEXT = Context(is_prefill, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, context_lens, block_tables, max_context_len, use_cuda_graph, block_size, gdn_state_slots, gdn_has_initial)
+    _CONTEXT = Context(is_prefill, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, context_lens, block_tables, max_context_len, use_cuda_graph, block_size, gdn_state_slots, gdn_has_initial, gdn_state_mode, gdn_carry_slots)
 
 def reset_context():
     global _CONTEXT
