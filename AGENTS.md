@@ -9,7 +9,14 @@ Nano-vLLM：从零实现的极简 vLLM（研究/学习用代码库，非生产�
 ```bash
 ~/vllm-env/bin/python3 -m scripts.benchmark /path/to/Qwen3-1.7B [--spec-model <draft 目录>] [--no-think] [--backend corex]
 ~/vllm-env/bin/python3 -m scripts.openai_server /path/to/Qwen3-1.7B [--port 8000] [--eager] [--spec-model <draft 目录>] [--spec-num-tokens k]
+# Qwen3.5 + DFlash（分支 qwen35-dflash；spec-num-tokens 缺省自动 = draft block_size-1 = 15）
+~/vllm-env/bin/python3 -m scripts.benchmark /path/to/Qwen3.5-2B --spec-model /path/to/Qwen3.5-2B-Dflash
+~/vllm-env/bin/python3 -m scripts.check_qwen35 base /path/to/Qwen3.5-2B --out /tmp/b.json
+~/vllm-env/bin/python3 -m scripts.check_qwen35 spec /path/to/Qwen3.5-2B --draft /path/to/Qwen3.5-2B-Dflash --out /tmp/s.json
+~/vllm-env/bin/python3 -m scripts.check_qwen35 check /tmp/b.json /tmp/s.json --label spec-vs-base
 ```
+
+- **Qwen3.5 校验脚本两两配对须分进程跑**（WSL 上一进程显存回收延迟，同进程先后建双引擎会互挤 KV 预算；预算报错自带 used/peak/current 诊断数字）。`check` 子命令逐 prompt 报告首个分歧 token 位置与深度，判定口径见「Qwen3.5 + DFlash」节。
 
 - **2026-09 精简**：benchmark 仅保留 question.jsonl 串行基准（vllm bench serve 对齐口径不变：seed shuffle / chat template / warmup 首条 / 单墙钟）；`benchmark graph|prefix` 子命令与 `check_eagle3` / `check_prefix_cache` / `verify_corex.sh` / `verify_ascend310p.sh` 已删除——文中历史锚点（E=2.095、CoreX 五步清单等）出自已移除的脚本，口径描述仍有效。
 - **benchmark 内置 spec 接受统计 + `--no-think`（2026-09-08）**：`--spec-model` 时汇总打印 Acceptance length (E) / token 接受率 / 逐位置接受率——脚本侧 monkey-patch `spec_round`（每轮返回列表长度 = 接受数 m + 1 bonus，图/eager、冷/热四路统一从 `_readback_spec_commit` 出），预热后安装、仅计主跑；EOS/max_tokens 截断发生在 scheduler 层、图内 cnt 不感知，收尾轮轻微高估（CoreX 实测 2560 token 多计 5 个 ≈0.2%，可忽略）。check_eagle3 删除后 E 锚点复现职责由 benchmark 接管。`--no-think` = 对 chat template 显式传 `enable_thinking=False`（默认不传 kwargs，与 vllm bench 逐字节一致），表头打印 `thinking=` 状态便于对表。
@@ -133,6 +140,16 @@ Nano-vLLM：从零实现的极简 vLLM（研究/学习用代码库，非生产�
 - **已知限制**：prefix cache 命中的 prefill 会把 k/v 换成整池 4D 切片（attention 层 prefix-hit 分支），TND 算子不消费该形态——与 nanovllm-ascend 参考实现同款；310P 上前缀命中负载（如 check_prefix_cache 的 warm 轮）预期在此崩溃，需 paged-TND 适配后解锁，勿当回归报。同分支也命中 spec verify（block_tables 恒传）——spec 全路径被引擎层拒绝的根因即此（见能力矩阵）。
 - **待实机验证**（本机无法测）：`bash scripts/verify_ascend310p.sh <target> <draft>` 环境预检 + 四步（eager prefix 回归[R1 cold 判据，warm 轮预期命中已知限制] → decode 图捕获 → spec 拒绝守卫 → TPS sweep）；步骤 0 探测四个载荷算子（`_npu_reshape_and_cache`/`npu_fused_infer_attention_score_v2`/`npu_add_rms_norm`/`npu_swiglu`）与 pinned allocator。
 - 环境钉（vllm-ascend 口径）：torch-npu==2.10.0.post4 / CANN 9.1.0 / 310p 专用镜像。
+
+## Qwen3.5 + DFlash 适配（hybrid + 块草稿投机，分支 qwen35-dflash）
+
+- **架构事实（勿回退）**：Qwen3.5 = 24 层 hybrid（18×Gated DeltaNet 线性注意力 + 6×门控全注意力，`full_attention_interval=4`），text-only（视觉塔不加载，等价 vllm `--language-model-only`），text 形状在嵌套 `text_config`。GDN 纯 torch：分块 prefill（逐行移植 transformers `torch_chunk_gated_delta_rule` 语义）+ 向量化单步 decode；门控 `g=-exp(A_log)·softplus(a+dt_bias)`、`beta=sigmoid(b)`、q/k 逐头 L2、RMSNormGated(norm_before_gate)。rope = NeoX 半分式 partial 64/256（`mrope_interleaved` 只影响多模态 T/H/W 行混合，text-only 退化为标准 rotary）；**Gemma 式 RMSNorm（weight+1）仅 Qwen3.5 主体**，DFlash draft 是标准 RMSNorm。门控注意力 q_proj 输出翻倍（q+gate 逐头），attn 输出 ×sigmoid(gate)——decode 路径 flash_attn 返回 `[n,1,H,D]`，**必须先归形 `[n,H,D]` 再过 gate**（阶段1 踩过广播膨胀坑）。权重：多模态壳 `model.language_model.` 前缀剥离 + `mtp.*`/`model.visual.*` 跳过（`Qwen3_5ForCausalLM.load_weights` 自带，引擎经 `hasattr(model,'load_weights')` 优先分发）。
+- **DFlash 口径事实（勿回退）**：draft 5 层标准 qwen3 注意力（**非因果**），checkpoint 无 embed/lm_head（共享 target）。每轮 = 上下文追加 → 块草稿 → verify → 最长前缀接受+bonus（commit_buf 契约与 EAGLE 一致）。aux 层 = draft config `target_layer_ids` [1,6,11,16,21]，语义 = **0-based 层输出**（qwen3 的 EAGLE3 是层输入口径，两者不同）。**上下文追加 = verify 的 v_aux 行 0..m**（vllm `_prepare_dflash_inputs_kernel` 口径：行 0 = 上轮 bonus 的 aux，只在本轮 verify 行 0 能算出，漏掉会在 L-1 位留永久空洞；行 m+1 是被拒提案的错位特征——任务书初版「行 1..m+1」为 off-by-one，勿回退）。draft 上下文 KV 走稠密缓冲（[ms, mml, 5层, 2, 4头, 128] bf16，不进 block manager）；k = block_size-1 = 15 自动派生。
+- **GDN 状态 × spec（关键正确性）**：状态池 conv[ms×(k+2)+1 槽, 6144, 3] + ssm[同, 16, 128, 128] fp32（ms=4 ≈1.3GB）；verify 走 'row' 模式逐行落槽（行 j 终态 → 槽 base+j，base=批内序×(k+1)），行 0 读 carry 槽（上轮 base+m，读后写同槽安全）；非 spec decode/prefill 走 'final' 模式（行为与阶段1 逐字节一致）。图捕获的 row 模式用 host 常量段界（`gdn_row_bases`）绕开捕获期 tolist 同步。
+- **引擎门控（config hybrid 分支）**：强制关 prefix cache（GDN 状态不可 block hash 复用）；`max_num_batched_tokens` 封顶到 max_model_len（禁 chunked prefill + 把 warmup 峰值压到 1×mml——8GB 卡按 8×2048 批预留会把 KV 池挤到 0 块）；仅 cuda 后端 + TP=1；eagle3+hybrid 干净拒绝、qwen3 target 只接受 eagle3。
+- **位等判定口径（三阶段实测沉淀）**：串行 bs=1 temp0 期望全等或 bf16 平票翻转（分歧点 top-1/top-2 打平或差 1 ULP、top-8 其余逐位一致）；**并发/图 padding 的深位置翻转 = 批形状漂移**（eager bs=n vs 图 bs=桶 的 GEMM/attention 归约序差，AGENTS「数值确定性」条同款）——base-vs-base 独立重跑 5/5 确证 base 自身确定、翻转源自 spec/图路径的形状差，判豁免不判 bug。验收锚点数据：阶段1 transformers 位等 8/10（2 平票）；阶段2 spec-vs-base 9/12+3 豁免、E=2.502（raw prompt）/5.179（benchmark coding，与论文 AL 4.78@block16 量级互证）；阶段3 decode 图串行 12/12、spec 图串行 12/12+E 守恒（ΔE=0.000，收尾截断口径差 ≤0.003）、双路径捕获降级干净。
+- **显存现实（8GB 卡）**：spec 引擎 init 后 ~5.7GB（权重 4.0 + GDN 池 ~0.65 + draft ctx 0.04 + 杂项），KV 池仅剩百 MB 级——spec 图 ms=4 需 `mml=512 / util 0.99`，ms=8 不现实；无 spec 的 decode 图 ms=4/mml1024 可全桶捕获。
+- **已知遗留**：EAGLE 原版 `_spec_round_graph` 的 padding 复位 `vs[:, n:]` 轴序错位（v_slots 视图 (M,rows) 的 seq 维在轴 0，应为 `vs[n:, :]`）+ 「仅桶收缩复位」条件漏首扩窗口——并发（n<桶）场景 verify 行 KV 槽被清 -1 → 跳写 → NaN 零流；串行（n==桶）不受影响。DFlash 同位 bug 已在阶段3 修复（NaN 分层探针定位），EAGLE 侧按红线未动，**建议单独提交修复并补并发位等门**。
 
 ## 约定
 

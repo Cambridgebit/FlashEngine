@@ -5,6 +5,7 @@
 在上游已有的前缀缓存、张量并行、torch.compile 加速、分块预填充基础上，本项目新增：
 
 - **EAGLE3 投机解码**：小草稿模型先猜 k 个 token，主模型一次前向批量验证，一轮生成多个 token（原理见「架构」一节）。
+- **Qwen3.5 混合架构 + DFlash 块草稿投机**（分支 `qwen35-dflash`）：支持 Gated DeltaNet 线性注意力与门控全注意力混合的 Qwen3.5（纯 torch GDN 实现），DFlash 草稿模型单次非因果前向并行起草整块 16 token，主模型一次验证。
 - **CUDA Graph 加速**：解码一步录一张图、投机解码一整轮录一张图；录制失败自动退回逐算子执行，只降速、不影响功能。
 - **多硬件后端**：NVIDIA CUDA 与天数智芯 CoreX 均已实机验证，华为 Ascend 310P 代码就绪、待实机验证。
 - **OpenAI 兼容服务**：流式输出 + 连续批处理，纯 Python 标准库实现，零新增依赖。
@@ -66,7 +67,9 @@ nanovllm/
 │   └── model_runner.py     # 执行总指挥：组装输入、调用模型、管理 CUDA Graph 与投机流程
 ├── models/
 │   ├── qwen3.py            # Qwen3 主模型
-│   └── eagle3.py           # EAGLE3 草稿模型
+│   ├── qwen3_5.py          # Qwen3.5 混合架构主模型（GDN + 门控注意力）
+│   ├── eagle3.py           # EAGLE3 草稿模型
+│   └── dflash.py           # DFlash 块草稿模型
 ├── layers/                 # 基础算子：attention / linear / embedding / 归一化 / RoPE / 采样器
 ├── backends/               # 硬件后端：cuda / corex / ascend 三套实现
 └── utils/                  # 工具：全局上下文、权重加载
