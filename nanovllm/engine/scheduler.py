@@ -3,6 +3,7 @@ from collections import deque
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
+from nanovllm.backends import get_backend
 
 
 class Scheduler:
@@ -25,7 +26,11 @@ class Scheduler:
         # 的包装；回调解耦——scheduler 不持有 model_runner 引用。qwen3 路径恒
         # None，preempt 零开销直通）。
         self.on_preempt = None
-        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size,
+        num_blocks = config.num_kvcache_blocks
+        if get_backend().reserve_dummy_kv_block():
+            assert num_blocks > 1, "310P dummy KV block requires num_kvcache_blocks > 1"
+            num_blocks -= 1
+        self.block_manager = BlockManager(num_blocks, config.kvcache_block_size,
                                           config.enable_prefix_cache)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()

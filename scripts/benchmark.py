@@ -56,7 +56,7 @@ def load_questions(path, category, num, seed):
                 continue
             qs.append(d["turns"][0])
     if not qs:
-        raise SystemExit(f"问题集为空: {path}（category={category}）")
+        raise SystemExit(f"No prompts found in {path} (category={category}).")
     if seed >= 0:
         random.seed(seed)
         random.shuffle(qs)
@@ -87,46 +87,40 @@ def run_seqs(llm, seqs):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="spec_bench question.jsonl 串行 TPS/TTFT 基准（vllm bench serve 口径）")
+        description="Serial TPS/TTFT benchmark compatible with vllm bench serve.")
     parser.add_argument("model")
     parser.add_argument("--questions",
                         default=os.path.join("..", "question.jsonl"),
-                        help="question.jsonl 路径（默认仓库上级目录的 spec_bench question.jsonl）")
+                        help="Path to question.jsonl (default: ../question.jsonl).")
     parser.add_argument("--category", default="coding",
-                        help="spec_bench 类别过滤（默认 coding；all 不过滤；文件无 category 字段时不过滤）")
+                        help="SpecBench category filter; use 'all' to disable filtering.")
     parser.add_argument("--num-prompts", type=int, default=10)
     parser.add_argument("--num-repeats", type=int, default=1,
-                        help="每条 prompt 连续重复次数（>1 构成重复请求负载：第 2..R 次"
-                             "全量命中前缀缓存；配合 --no-prefix-cache 做 TTFT A/B）")
+                        help="Consecutive runs per prompt; repeats can hit the prefix cache.")
     parser.add_argument("--no-prefix-cache", action="store_true",
-                        help="关闭前缀缓存（enable_prefix_cache=False，引擎跳过 block hash"
-                             "与命中查找），用于 TTFT/吞吐 A/B 对照")
+                        help="Disable prefix caching and block-hash lookup for A/B testing.")
     parser.add_argument("--max-tokens", type=int, default=256,
-                        help="每条输出上限（对齐 vllm spec_bench 默认 output_len=256；EOS 即停）")
+                        help="Maximum output tokens per request; EOS may stop generation earlier.")
     parser.add_argument("--seed", type=int, default=0,
-                        help="数据集 shuffle 种子（对齐 vllm bench --seed 默认 0：同 seed 即同 "
-                             "prompt 集；-1=不 shuffle，文件序前 N 条历史口径）")
+                        help="Dataset shuffle seed; -1 preserves file order.")
     parser.add_argument("--warmup", type=int, default=5,
-                        help="预热次数（不计指标；对齐 vllm --num-warmups，统一打首条 prompt）")
-    parser.add_argument("--spec-model", default="", help="EAGLE3 draft 目录（给出即启用投机）")
+                        help="Warmup iterations excluded from benchmark metrics.")
+    parser.add_argument("--spec-model", default="", help="Draft model directory; enables speculative decoding.")
     parser.add_argument("--spec-num-tokens", type=int, default=3)
     parser.add_argument("--no-think", action="store_true",
-                        help="chat template 显式 enable_thinking=False（Qwen3 模板插入空 "
-                             "<think></think>，直答；默认不传 kwargs=vllm bench 对齐口径，"
-                             "thinking 默认开启）。用于对齐 V1.8/历史 E 锚点做单变量对照")
+                        help="Pass enable_thinking=False to the chat template.")
     parser.add_argument("--backend", default="auto", choices=["auto", "cuda", "corex", "ascend310p"])
-    parser.add_argument("--eager", action="store_true", help="关闭 CUDA Graph")
+    parser.add_argument("--eager", action="store_true", help="Disable graph capture and use eager mode.")
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--max-num-seqs", type=int, default=8)
     parser.add_argument("--block-size", type=int, default=256)
     parser.add_argument("--gpu-mem-util", type=float, default=0.9,
-                        help="gpu_memory_utilization（默认 0.9；空板卡 KV 贴地需给图/运行峰值留余量时可调低）")
+                        help="Device-memory utilization reserved for model and KV cache.")
     args = parser.parse_args()
 
     qs = load_questions(args.questions, args.category, args.num_prompts, args.seed)
     thinking = "off" if args.no_think else "on(default)"
-    pcache = "off" if args.no_prefix_cache else "on"
 
     kwargs = dict(enforce_eager=args.eager, tensor_parallel_size=1, backend=args.backend,
                   max_model_len=args.max_model_len, max_num_seqs=args.max_num_seqs,
@@ -136,15 +130,18 @@ def main():
     if args.spec_model:
         kwargs.update(spec_model=args.spec_model, spec_num_tokens=args.spec_num_tokens)
     llm = LLM(args.model, **kwargs)
+    pcache = "on" if llm.model_runner.config.enable_prefix_cache else "off"
     # 表头在引擎构造后打印：k 取引擎实际生效值（dflash 按 draft config block_size-1
     # 自动派生，CLI 默认 3 会被覆盖——在派生前打印会显示错误的 k）。
     spec = f"spec(k={llm.model_runner.config.spec_num_tokens})" if args.spec_model else "decode"
     print(f"prompts: {len(qs)} (category={args.category}, seed={args.seed}) "
           f"x repeats={args.num_repeats} | mode={spec} | prefix_cache={pcache} | "
           f"max_tokens={args.max_tokens} | temp={TEMPERATURE} | thinking={thinking} | "
-          f"口径=vllm bench serve 对齐\n",
+          f"protocol=vllm-bench-serve-compatible\n",
           flush=True)
 
+    graph_stats = None
+    spec_graph_stats = None
     try:
         sp = SamplingParams(temperature=TEMPERATURE, max_tokens=args.max_tokens)
 
@@ -164,6 +161,14 @@ def main():
         # prompt（shuffle 后的 qs[0]）。
         for _ in range(args.warmup):
             run_seqs(llm, [Sequence(chat(qs[0]), sp)])
+
+        # Report graph activity for the measured window only. Keep capture
+        # success/failure counters, but exclude engine and benchmark warmups.
+        graph_runner = getattr(llm.model_runner, "graph_runner", None)
+        if graph_runner is not None and hasattr(graph_runner, "reset_runtime_stats"):
+            graph_runner.reset_runtime_stats()
+        if args.spec_model and hasattr(llm.model_runner, "reset_spec_graph_runtime_stats"):
+            llm.model_runner.reset_spec_graph_runtime_stats()
 
         # 投机解码接受率统计（对齐历史 check_eagle3 的 monkey-patch spec_round 口径，
         # 引擎零改动）：spec_round 每轮返回各 seq 的提交 token 列表，长度 = 接受
@@ -210,15 +215,53 @@ def main():
                 print(f"#{i:>3}  rep={rep}  tok={n:>4}  TTFT={ttft * 1000:>7.1f}ms  "
                       f"wall={wall:>6.2f}s", flush=True)
         bench_wall = time.perf_counter() - t_bench
+        graph_runner = getattr(llm.model_runner, "graph_runner", None)
+        if graph_runner is not None and hasattr(graph_runner, "get_stats"):
+            graph_stats = graph_runner.get_stats()
+        if args.spec_model and hasattr(llm.model_runner, "get_spec_graph_stats"):
+            spec_graph_stats = llm.model_runner.get_spec_graph_stats()
     finally:
         llm.exit()
 
     total_tok = sum(r[0] for r in rows)
+    request_wall = sum(r[2] for r in rows)
+    decode_tok = sum(max(r[0] - 1, 0) for r in rows)
+    decode_wall = sum(max(r[2] - r[1], 0.0) for r in rows)
+    host_overhead = max(bench_wall - request_wall, 0.0)
     ttfts = sorted(r[1] for r in rows)
     print(f"\n==== bench (n={len(rows)}) ====")
     print(f"Benchmark duration = {bench_wall:.2f} s   "
           f"Total generated tokens = {total_tok}")
     print(f"Output token throughput = {total_tok / bench_wall if bench_wall else 0.0:.1f} tok/s")
+    print(
+        "Request-wall throughput = "
+        f"{total_tok / request_wall if request_wall else 0.0:.1f} tok/s   "
+        f"Benchmark host overhead = {host_overhead:.3f} s"
+    )
+    print(
+        "Steady-state decode throughput = "
+        f"{decode_tok / decode_wall if decode_wall else 0.0:.1f} tok/s   "
+        f"({decode_tok} tokens / {decode_wall:.2f} s after first-token latency)"
+    )
+    if graph_stats is not None:
+        print(
+            "NPUGraph runtime = "
+            f"captures_ok={graph_stats['capture_success']}, "
+            f"captures_failed={graph_stats['capture_failure']}, "
+            f"replays={graph_stats['replay']}, "
+            f"fallbacks={graph_stats['fallback']}, "
+            f"bucket_hits={graph_stats['bucket_hits']}"
+        )
+    if spec_graph_stats is not None:
+        print(
+            "Spec graph runtime = "
+            f"captures_ok={spec_graph_stats['capture_success']}, "
+            f"captures_failed={spec_graph_stats['capture_failure']}, "
+            f"replays={spec_graph_stats['replay']}, "
+            f"eager_rounds={spec_graph_stats['eager_rounds']}, "
+            f"sampling_fallbacks={spec_graph_stats['sampling_fallbacks']}, "
+            f"bucket_hits={spec_graph_stats['bucket_hits']}"
+        )
     print(f"TTFT avg = {sum(ttfts) / len(ttfts) * 1000:.1f} ms   "
           f"median = {ttfts[len(ttfts) // 2] * 1000:.1f} ms")
     if args.num_repeats > 1:
@@ -234,7 +277,7 @@ def main():
         if warm:
             print(f"TTFT warm (rep>0, n={len(warm)}) = {sum(warm) / len(warm) * 1000:.1f} ms")
     pstats = llm.scheduler.block_manager.get_prefix_stats()
-    print(f"Prefix cache = {'off' if args.no_prefix_cache else 'on'}  "
+    print(f"Prefix cache = {pcache}  "
           f"(requests={pstats['requests']}, prefix_hits={pstats['prefix_hits']}, "
           f"hit_rate={pstats['hit_rate']:.1%}, cached_blocks={pstats['cached_blocks']}, "
           f"new_blocks={pstats['new_blocks']})")

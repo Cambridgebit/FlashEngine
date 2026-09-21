@@ -19,12 +19,10 @@ GQA 16Q/4KV 头，head_dim 128，rope theta 1e7 全旋转，q_norm/k_norm 标准
    draft attention metadata causal=False）。
 2. 上下文 KV 注入式缓存：上下文 K/V 不是 embed 推理产物，而是由 target aux 隐层
    重投影而来——fc(concat aux) → hidden_norm → 每层各自 k_proj/v_proj → k_norm →
-   rope(真实位置) → 写入引擎分配的稠密缓冲 [slots, max_model_len, L, kv_heads,
-   head_dim]×2（对齐 vllm precompute_and_store_context_kv 的投影链；缓冲由引擎
-   注入占位属性 ctx_k_cache/ctx_v_cache，镜像 qwen3_5 conv_cache/ssm_cache 注入
-   模式，不进 block manager）。block 自身查询行的 K/V 仅本轮 transient——被拒
-   提案不入上下文，下轮上下文一律由 aux 重投影覆盖（vllm 同语义：查询槽位在
-   下轮被上下文槽位覆写）。
+   rope(真实位置) → 写入草稿缓存。CUDA/CoreX 使用按序列分配的稠密缓冲；310P
+   使用每层独立的 FRACTAL_NZ paged KV，复用 target block-table/slot 编号并通过
+   非因果 SplitFuse 读取。block 查询槽在下一轮由已提交行的 aux 重投影覆盖，
+   因此被拒提案不会进入有效上下文。
 
 forward_block 形状流转（n=批内序列数，rows=k+1=1 anchor + k mask 查询行）：
   embeds [n, rows, h]（行 0 = anchor = 最后已提交 token 的 target embed；
@@ -48,6 +46,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
+from nanovllm.backends import get_backend
 from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import ReplicatedLinear, QKVParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
@@ -58,9 +57,8 @@ from nanovllm.utils.loader import default_weight_loader
 class DFlashBlockAttention(nn.Module):
     """block 草稿注意力：非因果、上下文 KV 注入。
 
-    与 qwen3.Qwen3Attention 的差异：不落 paged KV cache（上下文 KV 由引擎重投影
-    注入稠密缓冲；自身 KV 仅本轮 transient），无 causal mask，无 paged backend
-    分发——纯 torch sdpa（规模小：rows ≤ 16，max_ctx ≤ max_model_len）。
+    CUDA/CoreX 保留稠密上下文 + torch SDPA；310P 将投影上下文与查询 K/V 写入
+    私有分页 NZ 缓存，并用一次非因果 SplitFuse 计算整个查询块。
     """
 
     def __init__(self, config, rotary_emb) -> None:
@@ -76,6 +74,7 @@ class DFlashBlockAttention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
+        self.backend = get_backend()
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
             self.head_dim,
@@ -94,6 +93,9 @@ class DFlashBlockAttention(nn.Module):
         # 标准 RMSNorm（draft model_type=qwen3，非 target 的 Gemma 式 +1 口径）
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        # 310P DFlash uses a private paged FRACTAL_NZ cache per draft layer.
+        # Other backends leave these empty and retain the dense-SDPA path.
+        self.k_cache = self.v_cache = torch.tensor([])
 
     def forward(
         self,
@@ -104,6 +106,10 @@ class DFlashBlockAttention(nn.Module):
         k_ctx: torch.Tensor,              # [n, max_ctx, kvh, hd]
         v_ctx: torch.Tensor,
         mask: torch.Tensor,               # [n, 1, rows, max_ctx+rows] bool
+        query_slots: torch.Tensor | None = None,
+        block_tables: torch.Tensor | None = None,
+        context_lens: torch.Tensor | None = None,
+        max_seq_len: int | None = None,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
         q = qkv[..., :self.q_size].view(n, rows, self.num_heads, self.head_dim)
@@ -117,6 +123,26 @@ class DFlashBlockAttention(nn.Module):
             q.reshape(n * rows, self.num_heads, self.head_dim),
             k.reshape(n * rows, self.num_kv_heads, self.head_dim),
         )
+        if (query_slots is not None
+                and getattr(self.backend, "supports_dflash_paged", False)
+                and self.k_cache.numel() and self.v_cache.numel()):
+            q_flat = q.reshape(n * rows, self.num_heads, self.head_dim)
+            k_flat = k.reshape(n * rows, self.num_kv_heads, self.head_dim)
+            v_flat = v.reshape(n * rows, self.num_kv_heads, self.head_dim)
+            self.backend.store_kvcache(
+                k_flat, v_flat, self.k_cache, self.v_cache, query_slots
+            )
+            o = self.backend.dflash_paged_attention(
+                q_flat,
+                self.k_cache,
+                self.v_cache,
+                block_tables,
+                context_lens,
+                rows,
+                self.scaling,
+                max_seq_len,
+            )
+            return self.o_proj(o.reshape(n * rows, self.q_size))
         q = q.view(n, rows, self.num_heads, self.head_dim).transpose(1, 2)      # [n, H, rows, hd]
         k = k.view(n, rows, self.num_kv_heads, self.head_dim).transpose(1, 2)   # [n, kvh, rows, hd]
         v = v.transpose(1, 2)
@@ -144,13 +170,21 @@ class DFlashDecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(self, hidden_states, residual, positions, n, rows, k_ctx, v_ctx, mask):
+    def forward(self, hidden_states, residual, positions, n, rows, k_ctx, v_ctx, mask,
+                query_slots=None, block_tables=None, context_lens=None,
+                max_seq_len=None):
         # 与 qwen3.Qwen3DecoderLayer 同构（延迟残差 + 融合 add_rms_norm）
         if residual is None:
             hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(hidden_states, n, rows, positions, k_ctx, v_ctx, mask)
+        hidden_states = self.self_attn(
+            hidden_states, n, rows, positions, k_ctx, v_ctx, mask,
+            query_slots=query_slots,
+            block_tables=block_tables,
+            context_lens=context_lens,
+            max_seq_len=max_seq_len,
+        )
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
@@ -165,7 +199,10 @@ class DFlashDraftModel(nn.Module):
         super().__init__()
         hidden_size = config.hidden_size
         dfc = getattr(config, "dflash_config", None) or {}
-        assert dfc, "DFlash draft config 缺少 dflash_config（block_size/mask_token_id/target_layer_ids）"
+        assert dfc, (
+            "DFlash draft config is missing dflash_config "
+            "(block_size/mask_token_id/target_layer_ids)."
+        )
         self.target_layer_ids = tuple(dfc["target_layer_ids"])
         self.mask_token_id = int(dfc["mask_token_id"])
         # embedding / lm_head 与 target 共享（checkpoint 无此权重；dflash 无独立
@@ -188,6 +225,8 @@ class DFlashDraftModel(nn.Module):
             [DFlashDecoderLayer(config, self.rotary_emb) for _ in range(config.num_hidden_layers)]
         )
         self.norm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
+        self.backend = get_backend()
+        self.use_paged_kv = bool(getattr(self.backend, "supports_dflash_paged", False))
         # 上下文 KV 稠密缓冲占位（引擎注入真实缓冲，镜像 qwen3_5 conv_cache/ssm_cache）
         self.ctx_k_cache = torch.tensor([])
         self.ctx_v_cache = torch.tensor([])
@@ -200,7 +239,9 @@ class DFlashDraftModel(nn.Module):
         # 各层注意力形状一致（融合 GEMM 的前提，vllm 同款校验）
         for a in attns[1:]:
             assert (a.kv_size == a0.kv_size and a.head_dim == a0.head_dim
-                    and a.num_kv_heads == a0.num_kv_heads), "各层注意力形状须一致"
+                    and a.num_kv_heads == a0.num_kv_heads), (
+                        "All DFlash attention layers must use identical shapes."
+                    )
         # qkv_proj.weight 行序 [q | k | v]，取 k|v 段逐层拼接 → [L*2*kv, hidden]
         self._fused_kv_weight = torch.cat(
             [a.qkv_proj.weight[a.q_size:] for a in attns], dim=0).contiguous()
@@ -239,13 +280,26 @@ class DFlashDraftModel(nn.Module):
             k_lid = self.layers[lid].self_attn.k_norm(k_lid)
             # rope 只作用于 k（q/v 不参与上下文注入）；同张量传入 q/k 位取 k 输出
             k_lid, _ = self.rotary_emb(positions, k_lid, k_lid)
-            # 高级索引写：[slots[t], positions[t]] 各行互异（同序列位置不重、槽不共）
-            self.ctx_k_cache[slots, positions, lid] = k_lid.reshape(T, self._num_kv_heads, hd)
-            self.ctx_v_cache[slots, positions, lid] = v_all[:, lid]
+            if self.use_paged_kv:
+                attn = self.layers[lid].self_attn
+                self.backend.store_kvcache(
+                    k_lid.reshape(T, self._num_kv_heads, hd),
+                    v_all[:, lid],
+                    attn.k_cache,
+                    attn.v_cache,
+                    slots,
+                )
+            else:
+                # 高级索引写：[slots[t], positions[t]] 各行互异（同序列位置不重、槽不共）
+                self.ctx_k_cache[slots, positions, lid] = k_lid.reshape(T, self._num_kv_heads, hd)
+                self.ctx_v_cache[slots, positions, lid] = v_all[:, lid]
 
     def forward_block(self, last_token_ids: torch.Tensor, positions: torch.Tensor,
                       ctx_slots: torch.Tensor, ctx_lens: torch.Tensor,
-                      max_ctx: int, rows: int) -> torch.Tensor:
+                      max_ctx: int, rows: int,
+                      query_slots: torch.Tensor | None = None,
+                      block_tables: torch.Tensor | None = None,
+                      total_lens: torch.Tensor | None = None) -> torch.Tensor:
         """block 草稿前向（形状流转见模块 docstring）。
 
         last_token_ids [n]（anchor = 最后已提交 token）；positions [n, rows] =
@@ -264,24 +318,35 @@ class DFlashDraftModel(nn.Module):
         pos_flat = positions.reshape(-1)
         # 上下文 gather（右 padding 至 max_ctx；padding 行由 -inf mask 屏蔽。缓冲
         # 零初始化保证未写行为有限值，掩码后 0 权重 × 有限 v 无 NaN 传播）
-        k_all = self.ctx_k_cache[ctx_slots, :max_ctx]   # [n, max_ctx, L, kvh, hd]
-        v_all = self.ctx_v_cache[ctx_slots, :max_ctx]
-        # 非因果 mask：上下文段 j < ctx_len_i 可见，自身段（后 rows 列）全可见
-        ar = torch.arange(max_ctx, device=flat.device)
-        ctx_ok = ar[None, :] < ctx_lens[:, None]        # [n, max_ctx]
-        mask = torch.cat(
-            [ctx_ok[:, None, None, :].expand(n, 1, rows, max_ctx),
-             torch.ones(n, 1, rows, rows, dtype=torch.bool, device=flat.device)],
-            dim=-1)                                     # [n, 1, rows, max_ctx+rows]
+        if self.use_paged_kv:
+            assert query_slots is not None and block_tables is not None and total_lens is not None
+            k_all = v_all = mask = None
+        else:
+            k_all = self.ctx_k_cache[ctx_slots, :max_ctx]   # [n, max_ctx, L, kvh, hd]
+            v_all = self.ctx_v_cache[ctx_slots, :max_ctx]
+            # 非因果 mask：上下文段 j < ctx_len_i 可见，自身段（后 rows 列）全可见
+            ar = torch.arange(max_ctx, device=flat.device)
+            ctx_ok = ar[None, :] < ctx_lens[:, None]        # [n, max_ctx]
+            mask = torch.cat(
+                [ctx_ok[:, None, None, :].expand(n, 1, rows, max_ctx),
+                 torch.ones(n, 1, rows, rows, dtype=torch.bool, device=flat.device)],
+                dim=-1)                                     # [n, 1, rows, max_ctx+rows]
         residual = None
         hidden = flat
         for lid, layer in enumerate(self.layers):
             hidden, residual = layer(hidden, residual, pos_flat, n, rows,
-                                     k_all[:, :, lid], v_all[:, :, lid], mask)
+                                     None if k_all is None else k_all[:, :, lid],
+                                     None if v_all is None else v_all[:, :, lid], mask,
+                                     query_slots=query_slots,
+                                     block_tables=block_tables,
+                                     context_lens=total_lens,
+                                     max_seq_len=max_ctx)
         hidden, _ = self.norm(hidden, residual)
         # 行 0 = anchor 丢弃（z-lab：anchor 只作条件），行 1..k 过 target lm_head
         h = hidden.view(n, rows, -1)[:, 1:].reshape(n * k, -1)
-        return F.linear(h, self.lm_head_weight)         # [n*k, vocab]
+        return F.linear(
+            h, getattr(self, "lm_head_weight_nz", self.lm_head_weight)
+        )                                               # [n*k, vocab]
 
 
 def load_dflash_draft(model: DFlashDraftModel, path: str) -> None:
@@ -301,7 +366,7 @@ def load_dflash_draft(model: DFlashDraftModel, path: str) -> None:
     else:
         from safetensors import safe_open
         files = glob(os.path.join(path, "*.safetensors"))
-        assert files, f"DFlash draft 目录缺少权重文件: {path}"
+        assert files, f"No DFlash draft weight files found in {path}."
 
         def items():
             for file in files:

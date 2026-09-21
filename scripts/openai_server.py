@@ -841,27 +841,23 @@ def main():
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--api-key", default=None)
     parser.add_argument("--eager", action="store_true",
-                        help="enforce_eager=True（跳过 CUDA Graph capture，启动更快）")
+                        help="Set enforce_eager=True and skip graph capture.")
     parser.add_argument("--compile", action="store_true",
-                        help="torch.compile 编译模型（CoreX 上约 8% prefill 提速）")
+                        help="Compile supported model regions with torch.compile.")
     parser.add_argument("--backend", default="auto", choices=["auto", "cuda", "corex", "ascend310p"])
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--max-num-seqs", type=int, default=None)
     parser.add_argument("--block-size", type=int, default=None,
-                        help="KV block size（2 的幂，越小 prefix cache 粒度越细，需 CoreX kernel 支持）")
+                        help="KV-cache block size; must be supported by the selected backend.")
     parser.add_argument("--spec-model", default="",
-                        help="EAGLE3 draft 模型目录（启用投机解码，需与 target 同词表的官方权重）")
+                        help="Draft model directory; enables speculative decoding.")
     parser.add_argument("--spec-num-tokens", type=int, default=4,
-                        help="每轮起草 token 数 k（draft depth）")
+                        help="Number of draft tokens per speculative round.")
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--no-think", action="store_true",
-                        help="chat template 显式 enable_thinking=False（关闭 thinking，"
-                             "对齐 benchmark --no-think 的历史 E 锚点口径；默认交给模板"
-                             "=thinking on）。每请求可用 chat_template_kwargs.enable_thinking 覆盖")
+                        help="Pass enable_thinking=False to the chat template by default.")
     parser.add_argument("--reserve-output", type=int, default=512,
-                        help="上下文淘汰时为客户未指定 max_tokens 的请求预留的输出 token 数"
-                             "（默认 512）：prompt（system+历史+最新）超出 max_model_len 减去"
-                             "该值后，从最旧历史起逐条淘汰")
+                        help="Output-token reserve used during context eviction.")
     # KV 池按 (total*util - used) 贴地分配；空板卡（无桌面占用）需调低 util
     # 给图捕获/运行峰值留余量（32GB CoreX 卡贴地后仅剩 ~112MB，spec 图捕获必 OOM 降级）。
     parser.add_argument("--gpu-mem-util", type=float, default=0.9)
@@ -892,7 +888,6 @@ def main():
     if args.block_size is not None:
         kwargs["kvcache_block_size"] = args.block_size
 
-    print(f"loading model {args.model} ...", flush=True)
     engine = LLM(**kwargs)
     _tokenizer = engine.tokenizer
     _eos = engine.scheduler.eos
@@ -900,12 +895,6 @@ def main():
     _model_name = args.model.rstrip("/").rsplit("/", 1)[-1]
     _install_schedule_hook()
     _install_spec_stats()
-    spec_info = f"ON(k={args.spec_num_tokens}, {args.spec_model.rstrip('/').rsplit('/', 1)[-1]})" \
-        if args.spec_model else "OFF"
-    print(f"model '{_model_name}' ready | eos={_eos} | eager={args.eager} | spec={spec_info} | "
-          f"max_model_len={_max_model_len} | max_num_seqs={kwargs['max_num_seqs']} | "
-          f"thinking={'off' if args.no_think else 'on'}", flush=True)
-
     threading.Thread(target=_engine_loop, daemon=True).start()
     threading.Thread(target=_tps_loop, daemon=True).start()
 

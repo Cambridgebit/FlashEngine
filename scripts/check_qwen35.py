@@ -102,7 +102,7 @@ def cmd_check(args):
         a = json.load(f)
     with open(args.b) as f:
         b = json.load(f)
-    assert a["prompts"] == b["prompts"], "两次运行的 prompt 集不一致（--max-tokens/数据改动？）"
+    assert a["prompts"] == b["prompts"], "Prompt sets differ between the two runs."
     # 统一成生成段：ref 存全序列（prompt+gen），引擎侧存生成段
     def gen_side(d, i):
         if "full_ids" in d:
@@ -117,9 +117,9 @@ def cmd_check(args):
             print(f"[OK   {i}] {len(ga)} tok")
             continue
         first = next((j for j, (x, y) in enumerate(zip(ga, gb)) if x != y), min(len(ga), len(gb)))
-        depth = f"{first / max(len(ga), 1):.0%}" if len(ga) == len(gb) else "长度不同!"
-        print(f"[DIFF {i}] first@{first}/{len(ga)}（深度 {depth}） lens={len(ga)}/{len(gb)}")
-    print(f"{args.label}: {n_ok}/{len(a['prompts'])} 位等")
+        depth = f"{first / max(len(ga), 1):.0%}" if len(ga) == len(gb) else "length-mismatch"
+        print(f"[DIFF {i}] first@{first}/{len(ga)} depth={depth} lens={len(ga)}/{len(gb)}")
+    print(f"{args.label}: {n_ok}/{len(a['prompts'])} token-exact matches")
 
 
 def main():
@@ -128,23 +128,23 @@ def main():
 
     def common(p, need_model=True):
         if need_model:
-            p.add_argument("model", help="Qwen3.5 本地模型目录")
-        p.add_argument("--out", default=".omo/check_out.json", help="输出 json 路径")
+            p.add_argument("model", help="Local Qwen3.5 model directory")
+        p.add_argument("--out", default=".omo/check_out.json", help="Output JSON path")
         p.add_argument("--max-tokens", type=int, default=64)
         p.add_argument("--max-model-len", type=int, default=2048)
         p.add_argument("--max-num-seqs", type=int, default=2)
         p.add_argument("--gpu-mem-util", type=float, default=0.95)
-        p.add_argument("--graph", action="store_true", help="开 CUDA 图（默认 enforce_eager）")
-        p.add_argument("--kind", default="", help="json 标记（自动填子命令名）")
+        p.add_argument("--graph", action="store_true", help="Enable graph mode; eager is the default")
+        p.add_argument("--kind", default="", help="JSON label; defaults to the subcommand name")
 
-    common(sub.add_parser("ref", help="transformers 参考输出 → json"))
-    common(sub.add_parser("base", help="本引擎 base 跑一遍 → json"))
-    p_spec = sub.add_parser("spec", help="本引擎 spec（DFlash）跑一遍 → json")
+    common(sub.add_parser("ref", help="Save transformers reference outputs to JSON"))
+    common(sub.add_parser("base", help="Save base-engine outputs to JSON"))
+    p_spec = sub.add_parser("spec", help="Save DFlash speculative outputs to JSON")
     common(p_spec)
-    p_spec.add_argument("--draft", required=True, help="DFlash draft 模型目录")
-    p_ck = sub.add_parser("check", help="对比两份 json")
-    p_ck.add_argument("a", help="json A（如 ref 或 base）")
-    p_ck.add_argument("b", help="json B（如 base 或 spec）")
+    p_spec.add_argument("--draft", required=True, help="DFlash draft model directory")
+    p_ck = sub.add_parser("check", help="Compare two JSON result files")
+    p_ck.add_argument("a", help="JSON A, such as ref or base")
+    p_ck.add_argument("b", help="JSON B, such as base or spec")
     p_ck.add_argument("--label", default="PARITY")
 
     args = ap.parse_args()

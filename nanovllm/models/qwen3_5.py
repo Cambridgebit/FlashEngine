@@ -205,7 +205,9 @@ class Qwen3_5Attention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
         self.attn_output_gate = getattr(config, "attn_output_gate", True)
-        assert self.attn_output_gate, "Qwen3.5 全注意力层为门控注意力（attn_output_gate=true）"
+        assert self.attn_output_gate, (
+            "Qwen3.5 full-attention layers require attn_output_gate=true."
+        )
 
         # q 输出翻倍含 gate：QKVParallelLinear 的「总头数」按 total×(1+gate) 传
         self.qkv_proj = QKVParallelLinear(
@@ -299,7 +301,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.conv_dim = self.key_dim * 2 + self.value_dim
         self.conv_kernel_size = config.linear_conv_kernel_dim
         self.activation = config.hidden_act
-        assert self.activation in ("silu", "swish"), f"不支持的 conv 激活 {self.activation}"
+        assert self.activation in ("silu", "swish"), (
+            f"Unsupported convolution activation: {self.activation}"
+        )
         self.rms_norm_eps = config.rms_norm_eps
         # GQA 展开（transformers L500-502；Qwen3.5-2B 为 16/16=1，即无展开）
         self.gqa_ratio = self.total_num_v_heads // self.total_num_k_heads
@@ -386,16 +390,18 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             # （省 tolist host 同步——捕获期禁止 D2H），此时不要求 gdn_state_slots。
             assert ctx.gdn_carry_slots is not None and (
                 ctx.gdn_state_slots is not None or ctx.gdn_row_bases is not None), (
-                "'row' 模式需注入 context.gdn_carry_slots（行 0 读槽）与 "
-                "context.gdn_state_slots（eager 写基址）或 gdn_row_bases（图捕获 "
-                "host 静态写基址）之一")
+                "GDN row mode requires context.gdn_carry_slots plus either "
+                "context.gdn_state_slots or context.gdn_row_bases."
+            )
             core = self._forward_rows(mixed_qkv, b, a, ctx)
         else:
             # GDN 状态槽元数据由引擎注入 context（阶段 1b 契约字段）
             slots = ctx.gdn_state_slots
             has_initial = ctx.gdn_has_initial
             assert slots is not None and has_initial is not None, (
-                "引擎未注入 GDN 状态槽元数据（context.gdn_state_slots / gdn_has_initial，阶段 1b 契约）")
+                "Missing GDN state-slot metadata: context.gdn_state_slots and "
+                "context.gdn_has_initial are required."
+            )
             if ctx.is_prefill:
                 core = self._forward_prefill(mixed_qkv, b, a, slots, has_initial, ctx)
             else:
@@ -618,7 +624,7 @@ class Qwen3_5DecoderLayer(nn.Module):
         elif layer_type == "full_attention":
             self.self_attn = Qwen3_5Attention(config)
         else:
-            raise ValueError(f"无效 layer_type: {layer_type}")
+            raise ValueError(f"Invalid layer_type: {layer_type}")
         # MLP 与 Qwen3 dense 同构（gate/up 6144 + silu），直接复用
         self.mlp = Qwen3MLP(config.hidden_size, config.intermediate_size, config.hidden_act)
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)

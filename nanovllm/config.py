@@ -74,7 +74,11 @@ class Config:
             # 1) 强制关闭前缀缓存：GDN 状态随序列连续推进，无法按 block hash 复用，
             #    保留开关只会白付每步 hash 开销。
             if self.enable_prefix_cache:
-                print('[nano-vllm] hybrid 模型（Qwen3.5）强制关闭前缀缓存：GDN 状态不支持 block 级复用', flush=True)
+                print(
+                    "[nano-vllm] Prefix caching is disabled for Qwen3.5 hybrid "
+                    "models because GDN states cannot be reused by block hash.",
+                    flush=True,
+                )
                 self.enable_prefix_cache = False
             # 2) 禁 chunked prefill：GDN 状态只能整段一次推进（分段 prefill 需要
             #    中间态落池/回填，阶段1 不做）。做法：prefill 批预算封顶到
@@ -85,26 +89,32 @@ class Config:
             #    5029 MiB vs current 4131 MiB，碎片 ~1GB）。调度器「仅首序列可
             #    切分」分支在 mnbt >= mml 下不可达（核实注释见 scheduler.schedule）。
             if self.max_num_batched_tokens > self.max_model_len:
-                print(f'[nano-vllm] hybrid 模型（Qwen3.5）prefill 批预算 '
-                      f'max_num_batched_tokens {self.max_num_batched_tokens} -> {self.max_model_len}'
-                      '（禁 chunked prefill，单步至多一条满长序列，同时压低 GDN 前向峰值）', flush=True)
+                print(
+                    "[nano-vllm] Qwen3.5 hybrid prefill budget adjusted: "
+                    f"max_num_batched_tokens {self.max_num_batched_tokens} -> "
+                    f"{self.max_model_len}. Chunked prefill is disabled for GDN state safety.",
+                    flush=True,
+                )
                 self.max_num_batched_tokens = self.max_model_len
             assert self.max_num_batched_tokens >= self.max_model_len, (
-                f'hybrid 模型（Qwen3.5）禁用 chunked prefill：max_num_batched_tokens'
-                f'({self.max_num_batched_tokens}) 必须 >= max_model_len({self.max_model_len})')
+                "Qwen3.5 hybrid models disable chunked prefill: "
+                f"max_num_batched_tokens ({self.max_num_batched_tokens}) must be >= "
+                f"max_model_len ({self.max_model_len})."
+            )
             # 3) 仅 CUDA 后端：GDN 走纯 torch 实现，但状态池/图/spec 语义只在
             #    CUDA 验证。经 detect_backend() 取名（与 backend.name 同源；config
             #    阶段不实例化后端单例，避免 fork/spawn 前的隐式设备初始化）。
             backend_name = detect_backend()
             if backend_name != "cuda":
                 raise RuntimeError(
-                    f'hybrid 模型（Qwen3.5）当前仅支持 cuda 后端（当前后端：{backend_name}），'
-                    f'CoreX/Ascend 的 hybrid 支持不在本阶段范围')
+                    "Qwen3.5 hybrid models currently support the CUDA backend only; "
+                    f"selected backend: {backend_name}."
+                )
             # 4) 阶段1 仅 TP=1：GDN 状态槽按 seq_id 在各 rank 独立分配，而 Sequence
             #    的跨进程 pickle 不携带 seq_id，槽一致性不在本阶段范围（GDN 的 TP
             #    分片本身也待模型侧验证）。
             assert self.tensor_parallel_size == 1, \
-                'hybrid 模型（Qwen3.5）阶段1 仅支持 tensor_parallel_size == 1'
+                "Qwen3.5 hybrid models currently require tensor_parallel_size == 1."
         if self.spec_model:
             # spec 解码路径依赖 rank0 上的 draft 状态（h_seed），仅支持 TP=1。
             assert self.tensor_parallel_size == 1, "speculative decoding requires tensor_parallel_size == 1"
@@ -141,16 +151,39 @@ class Config:
                     else:
                         self.spec_aux_layers = tuple(l + 1 for l in tli)
                 assert len(self.spec_aux_layers) == len(dfc["target_layer_ids"]), (
-                    "DFlash draft fc 输入宽度与 aux 层数不一致："
+                    "DFlash projection width does not match the number of auxiliary layers: "
                     f"spec_aux_layers={self.spec_aux_layers} vs "
                     f"target_layer_ids={dfc['target_layer_ids']}")
                 assert max(self.spec_aux_layers) < self.text_config.num_hidden_layers, (
-                    f"DFlash aux 捕获层越界：spec_aux_layers={self.spec_aux_layers} "
-                    f">= 目标层数 {self.text_config.num_hidden_layers}")
+                    f"DFlash auxiliary layer index is out of range: "
+                    f"spec_aux_layers={self.spec_aux_layers}, "
+                    f"num_hidden_layers={self.text_config.num_hidden_layers}"
+                )
             elif not self.is_hybrid:
                 if not self.spec_aux_layers:
                     n = self.hf_config.num_hidden_layers
                     self.spec_aux_layers = (2, n // 2, n - 3)
-                assert len(self.spec_aux_layers) == 3, "EAGLE3 draft fc 输入为 3 个 aux 隐层拼接"
+                assert len(self.spec_aux_layers) == 3, (
+                    "EAGLE3 draft projection expects three concatenated auxiliary hidden states."
+                )
             # hybrid + spec_model 的方法匹配守卫在 model_runner（原 NotImplementedError
             # 位置替换为 spec_method 分派检查；eagle3+hybrid / dflash+qwen3 均干净拒绝）。
+        # 310P：paged attention 只支持 block_size 64/128。prefix-hit 由后端
+        # SplitFuse 读取 NZ paged KV；若运行时缺少 SplitFuse，ModelRunner 在后端
+        # 实例化后关闭 prefix cache（Config 阶段不 import torch_npu，避免提前初始化）。
+        if detect_backend() == 'ascend310p':
+            if self.kvcache_block_size not in (64, 128):
+                print(
+                    f"[nano-vllm] Ascend 310P KV-cache block size adjusted: "
+                    f"{self.kvcache_block_size} -> 128; supported values are 64 and 128.",
+                    flush=True,
+                )
+                self.kvcache_block_size = 128
+            head_dim = getattr(self.text_config, 'head_dim', None)
+            if head_dim is None:
+                head_dim = self.text_config.hidden_size // self.text_config.num_attention_heads
+            assert self.kvcache_block_size * head_dim <= 128 * 128, (
+                "Ascend 310P paged attention requires "
+                "block_size * head_dim <= 128*128; "
+                f"got {self.kvcache_block_size} * {head_dim}."
+            )

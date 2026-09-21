@@ -31,18 +31,24 @@ class BackendBase(ABC):
     #   CUDA       : decode 图 ✅实证 / spec 整轮图 ✅实证（graph_sample 默认 True）
     #   CoreX      : decode 图 ✅实证（V1.3：厂商 torch 的 CUDA Graph 兼容层可捕获）
     #                / spec 图 尝试+降级
-    #   Ascend310P : decode 图 尝试+降级（NPUGraph）/ spec 全路径 ❌ 引擎层拒绝
-    #                （supports_spec=False：verify 恒传 block_tables → attention 层
-    #                走整池 4D 分支，TND 不消费——paged-TND 适配后再开；
-    #                graph_sample 默认 False——NPU RNG 图安全性未验证）
+    #   Ascend310P : decode graph try+fallback (NPUGraph) / eager+graph spec OK
+    #                (verify PA lens/table host-preexpanded; smoke replay fallback)
     #   env 覆盖：NANOVLLM_SPEC_GRAPH=0 → spec 图一律不尝试（全后端）；
     #   NANOVLLM_GRAPH_SAMPLE=0/1 → 覆盖 graph_sample_default；TP>1 守卫不受 env
     #   影响（lm_head gather 不可捕获，恒禁图内采样）。
     supports_spec_graph = False
     # spec 全路径（eager 轮 + 图轮）可用性；False = 引擎在出现 spec_model 配置时
     # 直接干净拒绝（守卫见 model_runner，能力位裁决、不做 name 字符串判断）。
-    # 310P 因 TND 不消费 paged KV 而为 False。
     supports_spec = True
+    # prefix-hit prefill 是否把 k/v 换成整池切片喂给 attention。310P flash
+    # 算子不消费该形态，置 False；config 亦强制关 prefix cache。
+    supports_prefix_cache_attn = True
+    # prefill+block_tables: paged full-cache attn (spec verify/refill). 310P True; CUDA/CoreX False.
+    supports_paged_context_attn = False
+    # DFlash draft context/query KV can share the target block table and run
+    # through a backend paged-attention implementation. CUDA/CoreX keep the
+    # existing dense-SDPA path; 310P enables this when SplitFuse is available.
+    supports_dflash_paged = False
     # 设备语义串（"cuda"/"npu"）：set_default_device 与张量 .to(device) 的目标。
     device_name = "cuda"
     # 后端强制 dtype（None = 跟随 hf_config；310P 因 ATB 算子不支持 bf16 而强制 fp16）。
@@ -51,6 +57,43 @@ class BackendBase(ABC):
     # 显式设置时优先后端默认。Ascend 起步保守关闭（NPU RNG 图安全性未验证），
     # 关闭时 logits/采样走图外 gv["outputs"] 分支。
     graph_sample_default = True
+    # spec 整轮图是否在未设 NANOVLLM_SPEC_GRAPH 时尝试捕获。默认跟 graph_sample_default
+    # （spec 图内含 Gumbel）。310P 覆盖为 True（host 预展开 PA 元数据后可尝试）。
+    spec_graph_try_default = True
+
+    def runtime_info(self) -> dict[str, str]:
+        """Backend details shown by the common engine startup summary."""
+        return {
+            "attention_backend": "flash-attn",
+            "graph_backend": "CUDA Graph",
+            "kv_cache_layout": "BSHD",
+            "fused_ops": "backend default",
+        }
+
+    def optimize_model_weights(self, model) -> int:
+        """Apply backend-specific post-load weight layouts.
+
+        Returns the number of tensors converted. CUDA and CoreX keep the
+        checkpoint layout; Ascend 310P overrides this for FRACTAL_NZ GEMMs.
+        """
+        return 0
+
+    def optimize_dflash_weights(self, draft_model, target_lm_head) -> int:
+        """Optional post-layout hook for DFlash-only fused/shared weights."""
+        return 0
+
+    def dflash_paged_attention(
+        self,
+        q,
+        k_cache,
+        v_cache,
+        block_tables,
+        context_lens,
+        rows: int,
+        scale: float,
+        max_seq_len: int,
+    ):
+        raise NotImplementedError("DFlash paged attention is not supported by this backend")
 
     @abstractmethod
     def store_kvcache(
@@ -181,6 +224,36 @@ class BackendBase(ABC):
         # 默认 int32（CUDA triton store kernel 的约定 dtype，-1 padding 跳过）；
         # 若 vendor kernel 要求 int64，由 backend override（见 CoreXBackend）。
         return torch.int32
+
+    def allocate_kv_layers(
+        self,
+        num_layers: int,
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_dim: int,
+        dtype,
+        device,
+    ):
+        # None = 调用方按 get_kv_cache_shape 分配统一 6D 池再切片。
+        # 310P 覆盖为每层 FRACTAL_NZ 独立 K/V（empty_with_format）。
+        return None
+
+    def graph_pad_block(self, num_blocks: int) -> int:
+        # 图 padding 行的 block_table 填充值。CUDA/CoreX = -1（kernel 跳负槽）。
+        return -1
+
+    def graph_pad_context_len(self) -> int:
+        # 图 padding 行的 context_lens。CUDA/CoreX = 0。
+        return 0
+
+    def reserve_dummy_kv_block(self) -> bool:
+        # True = 末物理块永久留给图 dummy 行，BlockManager 只分配前 N-1 块。
+        return False
+
+    def graph_warmup_iters(self) -> int:
+        # capture 前在静态 buffer 上的 eager 热身次数（310P kernel lazy init）。
+        return 1
 
     def all_reduce(self, tensor):
         import torch.distributed as dist

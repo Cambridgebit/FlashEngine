@@ -15,9 +15,15 @@ from nanovllm.engine.model_runner import ModelRunner
 class LLMEngine:
 
     def __init__(self, model, **kwargs):
+        engine_t0 = perf_counter()
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        print(
+            f"[nano-vllm] Initializing engine for model {config.model} "
+            f"on backend {config.backend if config.backend != 'auto' else 'auto-detect'}...",
+            flush=True,
+        )
         Sequence.block_size = config.kvcache_block_size
         self.ps = []
         self.events = []
@@ -29,7 +35,9 @@ class LLMEngine:
             self.ps.append(process)
             self.events.append(event)
         self.model_runner = ModelRunner(config, 0, self.events)
+        tokenizer_t0 = perf_counter()
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
+        tokenizer_load_s = perf_counter() - tokenizer_t0
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
         # hybrid GDN 状态槽：preempt 释放回调（engine 侧解耦注入；qwen3 路径
@@ -40,9 +48,112 @@ class LLMEngine:
         # 初始化——实测同进程首轮 ~0.55s、其后 ~0.06s。此处跑一次极短生成
         # （max_tokens=2 保证走满一次 decode / spec 轮）把该开销前移到启动期，
         # 使首个真实请求 TTFT 与稳态一致（server 默认无 benchmark 的多次预热）。
-        self.generate(["warmup"], SamplingParams(temperature=0.0, max_tokens=2),
-                      use_tqdm=False)
+        runtime_warmup_t0 = perf_counter()
+        self.generate(
+            ["warmup"],
+            SamplingParams(temperature=0.0, max_tokens=2),
+            use_tqdm=False,
+        )
+        runtime_warmup_s = perf_counter() - runtime_warmup_t0
+        self._print_startup_summary(
+            config,
+            tokenizer_load_s=tokenizer_load_s,
+            runtime_warmup_s=runtime_warmup_s,
+            engine_startup_s=perf_counter() - engine_t0,
+        )
         atexit.register(self.exit)
+
+    def _print_startup_summary(
+        self,
+        config: Config,
+        *,
+        tokenizer_load_s: float,
+        runtime_warmup_s: float,
+        engine_startup_s: float,
+    ):
+        runner = self.model_runner
+        architecture = (
+            (getattr(config.hf_config, "architectures", None) or [None])[0]
+            or getattr(config.text_config, "model_type", None)
+            or type(runner.model).__name__
+        )
+        backend_info = runner.backend.runtime_info()
+        speculative = "enabled" if runner.spec_enabled else "disabled"
+        draft_id = config.spec_model if runner.spec_enabled else "n/a"
+        spec_method = config.spec_method if runner.spec_enabled else "n/a"
+        spec_tokens = config.spec_num_tokens if runner.spec_enabled else "n/a"
+        stats = runner.startup_stats
+
+        fields = [
+            ("Model ID", config.model),
+            ("Architecture", architecture),
+            ("Backend", runner.backend.name),
+            ("DType", str(runner.dtype).removeprefix("torch.")),
+            ("Tensor parallel size", config.tensor_parallel_size),
+            ("Max model length", config.max_model_len),
+            ("Max sequences", config.max_num_seqs),
+            ("KV-cache block size", config.kvcache_block_size),
+            ("Prefix cache", "enabled" if config.enable_prefix_cache else "disabled"),
+            ("Speculative decoding", speculative),
+            ("Speculative method", spec_method),
+            ("Draft model ID", draft_id),
+            ("Speculative tokens", spec_tokens),
+            ("Graph mode", runner.graph_mode()),
+            ("torch.compile", "enabled" if config.compile else "disabled"),
+            ("Attention backend", backend_info["attention_backend"]),
+            ("Graph backend", backend_info["graph_backend"]),
+            ("KV-cache layout", backend_info["kv_cache_layout"]),
+            ("Fused ops", backend_info["fused_ops"]),
+            ("Weight layout conversions", int(stats["weight_layout_conversions"])),
+        ]
+        if runner.spec_enabled and runner.config.spec_method == "dflash":
+            fields.insert(
+                -1,
+                ("DFlash attention path",
+                 backend_info.get("dflash_backend", "dense-KV/SDPA")),
+            )
+        print("[nano-vllm] Engine configuration:", flush=True)
+        for key, value in fields:
+            print(f"[nano-vllm]   {key}: {value}", flush=True)
+
+        print("[nano-vllm] Startup timings:", flush=True)
+        print(
+            f"[nano-vllm]   Model loading: {stats['model_load_s']:.3f} s",
+            flush=True,
+        )
+        if config.compile:
+            print(
+                "[nano-vllm]   Model compilation and first compiled warmup: "
+                f"{stats['model_compile_s']:.3f} s",
+                flush=True,
+            )
+        else:
+            print("[nano-vllm]   Model compilation: disabled", flush=True)
+            print(
+                f"[nano-vllm]   Model warmup: {stats['model_warmup_s']:.3f} s",
+                flush=True,
+            )
+        print(
+            f"[nano-vllm]   KV-cache allocation: "
+            f"{stats['kv_cache_allocation_s']:.3f} s",
+            flush=True,
+        )
+        print(
+            f"[nano-vllm]   Graph capture: {stats['graph_capture_s']:.3f} s",
+            flush=True,
+        )
+        print(
+            f"[nano-vllm]   Tokenizer loading: {tokenizer_load_s:.3f} s",
+            flush=True,
+        )
+        print(
+            f"[nano-vllm]   Runtime warmup: {runtime_warmup_s:.3f} s",
+            flush=True,
+        )
+        print(
+            f"[nano-vllm] Engine ready in {engine_startup_s:.3f} s",
+            flush=True,
+        )
 
     def exit(self):
         # 幂等：atexit 会再次调用；init 未完成（如 kv 预算不足抛错）时

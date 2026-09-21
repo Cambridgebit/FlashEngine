@@ -71,7 +71,9 @@ class PartialRotaryEmbedding(nn.Module):
     ) -> None:
         super().__init__()
         self.head_size = head_size
-        assert 0 < rotary_dim <= head_size, f"rotary_dim={rotary_dim} 越界（head_size={head_size}）"
+        assert 0 < rotary_dim <= head_size, (
+            f"rotary_dim={rotary_dim} is outside the valid range for head_size={head_size}."
+        )
         self.rotary_dim = rotary_dim
         self.backend = get_backend()
         # 缓存布局与现有 RotaryEmbedding 一致（cos | sin 拼接，positions 索引行），

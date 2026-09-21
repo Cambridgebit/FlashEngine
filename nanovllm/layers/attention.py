@@ -51,8 +51,15 @@ class Attention(nn.Module):
             )
 
         if context.is_prefill:
+            # 310P verify/refill：chunk 已写入 NZ 池，按 query 行展开 PA 读整池。
+            # 不可走 prefix-hit 的「把 k/v 换成整池再 flash」——flash 不消费 NZ paged。
+            if (context.block_tables is not None
+                    and getattr(self.backend, "supports_paged_context_attn", False)):
+                return self.backend.paged_context_attention(
+                    q, k_cache, v_cache, context, self.scale,
+                )
 
-            if context.block_tables is not None:    # prefix cache
+            if context.block_tables is not None and self.backend.supports_prefix_cache_attn:
                 k = k_cache
                 v = v_cache
 

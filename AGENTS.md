@@ -137,12 +137,28 @@ Nano-vLLM：从零实现的极简 vLLM（研究/学习用代码库，非生产�
 
 ## Ascend 310P（Atlas 300I Duo / 200I Pro）适配状态
 
-- 代码层已就绪（tri-backend-fusion）：`backends/ascend.py`（Ascend310PBackend）+ 设备代理/图 API 工厂全后端收口（engine/layers 内 `torch.cuda.*`/`.cuda()` 零直呼）。技术来源：nanovllm-ascend 的 torch_npu 对接形态 + vllm-ascend 的 310P 硬件事实。
-- **能力矩阵**：decode 图 = NPUGraph 尝试+降级（310P 仅支持 decode-only 级捕获）；**spec 全路径 = ❌ 引擎层拒绝**（`supports_spec=False`：verify 恒传 block_tables → attention 层走整池 4D 分支，TND 算子不消费，首个 spec 轮即硬崩——出现 spec_model 配置时干净报错；paged-TND 适配后再开，vllm-ascend A2 已证 v2 算子支持 TND+block_table）；算子融合 = `npu_rms_norm`/`npu_add_rms_norm`/`npu_swiglu` 级（npu_swiglu 已入承重清单；Npugraph_ex 在 310P 不可用，融合只能做在算子层）；graph_sample 默认 False（NPU RNG 图安全性未验证，`NANOVLLM_GRAPH_SAMPLE=1` 可实验性强制；spec 图门默认同时要求 graph_sample_default）。三后端 × 两图种的完整真值表见 `backends/base.py` 头部注释。
-- **硬件硬规矩**：仅 fp16（ATB 算子不支持 bf16，引擎按 `default_dtype` 强制 + 加载时隐式转换）；不支持 triton（本引擎 ascend 路径不依赖 triton）；prefill causal mask 按 max_model_len 全量构建有 OOM 风险——勿依赖 max-model-len 自动探测；TP=1 目标形态（多卡受 event-id 限制，且 spec 本就 TP=1）。
-- **已知限制**：prefix cache 命中的 prefill 会把 k/v 换成整池 4D 切片（attention 层 prefix-hit 分支），TND 算子不消费该形态——与 nanovllm-ascend 参考实现同款；310P 上前缀命中负载（如 check_prefix_cache 的 warm 轮）预期在此崩溃，需 paged-TND 适配后解锁，勿当回归报。同分支也命中 spec verify（block_tables 恒传）——spec 全路径被引擎层拒绝的根因即此（见能力矩阵）。
-- **待实机验证**（本机无法测）：`bash scripts/verify_ascend310p.sh <target> <draft>` 环境预检 + 四步（eager prefix 回归[R1 cold 判据，warm 轮预期命中已知限制] → decode 图捕获 → spec 拒绝守卫 → TPS sweep）；步骤 0 探测四个载荷算子（`_npu_reshape_and_cache`/`npu_fused_infer_attention_score_v2`/`npu_add_rms_norm`/`npu_swiglu`）与 pinned allocator。
-- 环境钉（vllm-ascend 口径）：torch-npu==2.10.0.post4 / CANN 9.1.0 / 310p 专用镜像。
+- 主仓后端 `backends/ascend.py` 已按 nano-vllm-ascend 实机路径收口（Qwen3-0.6B / CANN 9.1 / torch-npu 2.10.0.post4）：NZ KV + `_npu_flash_attention` prefill + `_npu_paged_attention` decode + NPUGraph 走现有 `capture_cudagraph`（不迁独立 NPUGraphDecodeRunner / TorchAir）。
+- 生产算子（勿回退到 FIA v2）：KV = 每层 `empty_with_format(FRACTAL_NZ)`，shape `(blocks, hidden/16, block_size, 16)`；写入 `_npu_reshape_and_cache(..., slot_indices=)`；prefill 默认 `auto`（运行时同时具备 `_npu_flash_attention_v3` + `_npu_paged_attention_splitfuse_v2` 时走 v3 + 2048 压缩 NZ causal mask，否则回落 `_npu_flash_attention`；`NANOVLLM_310P_FLASH_OP=legacy|v3|atb_v2` 可强制）；decode `_npu_paged_attention`（静态 out）；RoPE 优先 `_npu_rotary_embedding`、缺失时回落纯 torch。运行时：`allow_internal_format=True`、`jit_compile=False`、`NPU_FUZZY_COMPILE_BLACKLIST=ReduceNansum`。
+- 能力矩阵：decode 图 = NPUGraph 尝试+降级（lm_head + greedy argmax 入图；非 greedy 仍图外采样）；eager spec = on (EAGLE3/dense DFlash, multi-query PA); spec-graph try+smoke (host PA meta + greedy argmax + float accept)；DFlash draft 在 SplitFuse 可用时走独立分页 FRACTAL_NZ KV + 非因果 SplitFuse，复用 target block table/slot，并纳入同一 KV 内存预算；融合 = `npu_rms_norm`/`npu_add_rms_norm`/`npu_swiglu`/`_npu_rotary_embedding`；`graph_sample` 默认 False（指随机采样）。图 padding = 末块 dummy（block=N-1、ctx=1），BlockManager 只分配前 N-1 块。
+- 硬件硬规矩：仅 fp16；`kvcache_block_size` 仅 {64,128}（config 把 benchmark 默认 256 覆盖为 128）；`block_size * head_dim <= 128*128`；请显式压低 max_model_len；TP=1。
+- Prefix-hit/chunked prefill：运行时有 `_npu_paged_attention_splitfuse_v2` 时走固定 2048 ND 压缩 mask（mask_type=5），否则走 legacy SplitFuse + 动态 NZ mask；两者都缺失时自动关闭 prefix cache。spec 图默认尝试（PA meta host 预展开；图内 greedy argmax；float/static 验收避 AICPU Add；冒烟失败降级）。Sampler 仍支持 temperature=0 greedy。
+- 实机验证（`scripts/benchmark.py`，不迁 bench_ttft_tps.py）：
+
+```bash
+python3 -m scripts.benchmark /data/Qwen3-0.6B \
+  --backend ascend310p \
+  --gpu-mem-util 0.5 \
+  --max-model-len 512 \
+  --max-num-seqs 1 \
+  --warmup 1 \
+  --num-prompts 3 \
+  --max-tokens 64 \
+  --no-prefix-cache
+```
+
+  `--eager` 为 eager decode；默认 enforce_eager=False 走 NPUGraph（对应旧仓 --mode aclgraph）。
+  EAGLE3: --spec-model DRAFT --no-think. dense DFlash: paged target verify + paged draft SplitFuse，整轮 NPUGraph 捕获失败自动降级；DFlash 自动关闭 prefix cache；hybrid still cuda-only.
+- 环境钉：torch-npu==2.10.0.post4 / CANN 9.1.0 / 310p 专用镜像。
 
 ## Qwen3.5 + DFlash 适配（hybrid + 块草稿投机，分支 qwen35-dflash）
 
@@ -150,7 +166,7 @@ Nano-vLLM：从零实现的极简 vLLM（研究/学习用代码库，非生产�
 - **DFlash 口径事实（勿回退）**：draft 5 层标准 qwen3 注意力（**非因果**），checkpoint 无 embed/lm_head（共享 target）。每轮 = 上下文追加 → 块草稿 → verify → 最长前缀接受+bonus（commit_buf 契约与 EAGLE 一致）。aux 层 = draft config `target_layer_ids` [1,6,11,16,21]，语义 = **0-based 层输出**（qwen3 的 EAGLE3 是层输入口径，两者不同）。**上下文追加 = verify 的 v_aux 行 0..m**（vllm `_prepare_dflash_inputs_kernel` 口径：行 0 = 上轮 bonus 的 aux，只在本轮 verify 行 0 能算出，漏掉会在 L-1 位留永久空洞；行 m+1 是被拒提案的错位特征——任务书初版「行 1..m+1」为 off-by-one，勿回退）。draft 上下文 KV 走稠密缓冲（[ms, mml, 5层, 2, 4头, 128] bf16，不进 block manager）；k = block_size-1 = 15 自动派生。
 - **GDN 状态 × spec（关键正确性）**：状态池 conv[ms×(k+2)+1 槽, 6144, 3] + ssm[同, 16, 128, 128] fp32（ms=4 ≈1.3GB）；verify 走 'row' 模式逐行落槽（行 j 终态 → 槽 base+j，base=批内序×(k+1)），行 0 读 carry 槽（上轮 base+m，读后写同槽安全）；非 spec decode/prefill 走 'final' 模式（行为与阶段1 逐字节一致）。图捕获的 row 模式用 host 常量段界（`gdn_row_bases`）绕开捕获期 tolist 同步。
 - **引擎门控（config hybrid 分支）**：强制关 prefix cache（GDN 状态不可 block hash 复用）；`max_num_batched_tokens` 封顶到 max_model_len（禁 chunked prefill + 把 warmup 峰值压到 1×mml——8GB 卡按 8×2048 批预留会把 KV 池挤到 0 块）；仅 cuda 后端 + TP=1。四格配对矩阵：qwen3+eagle3（原路径）/ qwen3_5+dflash / **qwen3+dflash（已实现，待远端实测）** 三格放行；eagle3+hybrid 干净拒绝（唯一未实现格：_sg 路径的 GDN verify 分叉未接，硬跑会静默错乱）。
-- **Qwen3+dflash（dense）口径**：aux 换算在 config 层完成——qwen3.py 钩子是层输入口径，层 l 输出 ≡ 层 l+1 输入，故 `spec_aux_layers = target_layer_ids + 1`（Qwen3-4B 的 [1,9,17,25,33] → (2,10,18,26,34)），qwen3.py 零改动，与 vllm qwen3 dense 同构；`_df_*` 路径（eager+图）GDN 触点已 `is_hybrid` 条件化（dense 无 GDN 状态分叉，df_carry 段留零不消费）；**spec 图 dense 与 hybrid 同门捕获**（CUDA/CoreX 均尝试，失败自动降级 eager spec 轮）——CoreX 是 dense+dflash 图的主目标形态（EAGLE 整轮图实机已证 ixformer verify 可捕获）。draft paged KV 本就只给 eagle3 分配（dense+dflash 复用零浪费）。**dense 机械冒烟（2026-09-09，4070 + Qwen3-1.7B + 合成 mini dflash draft）全绿**：config 派生→setup→warmup→eager 轮→spec 图捕获（rows=16）→回放→读回提交全链走通，graph-vs-eager 4/4、base-vs-spec 4/4 位等；冒烟修出两个 dense 专属坑（hybrid 时代不可见）：① scheduler admission 状态槽门控从 `is_hybrid` 扩展为 `state_slots_gate`（hybrid GDN 池 / dense draft ctx 槽同构生命周期：prefill 分配、decode 持有、finish/preempt 释放，门控条件 `running_holders + len(scheduled) < ms`——qwen3+eagle3 无固定状态槽不受影响）；② `warmup_model` 的 dflash spec 状态回收原嵌在 `is_hybrid` 块内，dense warmup 假序列 ctx 槽泄漏 → 首个真实 prefill 槽耗尽，已提出块外。**已知限制**：dense+dflash 未禁 prefix cache——prefix 命中的 prefill 不重算命中段的 aux → draft 对该段上下文全盲（块草稿读零特征，E 退化、无崩溃、无数值错）；串行基准（互异 prompt）不受影响，共享前缀负载建议 `--no-prefix-cache`。**验证注意**：spec-vs-base 位等门对 aux 口径错误不敏感（草案垃圾→E≈1→仍位等），**E 数字才是 aux 正确性的最终信号**（该配对应显著 >2；E≈1-1.2 先查 aux 换算）。4B 权重 8.1GB，4070 8GB 装不下，实测需 ≥16GB NVIDIA 或 CoreX 32GB 板卡（后者跑 CoreX 后端环境，`--max-model-len` 建议 ≤4096 控 draft ctx 稠密缓冲尺寸）。
+- **Qwen3+dflash（dense）口径**：aux 换算在 config 层完成——qwen3.py 钩子是层输入口径，层 l 输出 ≡ 层 l+1 输入，故 `spec_aux_layers = target_layer_ids + 1`（Qwen3-4B 的 [1,9,17,25,33] → (2,10,18,26,34)），qwen3.py 零改动，与 vllm qwen3 dense 同构；`_df_*` 路径（eager+图）GDN 触点已 `is_hybrid` 条件化（dense 无 GDN 状态分叉，df_carry 段留零不消费）。CUDA/CoreX 保留稠密 draft KV；**310P 使用每层独立分页 FRACTAL_NZ draft KV**，复用 target block table/slot，context/query KV 均由 `_npu_reshape_and_cache` 写入并用非因果 SplitFuse 读取；分页 draft KV 已纳入每块显存预算，prefix cache 自动关闭。**spec 图整轮捕获**失败时统一降级 eager spec。**dense 机械冒烟（2026-09-09，4070 + Qwen3-1.7B + 合成 mini dflash draft）全绿**：config 派生→setup→warmup→eager 轮→spec 图捕获（rows=16）→回放→读回提交全链走通，graph-vs-eager 4/4、base-vs-spec 4/4 位等；冒烟修出两个 dense 专属坑：① scheduler admission 状态槽门控；② warmup dummy 状态回收。CUDA/CoreX 的已知限制仍是 prefix 命中不重算 aux；310P 已禁用。**验证注意**：spec-vs-base 位等门对 aux 口径错误不敏感，**E 数字才是 aux 正确性的最终信号**（该配对应显著 >2；E≈1-1.2 先查 aux 换算）。
 - **位等判定口径（三阶段实测沉淀）**：串行 bs=1 temp0 期望全等或 bf16 平票翻转（分歧点 top-1/top-2 打平或差 1 ULP、top-8 其余逐位一致）；**并发/图 padding 的深位置翻转 = 批形状漂移**（eager bs=n vs 图 bs=桶 的 GEMM/attention 归约序差，AGENTS「数值确定性」条同款）——base-vs-base 独立重跑 5/5 确证 base 自身确定、翻转源自 spec/图路径的形状差，判豁免不判 bug。验收锚点数据：阶段1 transformers 位等 8/10（2 平票）；阶段2 spec-vs-base 9/12+3 豁免、E=2.502（raw prompt）/5.179（benchmark coding，与论文 AL 4.78@block16 量级互证）；阶段3 decode 图串行 12/12、spec 图串行 12/12+E 守恒（ΔE=0.000，收尾截断口径差 ≤0.003）、双路径捕获降级干净。
 - **显存现实（8GB 卡）**：spec 引擎 init 后 ~5.7GB（权重 4.0 + GDN 池 ~0.65 + draft ctx 0.04 + 杂项），KV 池仅剩百 MB 级——spec 图 ms=4 需 `mml=512 / util 0.99`，ms=8 不现实；无 spec 的 decode 图 ms=4/mml1024 可全桶捕获。
 - **EAGLE `_spec_round_graph` padding 复位 bug（2026-09 已修）**：原 `vs[:, n:]` 轴序错位（`v_slots` 视图 (M,rows)，seq 维在轴 0，应为 `vs[n:, :]`——原写法清的是**所有序列的列**）+ 复位条件 `bucket < _spec_graph_active` 漏「首次扩桶 / 同桶内含 padding」两个窗口——并发（n<桶）下真实序列的 verify 行槽被清 -1 → 跳写 → NaN 零流 / 全 "！"；串行（n==桶）不受影响，故长期未被发现。已改为 `vs[n:, :]` + 条件 `n < bucket`（对齐 DFlash 版），并顺带在 no-spec `prepare_decode` 的 padding 复位里补 `ids/pos` 清零。验证：并发 spec（n=3→桶 4，正是触发窗口）输出正常、serial spec E=2.035 逐位不变。**遗留：建议补 n<bucket 并发位等门**（本仓无自动化测试）。

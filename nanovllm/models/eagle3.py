@@ -191,7 +191,7 @@ def load_eagle3_draft(model: Eagle3DraftModel, path: str) -> None:
     else:
         from safetensors import safe_open
         files = glob(os.path.join(path, "*.safetensors"))
-        assert files, f"EAGLE3 draft 目录缺少权重文件: {path}"
+        assert files, f"No EAGLE3 draft weight files found in {path}."
 
         def items():
             for file in files:

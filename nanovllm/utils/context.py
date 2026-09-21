@@ -43,6 +43,11 @@ class Context:
     # 循环体逐位一致，行为零变化。
     gdn_row_bases: list | None = None
     gdn_row_seg: int = 0
+    # 310P fused RoPE: the first attention layer materializes full-dim cos/sin
+    # once per model forward; subsequent layers reuse the fixed-address slices.
+    rope_cache_key: object | None = None
+    rope_cos: torch.Tensor | None = None
+    rope_sin: torch.Tensor | None = None
 
 _CONTEXT = Context()
 

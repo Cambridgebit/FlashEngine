@@ -60,7 +60,10 @@ class ParallelLMHead(VocabParallelEmbedding):
         if context.is_prefill:
             last_indices = context.cu_seqlens_q[1:] - 1
             x = x[last_indices].contiguous()
-        logits = F.linear(x, self.weight)
+        # Ascend 310P installs a separate FRACTAL_NZ projection weight after
+        # loading. Keep ``self.weight`` in ND because it may be tied to the
+        # token embedding, whose gather path does not consume NZ storage.
+        logits = F.linear(x, getattr(self, "weight_nz", self.weight))
         if self.tp_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
             dist.gather(logits, all_logits, 0)

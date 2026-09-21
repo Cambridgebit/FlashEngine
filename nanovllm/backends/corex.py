@@ -21,6 +21,14 @@ class CoreXBackend(BackendBase):
     # capture_spec_cudagraph 的 except）。
     supports_spec_graph = True
 
+    def runtime_info(self) -> dict[str, str]:
+        return {
+            "attention_backend": "IXFormer",
+            "graph_backend": "CUDA Graph compatibility layer",
+            "kv_cache_layout": "HND",
+            "fused_ops": "IXFormer attention and KV-cache ops",
+        }
+
     def store_kvcache(
         self,
         key,

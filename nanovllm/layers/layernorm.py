@@ -96,7 +96,9 @@ class RMSNormGated(nn.Module):
     ) -> None:
         super().__init__()
         self.eps = eps
-        assert activation in ("silu", "swish", "sigmoid"), f"不支持的 gate 激活 {activation}"
+        assert activation in ("silu", "swish", "sigmoid"), (
+            f"Unsupported gate activation: {activation}"
+        )
         self.activation = activation
         self.weight = nn.Parameter(torch.ones(hidden_size))
 
