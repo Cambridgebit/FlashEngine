@@ -573,6 +573,6 @@ max sequences 完全一致，同时报告：
 - `nanovllm/models/eagle3.py`：EAGLE3 draft 模型与 shifted-stream 前向；
 - `nanovllm/models/dflash.py`：DFlash context projection、分页/稠密 attention 分支；
 - `nanovllm/engine/aclgraph_attn.py`：paged-attention graph-task update 能力探测；
-- `EAGLE3.md`：EAGLE3 算法说明；
-- `DFlash.md`：DFlash 算法与多后端说明。
+- `docs/EAGLE3.md`：EAGLE3 算法说明；
+- `docs/DFlash.md`：DFlash 算法与多后端说明。
 

@@ -4,7 +4,7 @@
 > nano-vLLM 引擎（调度、KV 缓存、线性注意力状态池、计算图）配合的。
 > 内容以源码为准：`nanovllm/models/dflash.py`、`nanovllm/models/qwen3_5.py`、
 > `nanovllm/engine/model_runner.py`、`nanovllm/engine/scheduler.py`、`nanovllm/config.py`。
-> 性能数据与历史口径见 [AGENTS.md](AGENTS.md)，EAGLE3 路径见 [EAGLE3.md](EAGLE3.md)。
+> 性能数据与历史口径见 [AGENTS.md](../AGENTS.md)，EAGLE3 路径见 [EAGLE3.md](EAGLE3.md)。
 
 ---
 

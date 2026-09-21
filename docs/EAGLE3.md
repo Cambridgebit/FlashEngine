@@ -4,7 +4,7 @@
 > （调度、KV 缓存、计算图、多硬件后端）配合的。
 > 内容以源码为准：`nanovllm/models/eagle3.py`、`nanovllm/engine/model_runner.py`、
 > `nanovllm/engine/llm_engine.py`、`nanovllm/engine/scheduler.py`、`nanovllm/models/qwen3.py`。
-> 性能数据与历史口径见 [AGENTS.md](AGENTS.md)。
+> 性能数据与历史口径见 [AGENTS.md](../AGENTS.md)。
 
 ---
 
@@ -403,7 +403,7 @@ m     = 全部匹配则取 k，否则取第一个不匹配的位置     # 最长
   - RTX 4070 Laptop：接受长度 2.095，投机 108.7 tok/s，不开投机 66.2 tok/s（1.64 倍）；
   - CoreX 32GB：接受长度 2.050，成图 103.7 tok/s（逐算子仅 11.3——"投机必须有图"）。
 - 开启思考时接受长度会掉到 1.7~1.8（草稿更难预测），属正常，**不要与上面的参考值直接比较**
-  （见 [AGENTS.md](AGENTS.md)）。
+  （见 [AGENTS.md](../AGENTS.md)）。
 
 ---
 
