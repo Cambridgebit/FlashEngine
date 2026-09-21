@@ -1,20 +1,36 @@
 # Nano-vLLM
 
-基于 [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm) 的增强版：一个从零实现的轻量级大模型推理引擎。上游约 1200 行代码，本项目加入 EAGLE3、DFlash、CUDA Graph 与多硬件后端后约6800行。
+基于 [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm) 的增强版：一个从零实现的轻量级大模型推理引擎。上游约 1200 行代码（本项目分叉点实测 1450 行），加入 EAGLE3、DFlash、CUDA Graph 与多硬件后端后为 9138 行 Python（其中有效代码 7383 行），演化过程见[代码演化路线](#代码演化路线)。
 
 在上游已有的前缀缓存、张量并行、`torch.compile` 加速、分块预填充基础上，本项目新增：
 
 - **EAGLE3 投机解码**：小草稿模型先猜 `k` 个 token，主模型一次前向批量验证，一轮生成多个 token。
-- **Qwen3.5 混合架构 + DFlash 块草稿投机**（当前分支 `qwen35-dflash`）：支持 Gated DeltaNet 线性注意力与门控全注意力混合的 Qwen3.5，以及单次非因果前向起草整块 token 的 DFlash。
+- **Qwen3.5 混合架构 + DFlash 块草稿投机**：支持 Gated DeltaNet 线性注意力与门控全注意力混合的 Qwen3.5，以及单次非因果前向起草整块 token 的 DFlash。
 - **Qwen3 + DFlash**：复用 Qwen3 主模型接入 DFlash 块草稿路径；CUDA/CoreX 使用稠密 draft KV，Ascend 310P 使用分页 NZ draft KV + 非因果 SplitFuse，并支持整轮图。
 
 Ascend 310P 的 Graph、EAGLE3 与 DFlash 适配细节见
-[ASCEND310P_GRAPH_SPEC.md](ASCEND310P_GRAPH_SPEC.md)。
+[ASCEND310P_GRAPH_SPEC.md](docs/ASCEND310P_GRAPH_SPEC.md)。
 - **CUDA Graph / NPUGraph 加速**：普通解码一步录一张图，投机解码一整轮录一张图；捕获失败自动退回 eager，只影响速度、不影响功能。
 - **多硬件后端**：NVIDIA CUDA、天数智芯 CoreX、华为 Ascend 310P。
 - **OpenAI 兼容服务**：流式输出、连续批处理、前缀缓存统计与实时 TPS 日志，服务端仅使用 Python 标准库。
 
 > 开发约定、硬件限制与实测数据见 [AGENTS.md](AGENTS.md)。本文档以当前代码与当前分支为准。
+
+## 代码演化路线
+
+基线为上游 [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm)（官方口径约 1200 行）。各阶段实测 Python 行数（`wc -l`，含空行与注释）：
+
+| 阶段 | 内容 | 锚点 | 引擎侧 | scripts | 合计 |
+|---|---|---|---:|---:|---:|
+| ① 基线 | 上游 nano-vllm | `bb823b3` | 1385 | — | **1450** |
+| ② 第一批 | 多后端抽层 + **CoreX** 后端适配 + **EAGLE3** 投机推理 | `88b5d77` V1.4 | 2926 | 951 | **3877** |
+| ③ 第二版 | + **310P** 后端适配与 310P EAGLE3 | `fc26e87` V1.7 | 3438 | 1565 | **5003** |
+| ④ 第三批 | + **Qwen3.5 / DFlash** 块草稿投机 | `64f752a` V2.1.0 | 5744 | 1338 | **7082** |
+| ⑤ 当前 main | + 310P 图路径模块化（`npu_graph_runner` / `aclgraph_attn`） | `1a12029` | **7768** | **1370** | **9138** |
+
+非引擎侧 `scripts/` 当前 1370 行，占全仓 15.0%：`openai_server.py` 915、`benchmark.py` 297、`check_qwen35.py` 158。
+
+① 的 1450 行 = 引擎 1385 + 仓库根目录的 `bench.py`/`example.py` 65（这两个演示脚本后来被 `scripts/` 体系取代）。中间版本的行数会因重构而回落（如 V1.9 精简清理、V2.0.7 审计），因此比较时只看同阶段净增，不要逐提交线性外推。
 
 ## 快速开始
 
@@ -214,6 +230,10 @@ scripts/
 ├── benchmark.py            # question.jsonl 串行 TPS / TTFT / spec 统计
 ├── check_qwen35.py         # Qwen3.5/DFlash 参考、base、spec 校验
 └── openai_server.py        # OpenAI 兼容服务与实时日志
+docs/
+├── EAGLE3.md               # EAGLE3 算法与实现说明
+├── DFlash.md               # DFlash 算法与多后端说明
+└── ASCEND310P_GRAPH_SPEC.md # Ascend 310P 图路径技术规格
 ```
 
 ## 架构
