@@ -5,10 +5,15 @@
   Qwen3 默认 enable_thinking）后 encode；--no-think 显式关 thinking（模板插入
   空 <think></think> 直答，对齐 V1.8/历史 E 锚点口径，用于单变量二分接受率差异）；
 - 数据集：random.seed(--seed) 后 shuffle 取前 --num-prompts 条（--seed -1 = 文件序前 N 条）；
-- 采样：temperature=0 greedy，输出上限 --max-tokens（默认 256 = vllm spec_bench output_len）；
+- 采样：默认 temperature=0 greedy，可用 --temperature/--top-p/--top-k 对齐在线请求；
+  输出上限 --max-tokens（默认 256 = vllm spec_bench output_len）；
 - 预热：--warmup 次（不计指标），统一打 shuffle 后首条 prompt（对齐 vllm --num-warmups）；
-- 吞吐：Σ输出 token / 主跑总墙钟（单墙钟，含逐条 tokenize/打印的 host 开销，
+- 吞吐：Σ输出 token / 主跑总墙钟（单墙钟，含逐条 tokenize/进度条刷新的 host 开销，
   对齐 vllm「Output token throughput」）；TTFT 为进程内口径（vllm 为 client 端，高几 ms）；
+- 输出形式：主跑期间用 tqdm 进度条，末端实时显示本次请求的 TPOT 与 TTFT（不再逐条打印）；
+  结束后汇总打印 TTFT（ms）/ TPOT（ms/token）/ TPS（tok/s），均带单位。
+  TPOT = 逐请求 (wall - TTFT) / (输出 token 数 - 1) 的均值（对齐 vllm bench serve 的
+  Mean TPOT）；输出 ≤1 token 的请求无定义，不参与统计；
 - 重复请求负载：--num-repeats R 时每条 prompt 连续跑 R 次（相邻重复，第 2..R 次
   全量命中前缀缓存；只 tokenize 一次），配合 --no-prefix-cache 做 TTFT 冷/热 A/B
   （prefix cache 只降 TTFT、不动吞吐的结论即出自该对照）；repeats>1 时汇总额外
@@ -31,10 +36,12 @@ import os
 import random
 import time
 
+from tqdm import tqdm
+
 from nanovllm import LLM, SamplingParams
 from nanovllm.engine.sequence import Sequence
 
-TEMPERATURE = 0
+TEMPERATURE = 0.0
 
 
 def load_questions(path, category, num, seed):
@@ -85,6 +92,26 @@ def run_seqs(llm, seqs):
         [first[s.seq_id] for s in seqs], wall
 
 
+def request_progress(n, ttft, wall):
+    """进度条末端文本：本次请求的 TPOT 与 TTFT（输出 ≤1 token 时 TPOT 无定义）。"""
+    if n >= 2:
+        tpot_ms = (wall - ttft) / (n - 1) * 1000
+        return f"TPOT={tpot_ms:.1f}ms/tok  TTFT={ttft * 1000:.1f}ms"
+    return f"TPOT=n/a  TTFT={ttft * 1000:.1f}ms"
+
+
+def percentile(values, p):
+    """Linear percentile without adding a NumPy dependency to the benchmark."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    pos = (len(ordered) - 1) * p / 100.0
+    lo = int(pos)
+    hi = min(lo + 1, len(ordered) - 1)
+    frac = pos - lo
+    return ordered[lo] * (1.0 - frac) + ordered[hi] * frac
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Serial TPS/TTFT benchmark compatible with vllm bench serve.")
@@ -101,6 +128,10 @@ def main():
                         help="Disable prefix caching and block-hash lookup for A/B testing.")
     parser.add_argument("--max-tokens", type=int, default=256,
                         help="Maximum output tokens per request; EOS may stop generation earlier.")
+    parser.add_argument("--temperature", type=float, default=TEMPERATURE,
+                        help="Sampling temperature; 0 uses greedy sampling (default: 0).")
+    parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--top-k", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0,
                         help="Dataset shuffle seed; -1 preserves file order.")
     parser.add_argument("--warmup", type=int, default=5,
@@ -111,9 +142,14 @@ def main():
                         help="Pass enable_thinking=False to the chat template.")
     parser.add_argument("--backend", default="auto", choices=["auto", "cuda", "corex", "ascend310p"])
     parser.add_argument("--eager", action="store_true", help="Disable graph capture and use eager mode.")
-    parser.add_argument("--compile", action="store_true")
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--max-num-seqs", type=int, default=8)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=16384,
+                        help="Maximum prompt tokens processed in one prefill step.")
+    parser.add_argument("--disable-chunked-prefill", action="store_true",
+                        help="Require every prompt prefill to fit in one scheduler step.")
+    parser.add_argument("--max-num-partial-prefills", type=int, default=1,
+                        help="Maximum admitted requests with an unfinished prompt prefill.")
     parser.add_argument("--block-size", type=int, default=256)
     parser.add_argument("--gpu-mem-util", type=float, default=0.9,
                         help="Device-memory utilization reserved for model and KV cache.")
@@ -124,7 +160,10 @@ def main():
 
     kwargs = dict(enforce_eager=args.eager, tensor_parallel_size=1, backend=args.backend,
                   max_model_len=args.max_model_len, max_num_seqs=args.max_num_seqs,
-                  kvcache_block_size=args.block_size, compile=args.compile,
+                  max_num_batched_tokens=args.max_num_batched_tokens,
+                  enable_chunked_prefill=not args.disable_chunked_prefill,
+                  max_num_partial_prefills=args.max_num_partial_prefills,
+                  kvcache_block_size=args.block_size,
                   gpu_memory_utilization=args.gpu_mem_util,
                   enable_prefix_cache=not args.no_prefix_cache)
     if args.spec_model:
@@ -133,17 +172,31 @@ def main():
     pcache = "on" if llm.model_runner.config.enable_prefix_cache else "off"
     # 表头在引擎构造后打印：k 取引擎实际生效值（dflash 按 draft config block_size-1
     # 自动派生，CLI 默认 3 会被覆盖——在派生前打印会显示错误的 k）。
-    spec = f"spec(k={llm.model_runner.config.spec_num_tokens})" if args.spec_model else "decode"
+    spec = (f"spec({llm.model_runner.config.spec_method},"
+            f"k={llm.model_runner.config.spec_num_tokens})") if args.spec_model else "decode"
+    chunked = (
+        f"on(budget={llm.model_runner.config.max_num_batched_tokens},"
+        f"partial={llm.model_runner.config.max_num_partial_prefills})"
+        if llm.model_runner.config.enable_chunked_prefill else "off"
+    )
     print(f"prompts: {len(qs)} (category={args.category}, seed={args.seed}) "
           f"x repeats={args.num_repeats} | mode={spec} | prefix_cache={pcache} | "
-          f"max_tokens={args.max_tokens} | temp={TEMPERATURE} | thinking={thinking} | "
+          f"chunked_prefill={chunked} | "
+          f"max_tokens={args.max_tokens} | temp={args.temperature:g} | "
+          f"top_p={args.top_p:g} | top_k={args.top_k} | thinking={thinking} | "
           f"protocol=vllm-bench-serve-compatible\n",
           flush=True)
 
     graph_stats = None
     spec_graph_stats = None
+    draft_prefix_stats = None
     try:
-        sp = SamplingParams(temperature=TEMPERATURE, max_tokens=args.max_tokens)
+        sp = SamplingParams(
+            temperature=args.temperature,
+            max_tokens=args.max_tokens,
+            top_p=args.top_p,
+            top_k=args.top_k,
+        )
 
         def chat(q):
             # 对齐 vllm bench spec_bench 口径：CustomDataset.sample 对 prompt 套
@@ -164,9 +217,8 @@ def main():
 
         # Report graph activity for the measured window only. Keep capture
         # success/failure counters, but exclude engine and benchmark warmups.
-        graph_runner = getattr(llm.model_runner, "graph_runner", None)
-        if graph_runner is not None and hasattr(graph_runner, "reset_runtime_stats"):
-            graph_runner.reset_runtime_stats()
+        if hasattr(llm.model_runner, "reset_decode_graph_runtime_stats"):
+            llm.model_runner.reset_decode_graph_runtime_stats()
         if args.spec_model and hasattr(llm.model_runner, "reset_spec_graph_runtime_stats"):
             llm.model_runner.reset_spec_graph_runtime_stats()
 
@@ -201,38 +253,85 @@ def main():
         # 重复请求负载：每条 prompt 连续跑 num_repeats 次（相邻重复保证 rep>0
         # 全量命中前缀缓存；同 prompt 只 tokenize 一次）。命中统计在预热后清零。
         llm.scheduler.block_manager.reset_prefix_stats()
+        if hasattr(llm.model_runner, "df_prefix_snapshot_stats"):
+            for key in llm.model_runner.df_prefix_snapshot_stats:
+                llm.model_runner.df_prefix_snapshot_stats[key] = 0
         rows = []  # (n, ttft, wall, rep)
+        prompt_lens = []
         t_bench = time.perf_counter()
-        i = 0
-        for q in qs:
-            tokens_in = chat(q)
-            for rep in range(args.num_repeats):
-                i += 1
-                tokens, ttfts, wall = run_seqs(llm, [Sequence(tokens_in, sp)])
-                n = len(tokens[0])
-                ttft = ttfts[0] or 0.0
-                rows.append((n, ttft, wall, rep))
-                print(f"#{i:>3}  rep={rep}  tok={n:>4}  TTFT={ttft * 1000:>7.1f}ms  "
-                      f"wall={wall:>6.2f}s", flush=True)
+        # 进度条替代逐条打印：末端实时显示本请求的 TPOT/TTFT；刷新开销计入单墙钟
+        # （与「含逐条 host 开销」口径一致）。
+        with tqdm(total=len(qs) * args.num_repeats, desc="bench", unit="req",
+                  dynamic_ncols=True) as pbar:
+            for q in qs:
+                tokens_in = chat(q)
+                for rep in range(args.num_repeats):
+                    prompt_lens.append(len(tokens_in))
+                    tokens, ttfts, wall = run_seqs(llm, [Sequence(tokens_in, sp)])
+                    n = len(tokens[0])
+                    ttft = ttfts[0] or 0.0
+                    rows.append((n, ttft, wall, rep))
+                    pbar.set_postfix_str(request_progress(n, ttft, wall))
+                    pbar.update(1)
         bench_wall = time.perf_counter() - t_bench
-        graph_runner = getattr(llm.model_runner, "graph_runner", None)
-        if graph_runner is not None and hasattr(graph_runner, "get_stats"):
-            graph_stats = graph_runner.get_stats()
+        if (not llm.model_runner.spec_enabled
+                and getattr(llm.model_runner, "graph_capture_attempted", False)
+                and hasattr(llm.model_runner, "get_decode_graph_stats")):
+            graph_stats = llm.model_runner.get_decode_graph_stats()
         if args.spec_model and hasattr(llm.model_runner, "get_spec_graph_stats"):
             spec_graph_stats = llm.model_runner.get_spec_graph_stats()
+        if hasattr(llm.model_runner, "df_prefix_snapshot_stats"):
+            draft_prefix_stats = {
+                **llm.model_runner.df_prefix_snapshot_stats,
+                "bytes": llm.model_runner._df_prefix_snapshot_bytes,
+            }
     finally:
-        llm.exit()
+        llm.close()
 
     total_tok = sum(r[0] for r in rows)
+    total_input_tok = sum(prompt_lens)
     request_wall = sum(r[2] for r in rows)
     decode_tok = sum(max(r[0] - 1, 0) for r in rows)
     decode_wall = sum(max(r[2] - r[1], 0.0) for r in rows)
     host_overhead = max(bench_wall - request_wall, 0.0)
-    ttfts = sorted(r[1] for r in rows)
-    print(f"\n==== bench (n={len(rows)}) ====")
-    print(f"Benchmark duration = {bench_wall:.2f} s   "
-          f"Total generated tokens = {total_tok}")
-    print(f"Output token throughput = {total_tok / bench_wall if bench_wall else 0.0:.1f} tok/s")
+    ttfts = [r[1] for r in rows]
+    ttft_avg = sum(ttfts) / len(ttfts)
+    ttft_med = percentile(ttfts, 50)
+    tps = total_tok / bench_wall if bench_wall else 0.0
+    # TPOT：逐请求 (wall - TTFT) / (输出 token 数 - 1) 后取均值（对齐 vllm bench serve
+    # 的 Mean TPOT）；输出 ≤1 token 的请求无定义，不参与。串行 bs=1 下与下方
+    # 「Steady-state decode throughput」互为倒数（此处为请求均值，后者为 token 加权）。
+    tpot_s = [(r[2] - r[1]) / (r[0] - 1) for r in rows if r[0] >= 2]
+    tpot_ms_values = [v * 1000 for v in tpot_s]
+    tpot_ms = sum(tpot_ms_values) / len(tpot_ms_values) if tpot_ms_values else 0.0
+    e2el = [r[2] for r in rows]
+    print("\n============ Benchmark Result ============")
+    print(f"Successful requests:                 {len(rows)}")
+    print(f"Benchmark duration (s):              {bench_wall:.2f}")
+    print(f"Total input tokens:                  {total_input_tok}")
+    print(f"Total generated tokens:              {total_tok}")
+    print(f"Request throughput (req/s):          {len(rows) / bench_wall if bench_wall else 0.0:.2f}")
+    print(f"Input token throughput (tok/s):      {total_input_tok / bench_wall if bench_wall else 0.0:.2f}")
+    print(f"Output token throughput (tok/s):     {tps:.2f}")
+    print(f"Total token throughput (tok/s):      "
+          f"{(total_input_tok + total_tok) / bench_wall if bench_wall else 0.0:.2f}")
+    print("---------------Time to First Token----------------")
+    print(f"Mean TTFT (ms):                      {ttft_avg * 1000:.2f}")
+    print(f"Median TTFT (ms):                    {ttft_med * 1000:.2f}")
+    print(f"P99 TTFT (ms):                       {percentile(ttfts, 99) * 1000:.2f}")
+    print("-----Time per Output Token (excl. 1st token)------")
+    print(f"Mean TPOT (ms):                      {tpot_ms:.2f}")
+    print(f"Median TPOT (ms):                    {percentile(tpot_ms_values, 50):.2f}")
+    print(f"P99 TPOT (ms):                       {percentile(tpot_ms_values, 99):.2f}")
+    print("----------------End-to-end Latency-----------------")
+    print(f"Mean E2EL (ms):                      {sum(e2el) / len(e2el) * 1000:.2f}")
+    print(f"Median E2EL (ms):                    {percentile(e2el, 50) * 1000:.2f}")
+    print(f"P99 E2EL (ms):                       {percentile(e2el, 99) * 1000:.2f}")
+    print("================ Engine Details ===================")
+    print(f"Prompt length (tokens):              avg={total_input_tok / len(prompt_lens):.1f}, "
+          f"min={min(prompt_lens)}, max={max(prompt_lens)}")
+    print(f"Output length (tokens):              avg={total_tok / len(rows):.1f}, "
+          f"min={min(r[0] for r in rows)}, max={max(r[0] for r in rows)}")
     print(
         "Request-wall throughput = "
         f"{total_tok / request_wall if request_wall else 0.0:.1f} tok/s   "
@@ -244,15 +343,20 @@ def main():
         f"({decode_tok} tokens / {decode_wall:.2f} s after first-token latency)"
     )
     if graph_stats is not None:
+        graph_total = graph_stats["replay"] + graph_stats["fallback"]
+        graph_rate = graph_stats["replay"] / graph_total if graph_total else 0.0
         print(
-            "NPUGraph runtime = "
+            "Decode Graph runtime = "
             f"captures_ok={graph_stats['capture_success']}, "
             f"captures_failed={graph_stats['capture_failure']}, "
             f"replays={graph_stats['replay']}, "
             f"fallbacks={graph_stats['fallback']}, "
+            f"replay_rate={graph_rate:.1%}, "
             f"bucket_hits={graph_stats['bucket_hits']}"
         )
     if spec_graph_stats is not None:
+        graph_total = spec_graph_stats["replay"] + spec_graph_stats["eager_rounds"]
+        graph_rate = spec_graph_stats["replay"] / graph_total if graph_total else 0.0
         print(
             "Spec graph runtime = "
             f"captures_ok={spec_graph_stats['capture_success']}, "
@@ -260,10 +364,9 @@ def main():
             f"replays={spec_graph_stats['replay']}, "
             f"eager_rounds={spec_graph_stats['eager_rounds']}, "
             f"sampling_fallbacks={spec_graph_stats['sampling_fallbacks']}, "
+            f"replay_rate={graph_rate:.1%}, "
             f"bucket_hits={spec_graph_stats['bucket_hits']}"
         )
-    print(f"TTFT avg = {sum(ttfts) / len(ttfts) * 1000:.1f} ms   "
-          f"median = {ttfts[len(ttfts) // 2] * 1000:.1f} ms")
     if args.num_repeats > 1:
         # 冷/热分组（A/B 判据）：rep=0 = 冷跑（全量 prefill），rep>0 = 热跑（前缀
         # 命中，prefill 只重算尾部不足一块）。预热(>0)已把首条 prompt 写入缓存，
@@ -281,6 +384,12 @@ def main():
           f"(requests={pstats['requests']}, prefix_hits={pstats['prefix_hits']}, "
           f"hit_rate={pstats['hit_rate']:.1%}, cached_blocks={pstats['cached_blocks']}, "
           f"new_blocks={pstats['new_blocks']})")
+    if draft_prefix_stats is not None:
+        print("Draft prefix snapshots = "
+              f"saved={draft_prefix_stats['saved']}, "
+              f"restored={draft_prefix_stats['restored']}, "
+              f"evicted={draft_prefix_stats['evicted']}, "
+              f"host_memory={draft_prefix_stats['bytes'] / (1 << 20):.1f} MiB")
     if spec_stats is not None and spec_stats["rounds"]:
         rounds = spec_stats["rounds"]
         accepted = spec_stats["committed"] - rounds   # Σ 每轮接受 draft 数（提交数 - bonus）
@@ -291,6 +400,7 @@ def main():
               f"(accepted {accepted} / drafted {rounds * k})")
         print("Per-position acceptance = "
               + " / ".join(f"{p / rounds:.1%}" for p in spec_stats["pos"]))
+    print("===================================================")
 
 
 if __name__ == "__main__":

@@ -85,9 +85,6 @@ class Sampler(nn.Module):
             return self._forward_fast(logits, t, greedy, top_ks)
         return self._forward_legacy(logits, temperatures, top_ps, top_ks)
 
-    # 不使用 @torch.compile：torch 2.11 Inductor 对 legacy 路径中
-    # zeros_like().scatter_ 的 codegen 有 bug（get_block_shape NoneType），
-    # 任意 batch>1 的编译都会崩；Sampler 开销小且在 CUDA Graph 内被整体捕获，保持 eager 即可。
     def forward(
         self,
         logits: torch.Tensor,

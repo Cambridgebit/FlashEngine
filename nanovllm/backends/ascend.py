@@ -183,10 +183,10 @@ class Ascend310PBackend(BackendBase):
                     converted += 1
         return converted
 
-    def optimize_dflash_weights(self, draft_model, target_lm_head) -> int:
-        """Convert DFlash's non-module fused/shared GEMM weights to FRACTAL_NZ.
+    def optimize_block_draft_weights(self, draft_model, target_lm_head) -> int:
+        """Convert block-draft fused/shared GEMM weights to FRACTAL_NZ.
 
-        ``optimize_model_weights`` sees regular Linear modules, but DFlash also
+        ``optimize_model_weights`` sees regular Linear modules, but block drafts also
         owns a concatenated all-layer context-KV projection and directly shares
         the target LM-head tensor. Both are hot-path GEMMs on 310P.
         """
@@ -197,8 +197,17 @@ class Ascend310PBackend(BackendBase):
         if fused is not None and fused.ndim == 2:
             draft_model._fused_kv_weight = tn.npu_format_cast(fused, acl_format)
             converted += 1
+        markov = getattr(draft_model, "markov_head", None)
+        if markov is not None:
+            markov.markov_w2.weight_nz = tn.npu_format_cast(
+                markov.markov_w2.weight, acl_format)
+            converted += 1
         lm_weight = getattr(target_lm_head, "weight_nz", None)
-        if lm_weight is not None:
+        if draft_model.lm_head_weight is not target_lm_head.weight:
+            draft_model.lm_head_weight_nz = tn.npu_format_cast(
+                draft_model.lm_head_weight, acl_format)
+            converted += 1
+        elif lm_weight is not None:
             # ``lm_head_weight`` was constructed from the target Parameter, so
             # nn.Module registered that name in ``_parameters``. Replacing it
             # with a plain NPU tensor raises TypeError. Keep the shared ND
@@ -341,6 +350,34 @@ class Ascend310PBackend(BackendBase):
     def empty_cache(self):
         torch.npu.empty_cache()
 
+    def shutdown(self):
+        """Release the process-wide torch-npu runtime after engine teardown.
+
+        ``empty_cache`` only releases cached allocator blocks; it intentionally
+        keeps the NPU context alive.  Short-lived scripts need the torch-npu
+        shutdown hook as well, otherwise the Python process can remain visible
+        in npu-smi after all model tensors have been dropped.
+        """
+        try:
+            self.synchronize()
+        finally:
+            self.empty_cache()
+        try:
+            import torch_npu
+            npu_shutdown = getattr(torch_npu, "_npu_shutdown", None)
+            if callable(npu_shutdown):
+                npu_shutdown()
+            else:
+                print(
+                    "[nano-vllm] Warning: torch_npu._npu_shutdown is unavailable; "
+                    "the NPU runtime will be released by its interpreter-exit hook.",
+                    flush=True,
+                )
+        except Exception as exc:
+            # Cleanup must not mask the benchmark/server result. torch-npu also
+            # registers its own interpreter-exit hook as a final fallback.
+            print(f"[nano-vllm] Warning: NPU runtime shutdown failed: {exc}", flush=True)
+
     def mem_get_info(self):
         return torch.npu.mem_get_info()
 
@@ -352,6 +389,22 @@ class Ascend310PBackend(BackendBase):
 
     def new_graph(self):
         return torch.npu.NPUGraph()
+
+    def create_decode_graph_executor(self, plan):
+        from nanovllm.backends.ascend310p.graph import NPUGraphDecodeRunner
+        return NPUGraphDecodeRunner(plan)
+
+    def prefix_cache_disable_reason(self) -> str | None:
+        if not self.supports_splitfuse:
+            return "the runtime lacks paged-attention SplitFuse"
+        return None
+
+    def dense_noncausal_attention(self, q, k, v, mask, scale: float):
+        # Some 310P images cannot lower torch SDPA for this non-causal shape.
+        scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+        scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
+        probs = torch.softmax(scores.float(), dim=-1).to(q.dtype)
+        return torch.matmul(probs, v)
 
     @contextmanager
     def graph_ctx(self, graph, pool=None):
@@ -426,9 +479,14 @@ class Ascend310PBackend(BackendBase):
         )
 
     def prefill_attention(self, q, k, v, context, scale):
-        seq_lens = (context.cu_seqlens_q[1:] - context.cu_seqlens_q[:-1]).to(
-            device="cpu", dtype=torch.int32
-        ).contiguous()
+        seq_lens = context.host_seq_lens_q
+        if seq_lens is None:
+            # Graph/internal callers may only provide device cu_seqlens. Normal
+            # prefill always supplies host_seq_lens_q from prepare_prefill.
+            seq_lens = (context.cu_seqlens_q[1:] - context.cu_seqlens_q[:-1]).to(
+                device="cpu", dtype=torch.int32
+            )
+        seq_lens = seq_lens.to(device="cpu", dtype=torch.int32).contiguous()
         real_tokens = q.shape[0]
         num_heads, head_dim = q.shape[-2], q.shape[-1]
         num_kv_heads = k.shape[-2]
@@ -573,7 +631,7 @@ class Ascend310PBackend(BackendBase):
         hidden = k_cache.shape[1] * 16
         num_kv_heads = hidden // head_dim
         out = self._get_decode_out(bs, num_heads, head_dim, q.dtype, q.device)
-        from nanovllm.engine.aclgraph_attn import (
+        from nanovllm.backends.ascend310p.aclgraph_attn import (
             capture_paged_attention,
             is_attn_capturing,
             supports_pa_graph_update,

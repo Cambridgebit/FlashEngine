@@ -1,37 +1,62 @@
 from collections import deque
 
-from nanovllm.config import Config
-from nanovllm.engine.sequence import Sequence, SequenceStatus
-from nanovllm.engine.block_manager import BlockManager
 from nanovllm.backends import get_backend
+from nanovllm.config import Config
+from nanovllm.engine.block_manager import BlockManager
+from nanovllm.engine.sequence import Sequence, SequenceStatus
+from nanovllm.speculative.registry import block_draft_methods
 
 
 class Scheduler:
+    """Fair continuous-batching scheduler with chunked prefill.
+
+    Prefill and decode remain homogeneous accelerator launches, but when both
+    queues contain work the scheduler alternates them. This avoids decode
+    starvation without forcing every backend attention kernel to support a
+    mixed prefill/decode batch.
+    """
 
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
+        self.enable_chunked_prefill = config.enable_chunked_prefill
+        self.max_num_partial_prefills = config.max_num_partial_prefills
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
-        self.is_hybrid = config.is_hybrid
-        # 状态槽后端门控：hybrid（GDN 状态池）与 dense+dflash（draft ctx 稠密缓冲
-        # 槽）的 per-seq 状态槽都在 prefill 分配、decode 持有、finish/preempt 释放
-        # ——admission 必须保证「持有槽的序列总数 ≤ max_num_seqs」，否则排队请求
-        # 会在 decode 开始前把槽耗尽（dense+dflash 机械冒烟实测：ms=2 下 p2 仍占
-        # 槽时 p3/p4 被同一 prefill 批放行 → draft ctx 槽耗尽 RuntimeError）。
-        # qwen3+eagle3 无固定状态槽（spec_carry 按 seq_id 记账、finish 即释放），
-        # 门控关闭，行为零变化。
-        self.state_slots_gate = config.is_hybrid or config.spec_method == "dflash"
-        # hybrid GDN 状态槽释放回调（llm_engine 注入为 model_runner.drop_seq_state
-        # 的包装；回调解耦——scheduler 不持有 model_runner 引用。qwen3 路径恒
-        # None，preempt 零开销直通）。
+        # 上下文硬上限：引擎侧兜底，不依赖调用方把 max_tokens 夹紧。
+        # 越过 max_model_len 继续写 KV / 取 token 会让注意力读到从未写入的槽位，
+        # 表现为退化输出（重复同一个 token），而不是报错。
+        self.max_model_len = config.max_model_len
         self.on_preempt = None
+        self._prefer_decode = False
+        self.stats = {
+            "steps": 0,
+            "prefill_steps": 0,
+            "decode_steps": 0,
+            "prefill_tokens": 0,
+            "decode_tokens": 0,
+            "chunked_prefill_steps": 0,
+            "admitted_requests": 0,
+            "preemptions": 0,
+        }
+
         num_blocks = config.num_kvcache_blocks
-        if get_backend().reserve_dummy_kv_block():
-            assert num_blocks > 1, "310P dummy KV block requires num_kvcache_blocks > 1"
+        backend = get_backend()
+        if backend.reserve_dummy_kv_block():
+            if num_blocks <= 1:
+                raise RuntimeError(
+                    "The backend dummy KV block requires num_kvcache_blocks > 1"
+                )
             num_blocks -= 1
-        self.block_manager = BlockManager(num_blocks, config.kvcache_block_size,
-                                          config.enable_prefix_cache)
+        self.block_manager = BlockManager(
+            num_blocks,
+            config.kvcache_block_size,
+            config.enable_prefix_cache,
+            keep_last_block_unhashed=(
+                config.spec_method in block_draft_methods()
+                and getattr(backend, "supports_dflash_paged", False)
+            ),
+        )
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
 
@@ -41,57 +66,89 @@ class Scheduler:
     def add(self, seq: Sequence):
         self.waiting.append(seq)
 
-    def schedule(self) -> tuple[list[Sequence], bool]:
-        scheduled_seqs = []
-        num_batched_tokens = 0
+    def _num_partial_prefills(self) -> int:
+        return sum(bool(seq.block_table) for seq in self.waiting)
 
-        # prefill
-        # 状态槽后端 admission 门控（hybrid GDN 池 / dense+dflash draft ctx 槽）：
-        # 已 prefill 的序列即使在 prefill 批次间停滞（本引擎 prefill/decode 不同
-        # 批）也持有槽位，若不限制「持有槽的序列总数」，排队请求会在 decode 开始
-        # 前把槽耗尽。故门控后端下追加「步首 running + 本步新 prefill ≤
-        # max_num_seqs」（vLLM MambaManager 同思路：无空闲状态槽不放行新请求；
-        # preempt/finish 缩减 running 后自然放行）。注意用循环前快照：整段 prefill
-        # 的序列在循环内同时进入 running 与 scheduled_seqs，用实时 len(running)
-        # 会双计。
-        # 非门控后端（qwen3+eagle3 / 非 spec）短路恒真（快照变量不求值），条件与
-        # 原式等价，行为零变化。
-        running_holders = len(self.running)
-        while (self.waiting and len(scheduled_seqs) < self.max_num_seqs
-               and (not self.state_slots_gate
-                    or running_holders + len(scheduled_seqs) < self.max_num_seqs)):
+    def _num_active(self) -> int:
+        # A partial prefill owns KV blocks and optional draft state just like a
+        # running sequence, so it counts against max_num_seqs.
+        return len(self.running) + self._num_partial_prefills()
+
+    def _schedule_prefill(self) -> list[Sequence]:
+        scheduled: list[Sequence] = []
+        num_batched_tokens = 0
+        partial_prefills = self._num_partial_prefills()
+        active = len(self.running) + partial_prefills
+
+        while self.waiting and len(scheduled) < self.max_num_seqs:
             seq = self.waiting[0]
-            remaining = self.max_num_batched_tokens - num_batched_tokens
-            if remaining == 0:
+            was_partial = bool(seq.block_table)
+            if not was_partial and active >= self.max_num_seqs:
                 break
-            if not seq.block_table:
+
+            remaining_budget = self.max_num_batched_tokens - num_batched_tokens
+            if remaining_budget <= 0:
+                break
+
+            if not was_partial:
                 num_cached_blocks = self.block_manager.can_allocate(seq)
                 if num_cached_blocks == -1:
                     break
-                num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
+                remaining_tokens = seq.num_tokens - num_cached_blocks * self.block_size
             else:
-                num_tokens = seq.num_tokens - seq.num_cached_tokens
-            # hybrid 核实（阶段1b）：config 断言 max_num_batched_tokens >=
-            # max_model_len 下，首序列 remaining 即 ≥ 任意整段 prompt，min() 不截断、
-            # 本分支「仅首序列可切分」不可达 → hybrid prefill 恒整段（无 chunk）。
-            # （prompt 超过 max_model_len 属用户错误，非本断言保护范围。）
-            if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
-                break
-            if not seq.block_table:
+                num_cached_blocks = 0
+                remaining_tokens = seq.num_tokens - seq.num_cached_tokens
+
+            will_be_partial = remaining_tokens > remaining_budget
+            if will_be_partial:
+                if not self.enable_chunked_prefill:
+                    break
+                if not was_partial and partial_prefills >= self.max_num_partial_prefills:
+                    break
+
+            if not was_partial:
                 self.block_manager.allocate(seq, num_cached_blocks)
-            seq.num_scheduled_tokens = min(num_tokens, remaining)
+                active += 1
+                self.stats["admitted_requests"] += 1
+
+            seq.num_scheduled_tokens = min(remaining_tokens, remaining_budget)
+            if seq.num_scheduled_tokens <= 0:
+                raise RuntimeError(
+                    f"Scheduler made no prefill progress for sequence {seq.seq_id}."
+                )
             num_batched_tokens += seq.num_scheduled_tokens
-            if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
+            scheduled.append(seq)
+
+            complete = (
+                seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens
+            )
+            if complete:
                 seq.status = SequenceStatus.RUNNING
                 self.waiting.popleft()
                 self.running.append(seq)
-            scheduled_seqs.append(seq)
+                if was_partial:
+                    partial_prefills -= 1
+            else:
+                if not was_partial:
+                    partial_prefills += 1
+                # A partial chunk consumes the remaining token budget by
+                # construction; preserve FIFO order and continue next step.
+                break
 
-        if scheduled_seqs:
-            return scheduled_seqs, True
+        if scheduled:
+            self.stats["steps"] += 1
+            self.stats["prefill_steps"] += 1
+            self.stats["prefill_tokens"] += num_batched_tokens
+            if any(
+                seq.num_cached_tokens + seq.num_scheduled_tokens < seq.num_tokens
+                for seq in scheduled
+            ):
+                self.stats["chunked_prefill_steps"] += 1
+        return scheduled
 
-        # decode
-        while self.running and len(scheduled_seqs) < self.max_num_seqs:
+    def _schedule_decode(self) -> list[Sequence]:
+        scheduled: list[Sequence] = []
+        while self.running and len(scheduled) < self.max_num_seqs:
             seq = self.running.popleft()
             while not self.block_manager.can_append(seq):
                 if self.running:
@@ -103,50 +160,101 @@ class Scheduler:
                 seq.num_scheduled_tokens = 1
                 seq.is_prefill = False
                 self.block_manager.may_append(seq)
-                scheduled_seqs.append(seq)
-        assert scheduled_seqs
-        self.running.extendleft(reversed(scheduled_seqs))
-        return scheduled_seqs, False
+                scheduled.append(seq)
+        self.running.extendleft(reversed(scheduled))
+        if scheduled:
+            self.stats["steps"] += 1
+            self.stats["decode_steps"] += 1
+            self.stats["decode_tokens"] += len(scheduled)
+        return scheduled
+
+    def schedule(self) -> tuple[list[Sequence], bool]:
+        # Alternate homogeneous prefill and decode launches under concurrent
+        # load. If one side cannot make progress, immediately try the other.
+        if self.waiting and (not self.running or not self._prefer_decode):
+            prefills = self._schedule_prefill()
+            if prefills:
+                self._prefer_decode = bool(self.running)
+                return prefills, True
+
+        decodes = self._schedule_decode()
+        if decodes:
+            self._prefer_decode = False
+            return decodes, False
+
+        prefills = self._schedule_prefill()
+        if prefills:
+            self._prefer_decode = bool(self.running)
+            return prefills, True
+
+        raise RuntimeError(
+            "Scheduler cannot make progress: no KV capacity is available for "
+            "the waiting request and no running request can be decoded."
+        )
+
+    def get_stats(self) -> dict:
+        result = dict(self.stats)
+        result.update(
+            running=len(self.running),
+            waiting=len(self.waiting),
+            partial_prefills=self._num_partial_prefills(),
+            active=self._num_active(),
+        )
+        return result
 
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
         seq.is_prefill = True
         self.block_manager.deallocate(seq)
+        self.stats["preemptions"] += 1
         if self.on_preempt is not None:
-            # hybrid：抢占即丢 GDN 状态槽（正确性优先——状态与 KV 一同作废，
-            # 重 prefill 时零初始化重建）。回调由 llm_engine 注入，见 __init__。
             self.on_preempt(seq)
         self.waiting.appendleft(seq)
 
-    def prepare_spec_round(self, num_draft_tokens: int) -> list[Sequence]:
-        """投机解码轮准备：为每个 running 序列预分配 len+k 的 block 容量。
+    def prepare_spec_round(self, num_draft_tokens: int) -> tuple[list[Sequence], list[Sequence]]:
+        """Reserve KV capacity for one speculative round.
 
-        容量不足时抢占该序列（丢弃 KV，退回 waiting 等待重 prefill）。
+        返回 `(可参与本轮的序列, 因到上下文顶而本轮前就结束的序列)`：
+        顶格序列若不剔除，verify 会往 `max_model_len` 之外的位置写 KV。
         """
-        active = []
+        active: list[Sequence] = []
+        capped: list[Sequence] = []
         while self.running:
             seq = self.running.popleft()
-            # +1：draft 流最深写槽 = len+k-3，verify 覆盖到 len+k-1，留 1 余量。
-            if self.block_manager.ensure_capacity(seq, len(seq) + num_draft_tokens + 1):
+            if len(seq) >= self.max_model_len:
+                seq.status = SequenceStatus.FINISHED
+                self.block_manager.deallocate(seq)
+                capped.append(seq)
+                continue
+            target = min(len(seq) + num_draft_tokens + 1, self.max_model_len)
+            if self.block_manager.ensure_capacity(seq, target):
                 active.append(seq)
             else:
                 self.preempt(seq)
         self.running.extend(active)
-        return active
+        return active, capped
 
     def _maybe_finish(self, seq: Sequence, token_id: int) -> bool:
-        """完成判定（commit_spec / postprocess 共用）：命中 eos 或补全长度达 max_tokens。"""
-        return (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens >= seq.max_tokens
+        return (
+            (not seq.ignore_eos and token_id == self.eos)
+            or seq.num_completion_tokens >= seq.max_tokens
+            or seq.num_tokens >= self.max_model_len   # 到上下文顶：硬停，不再越界写 KV
+        )
 
-    def commit_spec(self, seqs: list[Sequence], tokens_list: list[list[int]]) -> list[Sequence]:
-        """投机解码轮提交：逐 token 追加（遇 eos / max_tokens 提前截断并结束序列）。
-
-        投机解码产生的 token 不做 block hash（前缀缓存仅覆盖 prefill 阶段，
-        避免被拒绝的 draft token 污染哈希表）。
-        """
+    def commit_spec(
+        self, seqs: list[Sequence], tokens_list: list[list[int]]
+    ) -> list[Sequence]:
         finished = []
         for seq, tokens in zip(seqs, tokens_list):
             for token_id in tokens:
+                # 投机一轮可提交 k+1 个 token：逐个提交时在顶格处截断，
+                # 保证 num_tokens 永不越过 max_model_len。
+                if seq.num_tokens >= self.max_model_len:
+                    seq.status = SequenceStatus.FINISHED
+                    self.block_manager.deallocate(seq)
+                    self.running.remove(seq)
+                    finished.append(seq)
+                    break
                 seq.append_token(token_id)
                 seq.num_cached_tokens = seq.num_tokens
                 if self._maybe_finish(seq, token_id):
@@ -157,7 +265,9 @@ class Scheduler:
                     break
         return finished
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
+    def postprocess(
+        self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool
+    ):
         for seq, token_id in zip(seqs, token_ids):
             self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens += seq.num_scheduled_tokens

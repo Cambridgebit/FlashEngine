@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the Nano-vLLM project
 
-"""310P decode 用 NPUGraph（ACLGraph）runner，对齐 nano-vllm-ascend bench_ttft_tps --mode aclgraph。
+"""Ascend 310P NPUGraph decode executor.
 
 每个 bucket 永久持有固定地址静态 Tensor；runtime 只 copy_ 内容。
 Sampler 在图外；图内是 model.forward + compute_logits。
@@ -12,6 +12,7 @@ import traceback
 
 import torch
 
+from nanovllm.backends.graph import DecodeGraphExecutor, DecodeGraphPlan
 from nanovllm.utils.context import set_context, reset_context
 
 
@@ -47,21 +48,20 @@ class DecodeGraphEntry:
     enabled: bool = True
     capture_error: str | None = None
 
-class NPUGraphDecodeRunner:
+class NPUGraphDecodeRunner(DecodeGraphExecutor):
 
-    def __init__(self, model_runner):
-        self.model_runner = model_runner
-        self.model = model_runner.model
-        self.config = model_runner.config
-        self.device = model_runner.device
-        self.block_size = model_runner.block_size
-        max_bs = model_runner._graph_max_bs
+    def __init__(self, plan: DecodeGraphPlan):
+        self.model = plan.model
+        self.config = plan.config
+        self.device = plan.device
+        self.block_size = plan.block_size
+        max_bs = plan.max_batch_size
         sizes = [x for x in ([1, 2, 4, 8] + list(range(16, max_bs + 1, 16))) if x <= max_bs]
         if not sizes or sizes[-1] != max_bs:
             sizes.append(max_bs)
         self.graph_capture_sizes = sizes
-        self.max_block_cols = model_runner._pin_W
-        self.warmup_iters = model_runner.backend.graph_warmup_iters()
+        self.max_block_cols = plan.max_block_columns
+        self.warmup_iters = plan.warmup_iters
         self.dummy_kv_block = self.config.num_kvcache_blocks - 1
         self.entries: dict[int, DecodeGraphEntry] = {}
         self._npu = npu_graph_api()
@@ -71,7 +71,7 @@ class NPUGraphDecodeRunner:
         for stream in (self.capture_stream, self.update_stream):
             with torch.npu.stream(stream):
                 torch.empty(1, device=self.device)
-        from nanovllm.engine.aclgraph_attn import supports_pa_graph_update
+        from nanovllm.backends.ascend310p.aclgraph_attn import supports_pa_graph_update
         self._pa_update_ok = supports_pa_graph_update()
         self.stats = {
             "capture_success": 0,
@@ -80,6 +80,16 @@ class NPUGraphDecodeRunner:
             "fallback": 0,
             "bucket_hits": {},
         }
+
+    @property
+    def capture_sizes(self) -> tuple[int, ...]:
+        return tuple(self.graph_capture_sizes)
+
+    def is_available(self) -> bool:
+        return any(
+            entry.enabled and entry.graph is not None
+            for entry in self.entries.values()
+        )
 
     def _create_pool_handle(self):
         handle_fn = getattr(self._npu, "graph_pool_handle", None)
@@ -224,7 +234,7 @@ class NPUGraphDecodeRunner:
             # and fall back to eager decode instead of aborting engine startup.
             entry = self._allocate_entry(graph_bs)
             self._fill_dummy(entry)
-            from nanovllm.engine.aclgraph_attn import (
+            from nanovllm.backends.ascend310p.aclgraph_attn import (
                 begin_attn_capture,
                 finish_attn_capture,
             )
@@ -317,7 +327,7 @@ class NPUGraphDecodeRunner:
         # here serialized every decode token; result.tolist() provides the
         # required completion point after replay.
         if entry.attn_captures:
-            from nanovllm.engine.aclgraph_attn import update_paged_attention_params
+            from nanovllm.backends.ascend310p.aclgraph_attn import update_paged_attention_params
             ok = update_paged_attention_params(
                 entry.attn_captures,
                 block_table=entry.block_tables,

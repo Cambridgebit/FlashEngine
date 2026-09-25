@@ -85,10 +85,6 @@ class Qwen3Attention(nn.Module):
             self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
             self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
-    # torch.compile 时整块保持 eager（graph-break）：对齐 vLLM PIECEWISE 思路。
-    # CoreX Inductor 在 qkv 切片/rope/attention 这一簇的跨边界融合会产出错误结果，
-    # 且 qkv/o_proj 是单 GEMM，不参与编译几乎无损；编译收益集中在 MLP 与 RMSNorm。
-    @torch.compiler.disable
     def forward(
         self,
         positions: torch.Tensor,

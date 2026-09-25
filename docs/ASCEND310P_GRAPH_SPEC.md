@@ -52,7 +52,7 @@ scatter metadata
     → one D2H readback
 ```
 
-### 1.3 DFlash 整轮图
+### 1.3 DFlash / DSpark 整轮图
 
 ```text
 scatter metadata
@@ -133,7 +133,7 @@ Weights will be converted while loading.
 
 ## 4. 普通 decode 的 NPUGraph 对齐
 
-实现文件：`nanovllm/engine/npu_graph_runner.py`。
+实现文件：`nanovllm/backends/ascend310p/graph.py`。
 
 ### 4.1 Batch bucket
 
@@ -350,7 +350,6 @@ DFlash 专用 metadata 包括：
 - `df_ctx_pos`：本轮 aux 追加位置；
 - `df_ctx_phys_slots`：对应的物理 slot；
 - `df_total_lens`：SplitFuse 读取的总 KV 长度；
-- `df_carry`：Qwen3.5 GDN 路径的状态携带槽；
 - `df_ctx_aux`：固定大小的 GPU aux staging buffer。
 
 block query 的 position 直接复用 host 已展开的 `v_positions`，不在图内执行 int64
@@ -368,15 +367,16 @@ DFlash query block 有 16 行，因此 padding 请求不能只把 16 行全部�
 
 这既满足算子输入约束，也不会污染真实请求。
 
-### 6.6 Prefix cache 门控
+### 6.6 Prefix cache（2026-09 更新）
 
-DFlash 的 draft context 不只依赖 token KV，还依赖 target aux。prefix hit 会跳过命中段的 target
-prefill，因此无法重建对应的 DFlash aux/KV。310P DFlash 会自动关闭 prefix cache：
+310P 分页 DFlash/DSpark 的 draft K/V 与 target K/V 使用相同的物理 block id 与 slot 编号，
+并在首次 prefill 时写入已投影的上下文状态。因此 prefix hit 复用某个 target block 时，
+对应的 draft block 同时保留，不需要重新计算 target aux。运行时仍需 SplitFuse；缺失时
+prefix cache 关闭。块查询会覆盖 anchor 所在的 prompt 末块，故该末块始终不注册为
+可复用哈希；下一次请求最多多做一个 block 的 prefill，换取草稿上下文正确性。
 
-```text
-Ascend 310P prefix cache disabled:
-DFlash auxiliary states cannot be reconstructed on a prefix hit.
-```
+这条规则只适用于分页 draft KV。CUDA/CoreX 的稠密 draft KV 通过有界 CPU block
+快照恢复。310P 路径尚需真实板卡上的前缀命中/图回放/输出一致性验收。
 
 ### 6.7 初始化顺序兼容
 
@@ -386,8 +386,6 @@ block table，draft NZ cache 也尚未创建。310P paged DFlash 在这一轮只
 DFlash 路径。
 
 该门控仅对 `dflash_paged=True` 生效；CoreX/CUDA 的稠密 DFlash warmup 行为保持不变。
-
----
 
 ## 7. Graph metadata 与同步策略
 
@@ -443,7 +441,7 @@ int32 graph buffer，不在 attention 调用内部临时 `.to()`。
 
 - 310P speculative decoding 只支持 TP=1；
 - 310P 强制 fp16；
-- Qwen3.5 hybrid + DFlash 仍只支持 CUDA；310P 支持的是 dense Qwen3 + DFlash；
+- 当前 target model 为 dense Qwen3；
 - nano-vLLM 没有 vLLM 的异步调度重叠，因此即使算子与图路径对齐，吞吐仍可能存在 host
   scheduling 差距；
 - 不同 CANN/torch-npu 版本对 SplitFuse v2、compressed mask 和 graph-task update 的支持不同，
@@ -486,12 +484,10 @@ Speculative method: dflash
 Speculative tokens: 15
 DFlash attention path: paged-KV/SplitFuse-legacy|v2
 Graph mode: spec_graph
-Prefix cache: disabled
+Prefix cache: enabled when SplitFuse is available; final prompt block excluded from prefix hashing (requires hardware validation)
 ```
 
 如果显示 `dense-KV/SDPA-fallback`，说明 SplitFuse 不可用或分页路径被环境变量关闭。
-
----
 
 ## 10. 验证命令
 
@@ -568,11 +564,10 @@ max sequences 完全一致，同时报告：
 ## 12. 关键源码索引
 
 - `nanovllm/backends/ascend.py`：310P 算子、NZ 权重/KV、SplitFuse、图能力声明；
-- `nanovllm/engine/npu_graph_runner.py`：普通 decode NPUGraph bucket runner；
+- `nanovllm/backends/ascend310p/graph.py`：普通 decode NPUGraph bucket runner；
 - `nanovllm/engine/model_runner.py`：spec metadata、EAGLE3/DFlash 整轮图、捕获与降级；
 - `nanovllm/models/eagle3.py`：EAGLE3 draft 模型与 shifted-stream 前向；
 - `nanovllm/models/dflash.py`：DFlash context projection、分页/稠密 attention 分支；
-- `nanovllm/engine/aclgraph_attn.py`：paged-attention graph-task update 能力探测；
+- `nanovllm/backends/ascend310p/aclgraph_attn.py`：paged-attention graph-task update 能力探测；
 - `docs/EAGLE3.md`：EAGLE3 算法说明；
 - `docs/DFlash.md`：DFlash 算法与多后端说明。
-

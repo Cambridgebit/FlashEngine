@@ -1,9 +1,10 @@
-"""DFlash 块草稿模型（z-lab DFlash / vllm model_executor/models/qwen3_dflash.py
-的最小等价实现，阶段2 eager 路径）。
+"""DFlash block-draft model for a dense Qwen3 target.
 
-结构（Qwen3.5-2B-Dflash checkpoint：model_type=qwen3，5 层 decoder，hidden 2048，
-GQA 16Q/4KV 头，head_dim 128，rope theta 1e7 全旋转，q_norm/k_norm 标准 RMSNorm
-——draft 是普通 qwen3 注意力，非 target 的 Gemma 式/Gemma 门控）：
+The draft is a compact Qwen3 decoder with non-causal block attention. It shares
+the target embedding and LM-head weights and receives target auxiliary states
+through a learned projection.
+
+Structure:
 - fc:          Linear(len(target_layer_ids)*hidden -> hidden)，aux 拼接投影；
 - hidden_norm: RMSNorm(hidden)，作用在 fc 输出上（上下文 KV 投影用，见
                vllm qwen3_dflash._project_context_kv：先 fc 后 hidden_norm）；
@@ -155,7 +156,8 @@ class DFlashBlockAttention(nn.Module):
             # eager 阶段显式展开换确定性（规模 ≤ [n,16,ctx+16,128] bf16，~MB 级）。
             k_full = k_full.repeat_interleave(rep, dim=1)
             v_full = v_full.repeat_interleave(rep, dim=1)
-        o = F.scaled_dot_product_attention(q, k_full, v_full, attn_mask=mask, scale=self.scaling)
+        o = self.backend.dense_noncausal_attention(
+            q, k_full, v_full, mask, self.scaling)
         o = o.transpose(1, 2).reshape(n * rows, self.q_size)
         return self.o_proj(o)
 
@@ -227,7 +229,7 @@ class DFlashDraftModel(nn.Module):
         self.norm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
         self.backend = get_backend()
         self.use_paged_kv = bool(getattr(self.backend, "supports_dflash_paged", False))
-        # 上下文 KV 稠密缓冲占位（引擎注入真实缓冲，镜像 qwen3_5 conv_cache/ssm_cache）
+        # Dense context-KV buffers are allocated and injected by ModelRunner.
         self.ctx_k_cache = torch.tensor([])
         self.ctx_v_cache = torch.tensor([])
 
@@ -299,7 +301,8 @@ class DFlashDraftModel(nn.Module):
                       max_ctx: int, rows: int,
                       query_slots: torch.Tensor | None = None,
                       block_tables: torch.Tensor | None = None,
-                      total_lens: torch.Tensor | None = None) -> torch.Tensor:
+                      total_lens: torch.Tensor | None = None,
+                      sample_from_anchor: bool = False) -> torch.Tensor:
         """block 草稿前向（形状流转见模块 docstring）。
 
         last_token_ids [n]（anchor = 最后已提交 token）；positions [n, rows] =
@@ -310,10 +313,11 @@ class DFlashDraftModel(nn.Module):
         """
         n = last_token_ids.size(0)
         k = rows - 1
-        # 输入行：[anchor embed, mask×k]（mask 行 = embed(mask_token_id)）
+        # DFlash samples masks; DSpark's native layout samples anchor + masks.
+        # Both layouts use the same non-causal block backbone.
         anchor = self.embed_tokens(last_token_ids)                         # [n, h]
         embeds = torch.cat([anchor.unsqueeze(1),
-                            self._mask_embed.expand(n, k, -1)], dim=1)     # [n, rows, h]
+                            self._mask_embed.expand(n, rows - 1, -1)], dim=1)
         flat = embeds.reshape(n * rows, -1)
         pos_flat = positions.reshape(-1)
         # 上下文 gather（右 padding 至 max_ctx；padding 行由 -inf mask 屏蔽。缓冲
@@ -322,13 +326,14 @@ class DFlashDraftModel(nn.Module):
             assert query_slots is not None and block_tables is not None and total_lens is not None
             k_all = v_all = mask = None
         else:
-            k_all = self.ctx_k_cache[ctx_slots, :max_ctx]   # [n, max_ctx, L, kvh, hd]
+            k_all = self.ctx_k_cache[ctx_slots, :max_ctx]
             v_all = self.ctx_v_cache[ctx_slots, :max_ctx]
-            # 非因果 mask：上下文段 j < ctx_len_i 可见，自身段（后 rows 列）全可见
             ar = torch.arange(max_ctx, device=flat.device)
-            ctx_ok = ar[None, :] < ctx_lens[:, None]        # [n, max_ctx]
+            ctx_ok = (ar[None, None, :] < ctx_lens[:, None, None]).expand(
+                n, rows, max_ctx)
+            # Non-causal block attention: valid context plus every query row.
             mask = torch.cat(
-                [ctx_ok[:, None, None, :].expand(n, 1, rows, max_ctx),
+                [ctx_ok[:, None, :, :],
                  torch.ones(n, 1, rows, rows, dtype=torch.bool, device=flat.device)],
                 dim=-1)                                     # [n, 1, rows, max_ctx+rows]
         residual = None
@@ -342,8 +347,9 @@ class DFlashDraftModel(nn.Module):
                                      context_lens=total_lens,
                                      max_seq_len=max_ctx)
         hidden, _ = self.norm(hidden, residual)
-        # 行 0 = anchor 丢弃（z-lab：anchor 只作条件），行 1..k 过 target lm_head
-        h = hidden.view(n, rows, -1)[:, 1:].reshape(n * k, -1)
+        # DFlash discards anchor; DSpark may predict from every query row.
+        h = hidden.view(n, rows, -1)
+        h = (h if sample_from_anchor else h[:, 1:]).reshape(-1, h.size(-1))
         return F.linear(
             h, getattr(self, "lm_head_weight_nz", self.lm_head_weight)
         )                                               # [n*k, vocab]

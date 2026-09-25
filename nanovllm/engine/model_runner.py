@@ -1,7 +1,9 @@
+import gc
 import os
 import pickle
 import time
 import traceback
+from collections import OrderedDict
 from itertools import accumulate
 
 import torch
@@ -11,15 +13,16 @@ from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.backends import get_backend
+from nanovllm.backends.graph import DecodeGraphPlan
 from nanovllm.config import Config
+from nanovllm.engine.block_manager import BlockManager
 from nanovllm.engine.sequence import Sequence
-from nanovllm.models.qwen3 import Qwen3ForCausalLM
-from nanovllm.models.qwen3_5 import Qwen3_5ForCausalLM
-from nanovllm.models.eagle3 import Eagle3DraftModel, load_eagle3_draft
-from nanovllm.models.dflash import DFlashDraftModel, load_dflash_draft
 from nanovllm.layers.sampler import Sampler
+from nanovllm.speculative.registry import block_draft_methods
 from nanovllm.utils.context import set_context, get_context, reset_context
-from nanovllm.utils.loader import load_model, iter_safetensors
+
+
+BLOCK_DRAFT_METHODS = block_draft_methods()
 
 
 def _bucket(table, n):
@@ -163,53 +166,36 @@ class ModelRunner:
         self.backend = get_backend()
         self.dflash_paged = bool(
             config.spec_model
-            and config.spec_method == "dflash"
+            and config.spec_method in BLOCK_DRAFT_METHODS
             and getattr(self.backend, "supports_dflash_paged", False)
         )
-        if self.dflash_paged and config.spec_num_tokens + 1 > self.block_size:
+        # verify/refill 的 block_table 形态按能力位分叉：310P 的分页 PA 读整池，
+        # 需要 per-query 展开表；CUDA/CoreX 的 varlen flash 硬校验
+        # block_table.shape[0] == batch_size，只能吃 per-seq 表（见 _verify_block_tables）。
+        self.paged_context_attn = bool(
+            getattr(self.backend, "supports_paged_context_attn", False)
+        )
+        draft_rows = (config.spec_num_tokens if config.spec_method == "dspark"
+                      and getattr(config.draft_config, "sample_from_anchor", True)
+                      else config.spec_num_tokens + 1)
+        if self.dflash_paged and draft_rows > self.block_size:
             raise ValueError(
                 "Ascend 310P paged DFlash requires draft block_size <= "
-                f"KV-cache block size ({config.spec_num_tokens + 1} > {self.block_size})."
+                f"KV-cache block size ({draft_rows} > {self.block_size})."
             )
-        if config.enable_prefix_cache and self.backend.name == "ascend310p":
-            disable_reason = None
-            if config.spec_model and config.spec_method == "dflash":
-                # A prefix hit skips target prefill for the reused blocks. DFlash
-                # also needs the auxiliary target states from those blocks to
-                # populate its private projected KV cache, so accepting such a
-                # hit would leave the draft context incomplete.
-                disable_reason = "DFlash auxiliary states cannot be reconstructed on a prefix hit"
-            elif not getattr(self.backend, "supports_splitfuse", False):
-                disable_reason = "the runtime lacks paged-attention SplitFuse"
+        if config.enable_prefix_cache:
+            disable_reason = self.backend.prefix_cache_disable_reason()
             if disable_reason is not None:
                 print(
-                    f"[nano-vllm] Ascend 310P prefix cache disabled: {disable_reason}.",
+                    f"[nano-vllm] Prefix cache disabled by backend: {disable_reason}.",
                     flush=True,
                 )
                 config.enable_prefix_cache = False
-        # 设备语义串与 dtype 解析：后端强制 dtype（如 310P 仅 fp16）优先于 hf_config。
-        # dtype 取 text_config：qwen3_5 外层多模态壳无顶层 dtype（实测 None），
-        # text 侧才有；qwen3 的 text_config 即 hf_config，逐字节同值。
+        # Backend-required dtype (for example fp16 on 310P) overrides the
+        # target checkpoint dtype.
         self.device = self.backend.device_name
-        self.dtype = self.backend.default_dtype or config.text_config.dtype
-        # hybrid（Qwen3.5）总开关：GDN 状态池/槽生命周期/图与 spec 门控统一由此
-        # 分支（qwen3 路径恒 False，所有 hybrid 分支不可达，行为零变化）。
-        self.is_hybrid = config.is_hybrid
-        # GDN 状态池字节数（hybrid 下由 _alloc_gdn_state_pool 填充；qwen3 恒 0）。
-        self._gdn_state_bytes = 0
-        # EAGLE3 投机解码（仅 TP=1，见 config 断言）。
+        self.dtype = self.backend.default_dtype or config.model_config.dtype
         self.spec_enabled = bool(config.spec_model)
-        if self.spec_enabled and self.is_hybrid and config.spec_method != "dflash":
-            # 守卫（配对矩阵唯余此格拒绝）：hybrid（Qwen3.5）+ EAGLE3 未实现——
-            # EAGLE3 链式草稿的 GDN verify 分叉未接入 _sg 路径（接入前硬跑会
-            # 静默状态错乱，故干净拒绝）。四格矩阵现状：qwen3+eagle3（原路径）、
-            # qwen3_5+dflash（hybrid 基建）、qwen3+dflash（dense：_df 路径 GDN
-            # 触点已 is_hybrid 条件化）三者放行。
-            raise RuntimeError(
-                "Qwen3.5 hybrid targets support DFlash speculative decoding only "
-                "(spec_method=dflash). EAGLE3 chained drafting and its three-layer "
-                "auxiliary-state contract are not compatible with the GDN hybrid model."
-            )
         if self.spec_enabled and not self.backend.supports_spec:
             # 能力位裁决（不做 name 字符串判断）。310P 已用多 query PA 承接
             # verify/refill；此守卫留给仍未适配 paged 形态的后端。
@@ -238,7 +224,8 @@ class ModelRunner:
         self._graph_bs_active = 0
         self.graphs = None
         self.graph_pool = None
-        # 310P decode 图走独立 NPUGraphDecodeRunner（CUDA/CoreX 仍 capture_cudagraph）。
+        # Optional backend-owned graph executor; CUDA/CoreX currently use the
+        # common graph implementation below.
         self.graph_runner = None
         # 每步 / 每轮复用的 pinned 暂存：避免热路径反复 cudaHostAlloc。
         # decode 元数据并入单个声明式 blob（MetaBlob），图内 scatter 分发，仅 2 次 H2D。
@@ -257,37 +244,19 @@ class ModelRunner:
         dist.init_process_group(self.backend.dist_name, f"tcp://localhost:{config.hccl_port}", world_size=self.world_size, rank=rank)
         self.backend.set_device(rank)
         default_dtype = torch.get_default_dtype()
-        if self.backend.default_dtype is not None and self.backend.default_dtype != config.text_config.dtype:
+        if self.backend.default_dtype is not None and self.backend.default_dtype != config.model_config.dtype:
             print(
                 f"[nano-vllm] Backend {self.backend.name} requires "
-                f"dtype={self.backend.default_dtype}; model dtype={config.text_config.dtype}. "
+                f"dtype={self.backend.default_dtype}; model dtype={config.model_config.dtype}. "
                 "Weights will be converted while loading.",
                 flush=True,
             )
         torch.set_default_dtype(self.dtype)
         torch.set_default_device(self.backend.device_name)
         model_load_t0 = time.perf_counter()
-        # 模型分发：qwen3_5（hybrid）→ Qwen3_5ForCausalLM（text 形状自取
-        # hf_config.text_config）；qwen3 路径原样不动。
-        if self.is_hybrid:
-            self.model = Qwen3_5ForCausalLM(hf_config)
-        else:
-            self.model = Qwen3ForCausalLM(hf_config)
-        # 模型自带 load_weights（Qwen3.5：多模态壳前缀剥离 + GDN in_proj/conv/A_log
-        # 特例装配，见 qwen3_5.load_weights）优先；qwen3 走通用 loader，路径不变。
-        if hasattr(self.model, "load_weights"):
-            self.model.load_weights(iter_safetensors(config.model))
-        else:
-            load_model(self.model, config.model)
-        if self.is_hybrid:
-            # 契约核对：模型侧 is_hybrid 必须与 config 判定一致（防两处口径漂移）。
-            assert getattr(self.model.model, "is_hybrid", False) is True, \
-                "Model does not declare model.model.is_hybrid=True."
-            # GDN 状态池在 warmup 之前分配：GDN forward（含预热轮）需要真实的
-            # conv/ssm 缓存（Attention 的 k_cache 靠 numel()==0 跳过预热写，GDN
-            # 无此占位语义）。其字节数此后已包含在 mem_get_info 的 used 里，
-            # allocate_kv_cache 的预算循环自动计入（勿再显式扣除，避免双重计费）。
-            self._alloc_gdn_state_pool()
+        self.target_adapter = config.target_adapter
+        self.model = self.target_adapter.build(hf_config)
+        self.target_adapter.load_weights(self.model, config.model)
         if self.spec_enabled:
             # aux 隐层捕获必须在 warmup 前打开（prefill 前向开始返回 (hidden, aux)）。
             self.model.model.aux_hidden_state_layers = tuple(config.spec_aux_layers)
@@ -297,17 +266,14 @@ class ModelRunner:
                 # dflash 无独立 draft 词表（= target 词表，无 d2t）——_fill_spec_meta
                 # 的 top_k 截断上界按 target 词表取值（vllm DFlashQwen3ForCausalLM
                 # 构造时同款回填）。
-                self.draft_config.draft_vocab_size = config.text_config.vocab_size
-            if config.spec_method == "dflash":
+                self.draft_config.draft_vocab_size = config.model_config.vocab_size
+            self.draft_model = config.spec_adapter.build_draft(config, self.model)
+            if config.spec_method in BLOCK_DRAFT_METHODS:
                 d = self.draft_config
                 # DFlash draft：embed/lm_head 共享 target（构造传入）；rope 的
                 # max_position 按 max_model_len 收紧（位置恒 < max_model_len，
                 # 省 262144 全长 cos/sin 缓存的开销）。
-                self.draft_model = DFlashDraftModel(
-                    d, self.model.model.embed_tokens,
-                    target_lm_head_weight=self.model.lm_head.weight,
-                    max_position=config.max_model_len)
-                load_dflash_draft(self.draft_model, config.spec_model)
+                self.draft_model.use_paged_kv = self.dflash_paged
                 self.draft_model._build_fused_kv_buffers()
                 # draft 上下文 KV 稠密缓冲：[slots, max_model_len, L, kvh, hd]×2
                 # bf16（~84MB@ms8/mml2048；不进 block manager——上下文 KV 由 aux
@@ -325,43 +291,31 @@ class ModelRunner:
                                  d.num_hidden_layers, d.num_key_value_heads, hd)
                     self.draft_model.ctx_k_cache = torch.zeros(ctx_shape, dtype=self.dtype)
                     self.draft_model.ctx_v_cache = torch.zeros(ctx_shape, dtype=self.dtype)
+                    self._df_prefix_snapshots = OrderedDict()
+                    self._df_prefix_snapshot_bytes = 0
+                    self._df_prefix_snapshot_limit = 1 << 30  # 1 GiB host RAM
+                    self.df_prefix_snapshot_stats = {"saved": 0, "restored": 0,
+                                                     "evicted": 0}
                 self._df_pad_ctx_slot = config.max_num_seqs
-                # 槽生命周期镜像 GDN 主槽（get_or_alloc / drop_seq_state 双路径清理）
                 self.draft_ctx_slots: dict[int, int] = {}
                 self._df_ctx_free = set(range(config.max_num_seqs))
-                # DFlash 每轮状态（按 seq_id 记账，batch 组成每轮可变）：
-                # spec_ctx_pending = 上轮 verify 已提交行的 aux（GPU 常驻——每轮
-                # ≤16 行×10KB，省 D2H/H2D；CPU 常驻则每轮多两次拷贝，取舍取 GPU）；
-                # gdn_spec_carry = 上轮 verify 行 m 的 GDN 槽号（绝对值）。
+                self._df_prefix_restored: set[int] = set()
+                # Per-sequence committed aux rows waiting to be appended to the
+                # block-draft context on the next round.
                 self.spec_ctx_pending: dict[int, torch.Tensor | None] = {}
-                self.gdn_spec_carry: dict[int, int] = {}
-            else:
-                self.draft_model = Eagle3DraftModel(self.draft_config, self.model.model.embed_tokens)
-                load_eagle3_draft(self.draft_model, config.spec_model)
-            # 本轮 verify 的 GDN 写基址（host int，读回更新 carry 用；仅 dflash 写）
-            self._df_bases: list[int] = []
         weight_nz_count = self.backend.optimize_model_weights(self.model)
         if self.spec_enabled:
             weight_nz_count += self.backend.optimize_model_weights(self.draft_model)
-            if self.config.spec_method == "dflash":
-                weight_nz_count += self.backend.optimize_dflash_weights(
+            if self.config.spec_method in BLOCK_DRAFT_METHODS:
+                weight_nz_count += self.backend.optimize_block_draft_weights(
                     self.draft_model, self.model.lm_head
                 )
         self.startup_stats["weight_layout_conversions"] = float(weight_nz_count)
         self.startup_stats["model_load_s"] = time.perf_counter() - model_load_t0
-        compile_t0 = time.perf_counter()
-        if config.compile:
-            # torch.compile：CoreX 上 qkv/rope/attention 区域的 Inductor 融合会产出
-            # 错误结果，Qwen3Attention.forward 已 @torch.compiler.disable 保持 eager，
-            # 此处只编译 embed + RMSNorm + MLP（正确性已验证 PASS）。
-            self.model = torch.compile(self.model)
         self.sampler = Sampler()
         warmup_t0 = time.perf_counter()
         self.warmup_model()
         self.startup_stats["model_warmup_s"] = time.perf_counter() - warmup_t0
-        self.startup_stats["model_compile_s"] = (
-            time.perf_counter() - compile_t0 if config.compile else 0.0
-        )
         kv_t0 = time.perf_counter()
         self.allocate_kv_cache()
         self.startup_stats["kv_cache_allocation_s"] = time.perf_counter() - kv_t0
@@ -378,11 +332,10 @@ class ModelRunner:
             #   df_l1      = 各 seq 的 L-1（anchor 位置 = 块查询位置基址 = ctx_len）；
             #   df_c       = 上轮提交行数（pending 长度，append 位置回推 L-1-c）；
             #   df_ctxslot = draft 上下文稠密缓冲槽号；
-            #   df_carry   = GDN verify 行 0 读槽（gdn_spec_carry 或主槽）。
-            df_segments = ([('df_l1', M), ('df_c', M), ('df_ctxslot', M), ('df_carry', M),
-                            ('df_ctx_pos', rows * M), ('df_ctx_phys_slots', rows * M),
+            df_segments = ([('df_l1', M), ('df_c', M), ('df_ctxslot', M),
+                             ('df_ctx_pos', rows * M), ('df_ctx_phys_slots', rows * M),
                             ('df_total_lens', M)]
-                           if self.config.spec_method == "dflash" else [])
+                           if self.config.spec_method in BLOCK_DRAFT_METHODS else [])
             self._sblob = MetaBlob(
                 [('chain_tokens', M), ('chain_pos', k * M), ('chain_ctxlen', k * M),
                  ('chain_slots', k * M), ('v_pos', rows * M), ('v_slots', rows * M),
@@ -393,7 +346,7 @@ class ModelRunner:
                 + df_segments,
                 [('ctemps', M), ('ctopps', M), ('v_temps', rows * M), ('v_topps', rows * M)])
             self._sg = self._alloc_spec_graph_vars(self._graph_max_bs, rows, k)
-            if self.config.spec_method == "dflash":
+            if self.config.spec_method in BLOCK_DRAFT_METHODS:
                 # dflash 专段静态缓冲（阶段3 图轮；eagle3 不分配，字节布局零变化）。
                 self._sg.update(self._alloc_df_graph_vars(self._graph_max_bs, rows))
         self.spec_graphs = None
@@ -407,44 +360,52 @@ class ModelRunner:
             "sampling_fallbacks": 0,
             "bucket_hits": {},
         }
+        self.decode_graph_stats = {
+            "capture_success": 0,
+            "capture_failure": 0,
+            "replay": 0,
+            "fallback": 0,
+            "bucket_hits": {},
+        }
         self.graph_capture_attempted = False
         graph_t0 = time.perf_counter()
         if not self.enforce_eager:
             if not self.spec_enabled:
-                if self.backend.name == "ascend310p":
-                    # 310P 与 bench_ttft_tps --mode aclgraph 同一套图：每桶静态
-                    # Tensor + copy_ + NPUGraph.replay；sampler 图外。失败按桶 eager。
-                    from nanovllm.engine.npu_graph_runner import NPUGraphDecodeRunner
+                graph_plan = DecodeGraphPlan(
+                    model=self.model,
+                    config=self.config,
+                    device=self.device,
+                    block_size=self.block_size,
+                    max_batch_size=self._graph_max_bs,
+                    max_block_columns=self._pin_W,
+                    warmup_iters=self.backend.graph_warmup_iters(),
+                )
+                self.graph_runner = self.backend.create_decode_graph_executor(graph_plan)
+                if self.graph_runner is not None:
                     self.graph_capture_attempted = True
-                    self.graph_runner = NPUGraphDecodeRunner(self)
                     self.graph_runner.capture_all()
-                    if not any(
-                        e.enabled and e.graph is not None
-                        for e in self.graph_runner.entries.values()
-                    ):
+                    if not self.graph_runner.is_available():
+                        failed_stats = self.graph_runner.get_stats()
+                        self.decode_graph_stats.update(failed_stats)
                         print(
-                            "[nano-vllm] All 310P NPUGraph buckets failed to capture; "
+                            "[nano-vllm] All backend graph buckets failed to capture; "
                             "decode will use eager mode.",
                             flush=True,
                         )
                         self.graph_runner = None
                 else:
-                    # hybrid（Qwen3.5）与 qwen3 同构捕获 decode 图（阶段3 解除阶段1
-                    # 门控）：GDN 单步（_forward_decode）本身无 host 同步/动态 shape，
-                    # 状态槽经 context 的 device twin 静态段消费（见 _alloc_gdn_state_pool
-                    # 与 prepare_decode 的图分支）；捕获失败仍走 try/except 优雅降级。
                     self.graph_capture_attempted = True
                     self.capture_cudagraph()
+                    if self.graphs:
+                        self.decode_graph_stats["capture_success"] = len(self.graphs)
+                    else:
+                        self.decode_graph_stats["capture_failure"] = 1
             else:
-                if self.config.spec_method == "dflash":
+                if self.config.spec_method in BLOCK_DRAFT_METHODS:
                     # DFlash spec 单图整轮捕获（阶段3：上下文追加/块草稿/verify
                     # 全静态化，见 _df_round_body / capture_df_spec_cudagraph）。
                     # 图门与 EAGLE3 同款（supports_spec_graph + graph_sample_default，
                     # NANOVLLM_SPEC_GRAPH 显式覆盖）；失败自动降级 eager spec 轮。
-                    # dense（Qwen3+dflash）与 hybrid 同门：图路径的 GDN 静态段已
-                    # is_hybrid 条件化（dense 无 GDN 状态分叉，df_carry 段留零不
-                    # 消费），CUDA/CoreX 均尝试捕获——CoreX 是 dense+dflash 图的
-                    # 主目标形态（EAGLE 整轮图实机已证 ixformer verify 可捕获）。
                     _env_spec = os.environ.get("NANOVLLM_SPEC_GRAPH")
                     if (self.world_size == 1 and self.backend.supports_spec_graph
                             and (_env_spec != "0" if _env_spec is not None
@@ -493,6 +454,23 @@ class ModelRunner:
         stats["bucket_hits"] = dict(stats["bucket_hits"])
         return stats
 
+    def get_decode_graph_stats(self) -> dict:
+        """Return unified decode-graph counters for CUDA, CoreX, and Ascend."""
+        if self.graph_runner is not None and hasattr(self.graph_runner, "get_stats"):
+            return self.graph_runner.get_stats()
+        stats = dict(self.decode_graph_stats)
+        stats["bucket_hits"] = dict(stats["bucket_hits"])
+        return stats
+
+    def reset_decode_graph_runtime_stats(self):
+        """Keep capture results and reset only measured decode runtime counters."""
+        if self.graph_runner is not None and hasattr(self.graph_runner, "reset_runtime_stats"):
+            self.graph_runner.reset_runtime_stats()
+            return
+        self.decode_graph_stats["replay"] = 0
+        self.decode_graph_stats["fallback"] = 0
+        self.decode_graph_stats["bucket_hits"] = {}
+
     def reset_spec_graph_runtime_stats(self):
         """Keep capture results but start a fresh speculative runtime window."""
         self.spec_graph_stats["replay"] = 0
@@ -501,15 +479,45 @@ class ModelRunner:
         self.spec_graph_stats["bucket_hits"] = {}
 
     def exit(self):
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        backend = self.backend
+        world_size = self.world_size
+        rank = self.rank
         if self.world_size > 1:
             self.shm.close()
-            dist.barrier()
-            if self.rank == 0:
+            if dist.is_initialized():
+                dist.barrier()
+            if rank == 0:
                 self.shm.unlink()
-        if self.graphs is not None:
-            del self.graphs, self.graph_pool
-        self.backend.synchronize()
-        dist.destroy_process_group()
+        try:
+            backend.synchronize()
+        except Exception as exc:
+            print(f"[nano-vllm] Warning: device synchronization during shutdown failed: {exc}",
+                  flush=True)
+
+        # Graph pools, KV caches, models and draft models all own device
+        # allocations. Drop every runner-owned reference before flushing the
+        # allocator; deleting only ``graphs`` leaves most NPU memory resident.
+        reset_context()
+        self.__dict__.clear()
+        self._closed = True
+        gc.collect()
+        try:
+            backend.empty_cache()
+        except Exception as exc:
+            print(f"[nano-vllm] Warning: device cache cleanup failed: {exc}", flush=True)
+        if dist.is_initialized():
+            try:
+                dist.destroy_process_group()
+            except Exception as exc:
+                print(f"[nano-vllm] Warning: process-group shutdown failed: {exc}",
+                      flush=True)
+        try:
+            backend.shutdown()
+        except Exception as exc:
+            print(f"[nano-vllm] Warning: device runtime shutdown failed: {exc}", flush=True)
 
     def loop(self):
         while True:
@@ -558,34 +566,17 @@ class ModelRunner:
         else:
             self.run(seqs, True)
         self.backend.empty_cache()
-        if self.is_hybrid:
-            # 预热 dummy 序列占用的 GDN 状态槽全量回收：清映射、槽位全数归还
-            # （池数据不擦除——槽重用后的首次消费恒为 has_initial=False 的
-            # 零初始化 prefill，旧值永不被读，见 drop_seq_state）。
-            self.gdn_slots.clear()
-            self._gdn_free_slots = set(range(self.config.max_num_seqs))
-        if self.config.spec_method == "dflash":
-            # DFlash：预热 dummy 序列的 spec 状态同口径全量回收（pending aux /
-            # GDN carry 记账 / draft 上下文槽）。hybrid 与 dense（qwen3+dflash）
-            # 都需要——原实现嵌在 is_hybrid 块内，dense 首次机械冒烟实测 warmup
-            # 假槽不回收 → 首个真实 prefill 槽耗尽 RuntimeError，故提出块外。
+        if self.config.spec_method in BLOCK_DRAFT_METHODS:
+            # Reclaim draft context slots held by warmup-only sequences.
             self.spec_ctx_pending.clear()
-            self.gdn_spec_carry.clear()
+            self._df_prefix_restored.clear()
             self.draft_ctx_slots.clear()
             self._df_ctx_free = set(range(self.config.max_num_seqs))
 
     def allocate_kv_cache(self):
         config = self.config
-        hf_config = config.hf_config
-        # 形状统一取 text_config（qwen3 的 text_config 即 hf_config，逐字节同值）。
-        tc = config.text_config
-        if self.is_hybrid:
-            # hybrid：只有全注意力层进 KV 池（GDN 无 KV cache，状态在独立池，
-            # 见 _alloc_gdn_state_pool）。层数显式取模型声明（契约字段
-            # num_attention_layers），避免从 layer_types 二次推导产生口径漂移。
-            num_attn_layers = self.model.model.num_attention_layers
-        else:
-            num_attn_layers = hf_config.num_hidden_layers
+        tc = config.model_config
+        num_attn_layers = tc.num_hidden_layers
         num_kv_heads = tc.num_key_value_heads // self.world_size
         head_dim = getattr(tc, "head_dim", tc.hidden_size // tc.num_attention_heads)
         block_bytes = 2 * num_attn_layers * self.block_size * num_kv_heads * head_dim * self.dtype.itemsize
@@ -604,8 +595,6 @@ class ModelRunner:
                             * draft_head_dim * self.dtype.itemsize)
         # WSL 下上一进程退出后驱动回收显存存在数秒延迟，`used` 可能虚高；
         # 预算不足时短暂等待重测，而非直接断言崩溃。
-        # 状态池（hybrid）在 warmup 前已分配，其字节数包含在下面的 used 里、
-        # 随本预算循环自动计入——勿再显式扣除（已占用的显存扣两次即双重计费）。
         requested = config.num_kvcache_blocks
         for _ in range(6):
             free, total = self.backend.mem_get_info()
@@ -624,7 +613,6 @@ class ModelRunner:
             raise RuntimeError(
                 f"Insufficient device-memory budget for KV cache: "
                 f"{block_bytes / 2**20:.1f} MiB is required per block"
-                + (f"; GDN state pool uses {self._gdn_state_bytes / 2**20:.1f} MiB" if self.is_hybrid else "")
                 + f"; gpu_memory_utilization={config.gpu_memory_utilization} leaves zero blocks "
                 f"(used={used / 2**20:.0f} MiB, peak={peak / 2**20:.0f} MiB, "
                 f"current={current / 2**20:.0f} MiB, "
@@ -680,28 +668,12 @@ class ModelRunner:
             head_dim=head_dim,
         )
         self.kv_cache = torch.empty(shape)
-        if self.is_hybrid:
-            # KV wiring（hybrid）：显式按注意力序号映射（计划 1b 要求）。核实结论：
-            # 模块树序 = decoder 层序 = attention_layer_ids 升序，故「按模块序递增」
-            # 对 qwen3_5 本也算正确；但池切片索引与全局层号是两个概念（读写都经
-            # module 上的池切片句柄，无需换算全局层号），这里按注意力序 0..5 显式
-            # 枚举并断言模块数，防未来模型结构调整时静默错位。
-            attn_mods = [m for m in self.model.modules()
-                         if hasattr(m, "k_cache") and hasattr(m, "v_cache")]
-            assert len(attn_mods) == num_attn_layers, (
-                f"Full-attention module count ({len(attn_mods)}) does not match "
-                f"KV-cache layer count ({num_attn_layers})."
-            )
-            for attn_ord, module in enumerate(attn_mods):
-                module.k_cache = self.kv_cache[0, attn_ord]
-                module.v_cache = self.kv_cache[1, attn_ord]
-        else:
-            layer_id = 0
-            for module in self.model.modules():
-                if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                    module.k_cache = self.kv_cache[0, layer_id]
-                    module.v_cache = self.kv_cache[1, layer_id]
-                    layer_id += 1
+        layer_id = 0
+        for module in self.model.modules():
+            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                module.k_cache = self.kv_cache[0, layer_id]
+                module.v_cache = self.kv_cache[1, layer_id]
+                layer_id += 1
         if self.spec_enabled and self.config.spec_method == "eagle3":
             # EAGLE3 draft 的 paged KV cache（dflash 无此结构，见上方预算分支注释）
             d = self.draft_config
@@ -721,12 +693,11 @@ class ModelRunner:
 
     def _df_drop_state(self, seq_id: int):
         """DFlash spec 状态清理（幂等；finish 的 drop_spec_state 与 preempt 的
-        drop_seq_state 双路径共用）：pending aux、draft 上下文槽、GDN carry 记账。
-        非 dflash 直通（qwen3+eagle3 / 非 spec hybrid 零开销）。"""
-        if self.config.spec_method != "dflash":
+        drop_spec_state 共用）：pending aux 与 draft 上下文槽。"""
+        if self.config.spec_method not in BLOCK_DRAFT_METHODS:
             return
         self.spec_ctx_pending.pop(seq_id, None)
-        self.gdn_spec_carry.pop(seq_id, None)
+        self._df_prefix_restored.discard(seq_id)
         slot = self.draft_ctx_slots.pop(seq_id, None)
         if slot is not None:
             self._df_ctx_free.add(slot)
@@ -734,111 +705,6 @@ class ModelRunner:
     def drop_spec_state(self, seq_id: int):
         self.spec_hidden.pop(seq_id, None)
         self.spec_carry.pop(seq_id, None)
-        self._df_drop_state(seq_id)
-
-    def _alloc_gdn_state_pool(self):
-        """hybrid（Qwen3.5）：GDN 线性注意力状态池分配 + 模块注入 + 槽生命周期初始化。
-
-        在 warmup 之前调用（GDN forward 含预热轮都需要真实缓存）；KV 池预算
-        （allocate_kv_cache 的 mem_get_info 重试循环）在本函数之后执行，状态池
-        字节数经 used 自动计入，无需显式扣除。
-
-        池形状（阶段1）：[num_gdn_layers, slots, *state_shape]，slots = max_num_seqs；
-        阶段2 spec 槽扩展（slots × (1+spec_num_tokens)，verify 行分叉槽）只改本函数
-        的 slots 来源与 fill/读侧语义。
-        """
-        spec = self.model.model.get_gdn_state_spec()
-        tc = self.config.text_config
-        n_gdn = tc.num_hidden_layers - self.model.model.num_attention_layers
-        slots = self.config.max_num_seqs
-        if self.config.spec_method == "dflash":
-            # DFlash（阶段2）：池扩为「主槽区 ms + verify 行槽区 ms×(k+1)」。
-            # verify 行槽静态布局：批内序号 i 的写基址 base_i = ms + i×(k+1)
-            # （行 0..k 逐行落槽，见 qwen3_5._forward_rows / _df_verify）。
-            # 主槽（prefill 终态 / 非 spec decode）保持 [0, ms) 的 get_or_alloc
-            # 语义不变——必须与全部行槽区互斥：prefill 与 verify 是不同引擎步、
-            # 批内序号在两步间可变，若 prefill 写进「本步批序号对应」的行槽区，
-            # 会被其他序列的 verify 行覆盖（carry 读到脏状态）。偏差说明：计划
-            # §3 写 slots = ms×(k+1)，实现取 ms×(k+2)，多出的 ms 槽即主槽区
-            # （@ms8 ≈ +8MB ssm，正确性必需）。
-            slots = self.config.max_num_seqs * (self.config.spec_num_tokens + 2)
-        # 阶段3 图 padding 保留槽（池尾 +1）：decode 图按桶回放时 padding 行的 GDN
-        # 读写需要一个「可安全弄脏」的槽——GDN 的 conv/ssm 读写是设备侧高级索引
-        # （idx=-1 会回绕到末槽写真实状态，不能用 -1 哨兵），padding 行统一指向本
-        # 保留槽：has_initial=False 零化 ssm 读、conv 读垃圾（输出丢弃）、写全落
-        # 保留槽（不脏任何可分配槽——空闲集只覆盖主槽区 [0, ms)）。spec 图 verify
-        # 的 padding 行写各自 base 行槽区（池静态布局互斥），同样不消费保留槽。
-        # 代价 ≤1 槽 ssm（fp32 ~1MB），enforce_eager 下闲置无害。
-        slots += 1
-        self._gdn_pad_slot = slots - 1
-        conv_shape = spec["conv_shape"]
-        ssm_shape = spec["ssm_shape"]
-        # conv 状态用模型 dtype、ssm 状态 fp32——形状与 dtype 均以 get_gdn_state_spec()
-        # 声明为准（勿在引擎侧硬编码，模型侧按 text_config 计算口径唯一）。
-        self.conv_pool = torch.empty((n_gdn, slots) + tuple(conv_shape), dtype=spec["conv_dtype"])
-        self.ssm_pool = torch.empty((n_gdn, slots) + tuple(ssm_shape), dtype=spec["ssm_dtype"])
-        self._gdn_state_bytes = (self.conv_pool.numel() * self.conv_pool.element_size()
-                                 + self.ssm_pool.numel() * self.ssm_pool.element_size())
-        # GDN 模块识别：模型侧契约字段（按 GDN 层序的权威模块引用，
-        # qwen3_5 恒赋值）。
-        gdn_mods = self.model.model.gdn_layers
-        assert len(gdn_mods) == n_gdn, (
-            f"Detected GDN module count ({len(gdn_mods)}) does not match "
-            f"the configured layer count ({n_gdn}); the model must expose gdn_layers."
-        )
-        for gdn_ord, module in enumerate(gdn_mods):
-            # 注入该层的池切片 [slots, *state_shape]：模块 forward 用
-            # context.gdn_state_slots[row] 在 slot 维索引读写。
-            module.conv_cache = self.conv_pool[gdn_ord]
-            module.ssm_cache = self.ssm_pool[gdn_ord]
-        # 槽生命周期（host 侧）：seq_id → slot 映射 + 空闲槽集合。分配在
-        # prepare_prefill/prepare_decode 兜底（get_or_alloc，warmup 直构 Sequence
-        # 绕过 scheduler 也由此覆盖）；释放在 finish（llm_engine）/ preempt
-        # （scheduler 回调）——见 drop_seq_state。
-        self.gdn_slots: dict[int, int] = {}
-        self._gdn_free_slots: set[int] = set(range(slots))
-        # 每步 GDN 元数据的 pinned host + device twin（图友好静态段：阶段3 图捕获
-        # 直接消费 device twin 固定地址。长度取 max_num_seqs（≥ _graph_max_bs，
-        # eager 路径覆盖全部并发；图桶在范围内）。host 槽位缓冲初始化为保留槽：
-        # 图 padding 行在「首次收窄前」读到的恒是 pad 槽而非初始 0（0 是真实主槽，
-        # padding 写会脏掉运行序列的状态——与 KV 池 slot_mapping 首扩桶 padding 行
-        # 写槽 0 的隐患同源，这里从分配上杜绝）。
-        N = self.config.max_num_seqs
-        self._gdn_slots_pin = torch.full((N,), self._gdn_pad_slot, dtype=torch.int32,
-                                         device='cpu', pin_memory=True)
-        self._gdn_init_pin = torch.zeros(N, dtype=torch.bool, device='cpu', pin_memory=True)
-        self._gdn_slots_dev = torch.full((N,), self._gdn_pad_slot, dtype=torch.int32)
-        self._gdn_init_dev = torch.zeros(N, dtype=torch.bool)
-
-    def _gdn_get_or_alloc_slot(self, seq: Sequence) -> int:
-        """GDN 状态槽 get_or_alloc（prepare_prefill/prepare_decode 兜底调用）。
-
-        新分配的槽内容无脏读风险：该序列的首次消费恒为 has_initial=False 的
-        零初始化 prefill（重用槽的残留值不会被读，之后被终态覆盖）。
-        """
-        slot = self.gdn_slots.get(seq.seq_id)
-        if slot is None:
-            try:
-                slot = self._gdn_free_slots.pop()
-            except KeyError:
-                # 调度门控（scheduler 的 hybrid admission）保证 live 序列数
-                # ≤ max_num_seqs；此断言炸穿即门控失效。
-                raise RuntimeError(
-                    "GDN state slots are exhausted; live sequences exceeded "
-                    f"max_num_seqs={self.config.max_num_seqs}."
-                ) from None
-            self.gdn_slots[seq.seq_id] = slot
-        return slot
-
-    def drop_seq_state(self, seq_id: int):
-        """hybrid GDN 状态槽释放（finish / preempt 时经 llm_engine 调用，与
-        drop_spec_state 同模式）。阶段1 不擦池数据：释放即断开映射，槽位重用时
-        由 has_initial=False 的零初始化 prefill 覆盖写入，旧值永不被读。"""
-        slot = self.gdn_slots.pop(seq_id, None)
-        if slot is not None:
-            self._gdn_free_slots.add(slot)
-        # dflash：preempt 路径同步清 spec 状态（finish 路径由 drop_spec_state 清，
-        # _df_drop_state 幂等，双路径重复调用安全）。
         self._df_drop_state(seq_id)
 
     def _graph_pad_block(self) -> int:
@@ -905,21 +771,6 @@ class ModelRunner:
                 slot_mapping.extend(range(slot_start, slot_end))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
-        # hybrid：GDN 状态槽元数据（pinned host → device twin 非阻塞 H2D，静态段，
-        # 模仿 _dblob 写法）。整段 prefill（hybrid 禁 chunk）：每序列一个槽；
-        # has_initial 恒 False——零初始化、终态写主槽，preempt 后重 prefill 同口径
-        # 重建。host 缓冲的跨步覆写安全性同 _dblob：每步收尾必有 D2H 同步
-        # （token_ids.tolist()），覆写时上一步 H2D 已完成。
-        gdn_extra = {}
-        if self.is_hybrid:
-            n_seqs = len(seqs)
-            for i, seq in enumerate(seqs):
-                self._gdn_slots_pin[i] = self._gdn_get_or_alloc_slot(seq)
-                self._gdn_init_pin[i] = False
-            self._gdn_slots_dev[:n_seqs].copy_(self._gdn_slots_pin[:n_seqs], non_blocking=True)
-            self._gdn_init_dev[:n_seqs].copy_(self._gdn_init_pin[:n_seqs], non_blocking=True)
-            gdn_extra = dict(gdn_state_slots=self._gdn_slots_dev[:n_seqs],
-                             gdn_has_initial=self._gdn_init_dev[:n_seqs])
         input_ids = torch.tensor(
             input_ids, dtype=torch.int64, device="cpu", pin_memory=True
         ).to(self.device, non_blocking=True)
@@ -939,7 +790,14 @@ class ModelRunner:
             device="cpu",
             pin_memory=True,
         ).to(self.device, non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, block_size=self.block_size, **gdn_extra)
+        # Keep the lengths that were already computed on the host. The 310P
+        # flash-attention wrapper needs a CPU int32 vector; reconstructing it
+        # from device cu_seqlens in every layer serializes the entire NPU stream.
+        host_seq_lens_q = torch.tensor(
+            [seq.num_scheduled_tokens for seq in seqs], dtype=torch.int32)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+                    slot_mapping, None, block_tables, block_size=self.block_size,
+                    host_seq_lens_q=host_seq_lens_q)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -957,16 +815,9 @@ class ModelRunner:
             ctx_v[i] = len(seq)
             slots_v[i] = seq.block_table[-1] * block_size + seq.last_block_num_tokens - 1
             self._fill_bt_row(bt, i, seq.block_table)
-            if self.is_hybrid:
-                # GDN 状态槽（host 侧先行填写）：decode 每行槽 + has_initial=True
-                # ——单行消费主槽、写回主槽（计划 §3 语义）。
-                self._gdn_slots_pin[i] = self._gdn_get_or_alloc_slot(seq)
-                self._gdn_init_pin[i] = True
         # graph 直通：host 填 blob → run_model 2 次 H2D → 图内 scatter 分发。
-        # gv buffer 是 capture 时（inference mode）创建的 inference tensor，
-        # 相关写入须在 inference mode 内进行。hybrid（阶段3）与 qwen3 同构：
-        # GDN 元数据消费 device twin 固定地址（capture 时经 set_context 烘焙进图，
-        # 每步 H2D 刷新内容即可，无需图内 scatter——twin 本身就是静态段）。
+        # Graph buffers were created under inference mode; updates must remain
+        # under inference mode as well.
         if self.graphs is not None:
             gv = self.graph_vars
             bucket = _bucket(self.graph_bs, n)
@@ -986,14 +837,6 @@ class ModelRunner:
                         pos_v[n:bucket].zero_()
                         bt[n:, :].fill_(pad_block)
                     self._graph_bs_active = bucket
-                    if self.is_hybrid:
-                        # GDN padding 行 → 保留槽 + has_initial=False（host 侧
-                        # 复位，随下方 H2D 一起上卡）；真实行已在上面循环写好。
-                        # 随后 twin 整段 H2D [:bucket]（图捕获消费 twin 固定地址）。
-                        self._gdn_slots_pin[n:bucket] = self._gdn_pad_slot
-                        self._gdn_init_pin[n:bucket] = False
-                        self._gdn_slots_dev[:bucket].copy_(self._gdn_slots_pin[:bucket], non_blocking=True)
-                        self._gdn_init_dev[:bucket].copy_(self._gdn_init_pin[:bucket], non_blocking=True)
                     set_context(False,
                                 slot_mapping=gv['slot_mapping'][:n],
                                 context_lens=gv['context_lens'][:n],
@@ -1010,21 +853,15 @@ class ModelRunner:
             slot_mapping = slots_v[:n].to(self.device, non_blocking=True).to(slot_dtype)
             context_lens = ctx_v[:n].to(self.device, non_blocking=True).to(torch.int32)
             block_tables = bt[:n].to(self.device, non_blocking=True).to(torch.int32)
-        # hybrid：GDN 状态槽元数据 H2D（pinned host → device twin 非阻塞拷贝；
-        # 阶段3 图捕获直接消费 twin 固定地址）。跨步覆写安全性同 prepare_prefill。
-        gdn_extra = {}
-        if self.is_hybrid:
-            self._gdn_slots_dev[:n].copy_(self._gdn_slots_pin[:n], non_blocking=True)
-            self._gdn_init_dev[:n].copy_(self._gdn_init_pin[:n], non_blocking=True)
-            gdn_extra = dict(gdn_state_slots=self._gdn_slots_dev[:n],
-                             gdn_has_initial=self._gdn_init_dev[:n])
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables, max_context_len=self.config.max_model_len, block_size=self.block_size, **gdn_extra)
+        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens,
+                    block_tables=block_tables,
+                    max_context_len=self.config.max_model_len,
+                    block_size=self.block_size)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence], is_prefill: bool = False):
         """返回 (temperatures, top_ps, top_ks) 张量；top_k 不生效时传词表大小（掩码恒假）。"""
-        # 词表大小取 text_config（qwen3_5 外层多模态壳无 vocab_size；qwen3 同值）。
-        vocab = self.config.text_config.vocab_size
+        vocab = self.config.model_config.vocab_size
         n = len(seqs)
         blob = self._dblob
         M = self._pin_M
@@ -1057,6 +894,8 @@ class ModelRunner:
         if is_prefill or self.enforce_eager or input_ids.size(0) > self._graph_max_bs:
             return self.model.compute_logits(self.model(input_ids, positions)), False
         if self.graphs is None:    # 捕获失败降级：decode 全部走 eager 前向
+            if self.graph_capture_attempted:
+                self.decode_graph_stats["fallback"] += 1
             return self.model.compute_logits(self.model(input_ids, positions)), False
 
         bs = input_ids.size(0)
@@ -1065,14 +904,19 @@ class ModelRunner:
         # 真实 bs 向上取到最近的 graph bucket（bs=3 → graph 4）。
         graph_bs = _bucket(self.graph_bs, bs)
         if graph_bs is None:
+            self.decode_graph_stats["fallback"] += 1
             return self.model.compute_logits(self.model(input_ids, positions)), False
         # 防御：仅接受 prepare_decode 直通准备的输入（blob 分发依赖固定地址）。
         if input_ids.data_ptr() != gv["input_ids"].data_ptr():
+            self.decode_graph_stats["fallback"] += 1
             return self.model.compute_logits(self.model(input_ids, positions)), False
 
         # 2 次 H2D + replay；元数据分发（int64→int32 转换）在图内 scatter 完成。
         self._dblob.h2d()
         self.graphs[graph_bs].replay()
+        self.decode_graph_stats["replay"] += 1
+        bucket_hits = self.decode_graph_stats["bucket_hits"]
+        bucket_hits[graph_bs] = bucket_hits.get(graph_bs, 0) + 1
         if self.graph_sample:
             return gv["token_ids"][:bs], True
         return self.model.compute_logits(gv["outputs"][:bs]), False
@@ -1111,10 +955,10 @@ class ModelRunner:
 
         EAGLE3：draft 同 chunk 前向（复用同一 context，为 prompt 每个位置写入
         draft KV），已完成 prefill 的序列记录 h_seed（aux 最后一行）。
-        DFlash：走 _run_prefill_spec_dflash（aux 全行投影写上下文稠密缓冲）。
+        DFlash/DSpark：走块草稿 prefill（aux 按 chunk 投影写上下文缓存）。
         """
-        if self.config.spec_method == "dflash":
-            return self._run_prefill_spec_dflash(seqs)
+        if self.config.spec_method in BLOCK_DRAFT_METHODS:
+            return self._run_prefill_spec_block_draft(seqs)
         assert self.rank == 0
         input_ids, positions = self.prepare_prefill(seqs)
         hidden, aux = self.model(input_ids, positions)
@@ -1130,8 +974,14 @@ class ModelRunner:
         shifted = []
         for i, seq in enumerate(seqs):
             off0, off1 = offsets[i], offsets[i + 1]
+            prompt_end = seq.num_cached_tokens + seq.num_scheduled_tokens
+            tail_token = (
+                seq.token_ids[prompt_end]
+                if prompt_end < seq.num_tokens
+                else token_ids[i]
+            )
             shifted.append(torch.cat([input_ids[off0 + 1:off1],
-                                      input_ids.new_tensor(token_ids[i]).view(1)]))
+                                      input_ids.new_tensor(tail_token).view(1)]))
         self.draft_model.forward_prefill(positions, seed, torch.cat(shifted))
         reset_context()
         for i, seq in enumerate(seqs):
@@ -1160,7 +1010,7 @@ class ModelRunner:
             self.graph_sample
             or all(seq.temperature <= 1e-10 for seq in seqs)
         )
-        if self.config.spec_method == "dflash":
+        if self.config.spec_method in BLOCK_DRAFT_METHODS:
             if self.spec_graphs is not None and seqs and sampling_compatible:
                 bucket = _bucket(self.spec_graph_bs, len(seqs))
                 if bucket is not None:
@@ -1188,9 +1038,7 @@ class ModelRunner:
         blob = self._sblob
         M, W = self._pin_M, self._pin_W
         draft_vocab = self.draft_config.draft_vocab_size
-        # vocab 取 text_config：qwen3_5 外层多模态壳无顶层 vocab_size（实测）；
-        # qwen3 的 text_config 即 hf_config，取值逐字节相同（行为零变化）。
-        vocab = self.config.text_config.vocab_size
+        vocab = self.config.model_config.vocab_size
         chain_tokens = blob.view_i64('chain_tokens')
         ctopks = blob.view_i64('ctopks')
         ctemps = blob.view_f32('ctemps')
@@ -1363,8 +1211,8 @@ class ModelRunner:
     # 轮次结构（z-lab dflash 语义，对齐 vllm DFlashProposer/DFlashSpeculator）：
     # ① 上下文追加（上轮 v_aux 已提交行 → fc+norm → k/v proj → rope → 稠密缓冲）
     # ② block 草稿（anchor+mask×k 单次非因果前向 → target 词表采样 [n, k]）
-    # ③ verify（复用 EAGLE 骨架的 _sg 缓冲与验收口径；GDN 走 'row' 逐行落槽）
-    # ④ 读回提交 + 更新 spec_ctx_pending / GDN carry（无链式 carry / refill）。
+    # ③ verify（复用 EAGLE 骨架的 _sg 缓冲与验收口径）
+    # ④ 读回提交 + 更新 spec_ctx_pending（无链式 carry / refill）。
 
     def _df_ctx_get_or_alloc(self, seq: Sequence) -> int:
         """draft 上下文 KV 稠密缓冲的槽 get_or_alloc（prefill 时分配）。
@@ -1384,14 +1232,71 @@ class ModelRunner:
             self.draft_ctx_slots[seq.seq_id] = slot
         return slot
 
-    @torch.inference_mode()
-    def _run_prefill_spec_dflash(self, seqs: list[Sequence]) -> list[int]:
-        """DFlash prefill 步：target 前向（aux 5 层捕获）+ 首 token 采样 + prefill
-        aux 全行（位置 0..P-1）投影写入 draft 上下文 KV 稠密缓冲。
+    def has_dflash_prefix_snapshot(self, block_id: int, block_hash: int) -> bool:
+        snapshot = self._df_prefix_snapshots.get(block_id)
+        return snapshot is not None and snapshot[0] == block_hash
 
-        与 EAGLE3 prefill 的差异：无 draft 流式 prefill（dflash 无链式流——draft
-        上下文 = aux 重投影，块查询行每轮由 embed 现算）；spec_ctx_pending 置 None
-        （上下文已落盘，首轮块草稿的 ctx_len = P 恰为 anchor 前的全部位置）。
+    def save_dflash_prefix_snapshots(self, seqs: list[Sequence]) -> None:
+        """Snapshot complete dense draft-KV blocks before BlockManager hashes them.
+
+        Snapshots live in bounded CPU RAM. A target-KV block without a matching
+        snapshot is deliberately treated as a cache miss by the validator.
+        """
+        if self.dflash_paged or not self.config.enable_prefix_cache:
+            return
+        for seq in seqs:
+            if (not seq.block_table or seq.seq_id not in self.draft_ctx_slots
+                    or seq.num_cached_tokens + seq.num_scheduled_tokens != seq.num_tokens):
+                continue
+            slot = self.draft_ctx_slots[seq.seq_id]
+            block_hash = -1
+            for i in range(seq.num_prompt_tokens // self.block_size):
+                block_hash = BlockManager.compute_hash(seq.block(i), block_hash)
+                block_id = seq.block_table[i]
+                if self.has_dflash_prefix_snapshot(block_id, block_hash):
+                    continue
+                begin = i * self.block_size
+                end = begin + self.block_size
+                k = self.draft_model.ctx_k_cache[slot, begin:end].to("cpu").contiguous()
+                v = self.draft_model.ctx_v_cache[slot, begin:end].to("cpu").contiguous()
+                size = (k.numel() * k.element_size() + v.numel() * v.element_size())
+                old = self._df_prefix_snapshots.pop(block_id, None)
+                if old is not None:
+                    self._df_prefix_snapshot_bytes -= old[3]
+                if size > self._df_prefix_snapshot_limit:
+                    continue
+                while self._df_prefix_snapshot_bytes + size > self._df_prefix_snapshot_limit:
+                    _, evicted = self._df_prefix_snapshots.popitem(last=False)
+                    self._df_prefix_snapshot_bytes -= evicted[3]
+                    self.df_prefix_snapshot_stats["evicted"] += 1
+                self._df_prefix_snapshots[block_id] = (block_hash, k, v, size)
+                self._df_prefix_snapshot_bytes += size
+                self.df_prefix_snapshot_stats["saved"] += 1
+
+    def _restore_dflash_prefix(self, seq: Sequence, slot: int) -> None:
+        if not seq.num_cached_tokens or self.dflash_paged:
+            return
+        block_hash = -1
+        for i in range(seq.num_cached_tokens // self.block_size):
+            block_hash = BlockManager.compute_hash(seq.block(i), block_hash)
+            block_id = seq.block_table[i]
+            if not self.has_dflash_prefix_snapshot(block_id, block_hash):
+                raise RuntimeError("DFlash prefix snapshot missing after cache admission")
+            _, k, v, _ = self._df_prefix_snapshots[block_id]
+            self._df_prefix_snapshots.move_to_end(block_id)
+            begin = i * self.block_size
+            end = begin + self.block_size
+            self.draft_model.ctx_k_cache[slot, begin:end].copy_(k)
+            self.draft_model.ctx_v_cache[slot, begin:end].copy_(v)
+            self.df_prefix_snapshot_stats["restored"] += 1
+
+    @torch.inference_mode()
+    def _run_prefill_spec_block_draft(self, seqs: list[Sequence]) -> list[int]:
+        """Block-draft prefill, including incremental chunk projection.
+
+        Every prompt chunk immediately projects its target auxiliary states into
+        draft context KV. Consequently a later chunk or the first speculative
+        round observes exactly the same context as a one-shot prefill.
         """
         assert self.rank == 0
         input_ids, positions = self.prepare_prefill(seqs)
@@ -1401,8 +1306,6 @@ class ModelRunner:
         reset_context()
         offsets = list(accumulate([0] + [seq.num_scheduled_tokens for seq in seqs]))
         for i, seq in enumerate(seqs):
-            if seq.num_cached_tokens + seq.num_scheduled_tokens != seq.num_tokens:
-                continue  # hybrid 禁 chunked prefill（config 断言），防御分支
             # ``warmup_model`` runs before ``allocate_kv_cache`` so its dummy
             # sequences intentionally have no block table. CUDA/CoreX DFlash
             # can still write their already-allocated dense context cache, but
@@ -1412,10 +1315,12 @@ class ModelRunner:
             if (self.dflash_paged
                     and (not seq.block_table
                          or not self.draft_model.layers[0].self_attn.k_cache.numel())):
-                self.gdn_spec_carry.pop(seq.seq_id, None)
                 self.spec_ctx_pending[seq.seq_id] = None
                 continue
             slot = self._df_ctx_get_or_alloc(seq)
+            if seq.seq_id not in self._df_prefix_restored:
+                self._restore_dflash_prefix(seq, slot)
+                self._df_prefix_restored.add(seq.seq_id)
             p0, p1 = offsets[i], offsets[i + 1]
             if self.dflash_paged:
                 start = seq.num_cached_tokens
@@ -1429,13 +1334,12 @@ class ModelRunner:
                 context_slots = torch.full(
                     (p1 - p0,), slot, dtype=torch.int64, device=self.device
                 )
-            # prefill aux 全行（0-based 层输出口径）→ 投影写缓冲（位置 0..P-1）
+            # Project this chunk at its absolute target positions.
             self.draft_model.project_context_kv(
                 aux[p0:p1], positions[p0:p1],
                 context_slots)
-            # 首 verify 的 GDN carry = prefill 终态主槽（gdn_slots），清 preempt 残留
-            self.gdn_spec_carry.pop(seq.seq_id, None)
-            self.spec_ctx_pending[seq.seq_id] = None
+            if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
+                self.spec_ctx_pending[seq.seq_id] = None
         return token_ids
 
     def _df_append_context(self, seqs: list[Sequence]):
@@ -1481,6 +1385,29 @@ class ModelRunner:
         for s, _ in rows:
             self.spec_ctx_pending[s.seq_id] = None
 
+    def _df_sample_from_anchor(self) -> bool:
+        return (self.config.spec_method == "dspark"
+                and getattr(self.draft_config, "sample_from_anchor", True))
+
+    def _df_query_rows(self) -> int:
+        return self.config.spec_num_tokens + (not self._df_sample_from_anchor())
+
+    def _sample_dspark(self, base_logits: torch.Tensor, anchor_ids: torch.Tensor,
+                       temps: torch.Tensor, topps: torch.Tensor,
+                       topks: torch.Tensor, graph: bool = False) -> torch.Tensor:
+        """Sequential Markov bias after a single parallel backbone forward."""
+        n = anchor_ids.numel()
+        k = self.config.spec_num_tokens
+        base = base_logits.view(n, k, -1)
+        prev = anchor_ids
+        proposals = []
+        for pos in range(k):
+            logits = base[:, pos] + self.draft_model.markov_bias(prev)
+            prev = (self._sg_sample(logits, temps, topps, topks, True)
+                    if graph else self.sampler.forward_native(logits, temps, topps, topks))
+            proposals.append(prev)
+        return torch.stack(proposals, dim=1)
+
     def _df_draft_block(self, seqs: list[Sequence]) -> torch.Tensor:
         """② block 草稿：anchor+mask×k 单次非因果前向，逐 mask 行采样提案。
 
@@ -1489,7 +1416,7 @@ class ModelRunner:
         logits 行序 (i, j) → i*k+j 与 repeat_interleave(k) 对齐。
         """
         k = self.config.spec_num_tokens
-        rows = k + 1
+        rows = self._df_query_rows()
         n = len(seqs)
         Ls = [len(seq) for seq in seqs]
         # 块查询位置 = [l'-1, ..., l'+k-1]（anchor = 最后已提交 token，l' = 序列长）
@@ -1539,8 +1466,9 @@ class ModelRunner:
             query_slots=query_slots,
             block_tables=block_tables,
             total_lens=total_lens,
+            sample_from_anchor=self._df_sample_from_anchor(),
         )
-        vocab = self.config.text_config.vocab_size
+        vocab = self.config.model_config.vocab_size
         temps = torch.tensor(
             [seq.temperature for seq in seqs],
             dtype=torch.float32,
@@ -1559,40 +1487,31 @@ class ModelRunner:
             device="cpu",
             pin_memory=True,
         ).to(self.device, non_blocking=True)
+        if self.config.spec_method == "dspark":
+            return self._sample_dspark(logits, last, temps, topps, topks)
         ids = self.sampler.forward_native(
             logits, temps.repeat_interleave(k), topps.repeat_interleave(k),
             topks.repeat_interleave(k))
         return ids.view(n, k)
 
-    def _df_verify(self, seqs: list[Sequence]):
-        """③ target verify：[last_token, d1..dk] 一次前向，行 j 预测位置 L+j，
-        图外采样并暂存 aux。
+    def _verify_block_tables(self, g, bs: int, rows: int):
+        """verify/refill 用的 block_table，形态按后端能力位选择（勿回退成无条件展开）。
 
-        与 _sg_verify 同构（同一批 _sg 静态缓冲），差异仅 GDN 上下文：'row' 模式
-        + 写基址/ carry 槽——EAGLE3 路径零触碰红线，故独立成方法而非加参。
-        GDN 元数据（host 逐 seq 解析，跨轮槽位按 seq_id 记账；仅 hybrid）：
-        - 写基址 base_i = max_num_seqs + i×(k+1)（池静态布局，行 0..k 逐行落槽）；
-        - 行 0 读槽 = gdn_spec_carry[seq]（后续轮 = 上轮 base+m）或 gdn_slots[seq]
-          （首轮 = prefill 终态主槽）。
-        dense（Qwen3+DFlash）无 GDN：上下文 kwargs 整组缺省，_df_bases 仍记录
-        （读回侧 is_hybrid 门控，恒不消费）。
+        310P 的分页 PA 读整池、按 query 行取自己的上下文长度，需要 per-query 展开表
+        （bs*rows 行）；CUDA/CoreX 走 varlen flash 的分页 KV 模式，内核硬校验
+        `block_table.shape[0] == cu_seqlens_q 的批大小`，传展开表直接
+        RuntimeError: block_table must have shape (batch_size, max_num_blocks_per_seq)。
         """
+        if self.paged_context_attn:
+            return g['v_btables_exp'][:bs * rows]
+        return g['v_btables'][:bs]
+
+    def _df_verify(self, seqs: list[Sequence]):
+        """Verify ``[last_token, d1..dk]`` with the target model."""
         g = self._sg
         k = self.config.spec_num_tokens
         rows = k + 1
         n = len(seqs)
-        ms = self.config.max_num_seqs
-        bases = [ms + i * rows for i in range(n)]
-        gdn_extra: dict = {}
-        if self.is_hybrid:
-            carries = [self.gdn_spec_carry.get(s.seq_id, self.gdn_slots[s.seq_id]) for s in seqs]
-            base_dev = torch.tensor(
-                bases, dtype=torch.int32, device="cpu", pin_memory=True
-            ).to(self.device, non_blocking=True)
-            carry_dev = torch.tensor(
-                carries, dtype=torch.int32, device="cpu", pin_memory=True
-            ).to(self.device, non_blocking=True)
-            gdn_extra = dict(gdn_state_slots=base_dev, gdn_carry_slots=carry_dev, gdn_state_mode='row')
         # max_seqlen_k 用 max_model_len 上界（同 _sg_verify 的 varlen grid 口径）
         set_context(True,
                     cu_seqlens_q=g['v_cu_q'][:n + 1],
@@ -1601,22 +1520,20 @@ class ModelRunner:
                     max_seqlen_k=self.config.max_model_len,
                     slot_mapping=g['v_slots'][:n * rows],
                     context_lens=g['v_ctx_lens'][:n * rows],
-                    block_tables=g['v_btables_exp'][:n * rows],
-                    block_size=self.block_size,
-                    **gdn_extra)
+                    block_tables=self._verify_block_tables(g, n, rows),
+                    block_size=self.block_size)
         hidden, aux = self.model(g['v_input_ids'][:n * rows], g['v_positions'][:n * rows])
         logits = F.linear(
             hidden, getattr(self.model.lm_head, "weight_nz", self.model.lm_head.weight))
         g['v_token_ids'][:n * rows] = self.sampler.forward_native(
             logits, g['v_temps'][:n * rows], g['v_topps'][:n * rows], g['v_topks'][:n * rows])
         g['v_aux'][:n * rows].copy_(aux)
-        self._df_bases = bases  # 供读回更新 carry（host int）
 
     def _df_readback_commit(self, seqs: list[Sequence]) -> list[list[int]]:
         """④ 统一读回（每轮唯一一次 D2H；commit_buf 契约与 EAGLE3 完全一致：
         committed = row[:row[rows]]，cnt 固定打包在第 rows 列）：
         提取提交 token + 更新 spec_ctx_pending（v_aux 行 0..m = 新可得已提交位置
-        L-1..L+m-1，供下轮上下文追加）与 GDN carry（本轮行 m 的槽 base_i+m）。
+        L-1..L+m-1，供下轮上下文追加）。
         """
         g = self._sg
         rows = self.config.spec_num_tokens + 1
@@ -1629,9 +1546,6 @@ class ModelRunner:
             results.append(row[:c])
             # 下一轮上下文追加行：v_aux 行 0..c-1（GPU 常驻 clone）
             self.spec_ctx_pending[seq.seq_id] = g['v_aux'][i * rows:i * rows + c].clone()
-            # GDN carry = 本轮行 m 槽（c-1 = m ≥ 0）；下轮行 0 读此槽（仅 hybrid）
-            if self.is_hybrid:
-                self.gdn_spec_carry[seq.seq_id] = self._df_bases[i] + (c - 1)
             # 回滚未提交的调度计数（同 _readback_spec_commit）
             seq.num_scheduled_tokens = 0
         return results
@@ -1655,7 +1569,7 @@ class ModelRunner:
         # ---- ② block 草稿 ----
         drafted = self._df_draft_block(seqs)   # [n, k] target 词表 id
         # ---- ③ verify：填 meta（复用 _fill_spec_meta，chain 段写而不读）→
-        #      组装 v_input_ids = [last_token, d1..dk] → target 前向（GDN row）----
+        #      组装 v_input_ids = [last_token, d1..dk] → target 前向 ----
         self._fill_spec_meta(seqs)
         # 与 EAGLE3 eager 流程对齐的元数据分发：_fill_spec_meta 只写 pinned host
         # blob，_df_verify 消费的是 _sg 静态 buffer（v_positions/v_slots/v_cu_k/
@@ -1696,28 +1610,16 @@ class ModelRunner:
     #    向固定 [bs, k+1] 形状。padding 行消费 chain_tokens/df_l1 的陈旧值（恒
     #    为合法 token id / < max_model_len 的位置，产出垃圾提案被丢弃，不写任何
     #    KV/状态）。
-    # c) verify（_df_verify_graph）：沿用 _sg 静态缓冲 + _sg_scatter；GDN 'row'
-    #    模式在图内——写基址改为 host 常量列表注入（gdn_row_bases，按池静态布局
-    #    只依赖批内序号，bake 进图即正确），行 0 读槽走 df_carry 静态 buffer
-    #    （blob 每轮分发，动态值）；python 循环（逐 seq × 逐行）捕获期按常量
-    #    展开（次数只依赖 bs 桶与 k+1）。padding 行写各自 base 行槽区（互斥），
-    #    行 0 读 df_carry=0 号槽（只读不脏）。
+    # c) verify（_df_verify_graph）：沿用 _sg 静态缓冲 + _sg_scatter。
 
     def _alloc_df_graph_vars(self, max_bs: int, rows: int) -> dict:
         """dflash 图轮专段静态缓冲（_sg 之外的补充段；eagle3 不分配）。"""
-        # aux 宽度取 text_config（qwen3_5 外层壳无顶层 hidden_size）。
-        aux_width = self.config.text_config.hidden_size * len(self.config.spec_aux_layers)
+        aux_width = self.config.model_config.hidden_size * len(self.config.spec_aux_layers)
         slot_dtype = self.backend.graph_slot_mapping_dtype()
         return dict(
             # 上下文追加的 aux 暂存：host 每轮从 spec_ctx_pending（GPU clone）
             # 装载有效行、其余清零；图内 project_context_kv 消费固定 [bs*rows] 形状。
             df_ctx_aux=torch.zeros(max_bs * rows, aux_width, dtype=self.dtype),
-            # GDN verify 写基址：桶静态常量 base_i = max_num_seqs + i*rows
-            # （_alloc_gdn_state_pool 的行槽区布局），capture 期烘进图。
-            df_bases=(self.config.max_num_seqs
-                      + torch.arange(max_bs, dtype=torch.int32) * rows),
-            # GDN verify 行 0 读槽：每轮经 _df_scatter 从 blob 孪生分发（动态）。
-            df_carry=torch.zeros(max_bs, dtype=torch.int32),
             # 310P paged DFlash metadata. Keep these as static graph buffers so
             # int64->int32 conversion and non-contiguous last-column slicing do
             # not become operators inside the captured graph.
@@ -1730,14 +1632,14 @@ class ModelRunner:
 
     def _fill_df_meta(self, seqs: list[Sequence]):
         """dflash 图轮专段填充（_fill_spec_meta 之后调用，host 写 pinned blob）：
-        L-1 / pending 行数 / ctx 槽 / GDN 行 0 读槽。chain 段（chain_pos/ctxlen/
+        L-1 / pending 行数 / ctx 槽。chain 段（chain_pos/ctxlen/
         slots）dflash 不消费、写而不读（与 eager 轮同口径）。"""
         blob = self._sblob
         l1 = blob.view_i64('df_l1')
         c = blob.view_i64('df_c')
         cs = blob.view_i64('df_ctxslot')
-        cy = blob.view_i64('df_carry')
         rows = self.config.spec_num_tokens + 1
+        query_rows = self._df_query_rows()
         M = self._pin_M
         ctx_pos = blob.view_i64('df_ctx_pos', (M, rows))
         ctx_phys = blob.view_i64('df_ctx_phys_slots', (M, rows))
@@ -1750,17 +1652,13 @@ class ModelRunner:
             c[i] = pending_count
             cs[i] = self.draft_ctx_slots[seq.seq_id]
             start = l1_value - pending_count
-            total_lens[i] = l1_value + rows
+            total_lens[i] = l1_value + query_rows
             for j in range(rows):
                 pos = start + j
                 ctx_pos[i, j] = pos
                 ctx_phys[i, j] = (
                     self._slot_of(seq, pos) if self.dflash_paged else int(cs[i])
                 )
-            # 行 0 读槽：与 eager _df_verify 同源（carry 优先，回落 prefill 主槽）。
-            # dense（Qwen3+dflash）无 GDN：df_carry 段留零，_df_verify_graph 不消费。
-            if self.is_hybrid:
-                cy[i] = self.gdn_spec_carry.get(seq.seq_id, self.gdn_slots[seq.seq_id])
 
     def _df_load_ctx_aux(self, seqs: list[Sequence], bs: int):
         """上下文追加的 aux 暂存装载（图外 host 步，GPU→GPU）：spec_ctx_pending
@@ -1783,7 +1681,6 @@ class ModelRunner:
         blob = self._sblob
         rows = self.config.spec_num_tokens + 1
         M = self._pin_M
-        g['df_carry'][:bs].copy_(blob.device_view_i64('df_carry')[:bs])
         g['df_ctx_positions'][:bs * rows].copy_(
             blob.device_view_i64('df_ctx_pos', (M, rows))[:bs].reshape(-1))
         g['df_ctx_slots'][:bs * rows].copy_(
@@ -1815,45 +1712,43 @@ class ModelRunner:
         blob = self._sblob
         k = self.config.spec_num_tokens
         rows = k + 1
+        query_rows = self._df_query_rows()
         l1 = blob.device_view_i64('df_l1')[:bs]
         # v_positions is already host-expanded to [L-1, ..., L-1+k] by
         # _fill_spec_meta and copied into a static int64 graph buffer. Reusing
         # it avoids an NPU int64 arange+Add pair (AICPU/507011 on 310P graphs).
-        block_pos = g['v_positions'][:bs * rows].view(bs, rows)
+        block_pos = g['v_positions'][:bs * rows].view(bs, rows)[:, :query_rows]
+        query_slots = None
+        if self.dflash_paged:
+            query_slots = (g['v_slots'][:bs * rows].view(bs, rows)[:, :query_rows]
+                           .contiguous().reshape(-1))
         logits = self.draft_model.forward_block(
             g['chain_tokens'][:bs], block_pos,
             blob.device_view_i64('df_ctxslot')[:bs], l1,
-            self.config.max_model_len, rows,
-            query_slots=(g['v_slots'][:bs * rows] if self.dflash_paged else None),
+            self.config.max_model_len, query_rows,
+            query_slots=query_slots,
             block_tables=(g['v_btables'][:bs] if self.dflash_paged else None),
             total_lens=(g['df_total_lens'][:bs]
-                        if self.dflash_paged else None))
-        ids = self._sg_sample(
-            logits,
-            g['chain_temps'][:bs].repeat_interleave(k),
-            g['chain_topps'][:bs].repeat_interleave(k),
-            g['chain_topks'][:bs].repeat_interleave(k),
-            True)
-        g['drafted_ids'][:k, :bs] = ids.view(bs, k).t()
+                        if self.dflash_paged else None),
+            sample_from_anchor=self._df_sample_from_anchor())
+        if self.config.spec_method == "dspark":
+            ids = self._sample_dspark(
+                logits, g['chain_tokens'][:bs], g['chain_temps'][:bs],
+                g['chain_topps'][:bs], g['chain_topks'][:bs], graph=True)
+        else:
+            ids = self._sg_sample(
+                logits,
+                g['chain_temps'][:bs].repeat_interleave(k),
+                g['chain_topps'][:bs].repeat_interleave(k),
+                g['chain_topks'][:bs].repeat_interleave(k),
+                True).view(bs, k)
+        g['drafted_ids'][:k, :bs] = ids.t()
 
     def _df_verify_graph(self, bs: int):
-        """③ target verify（图内静态化）：与 _df_verify 同构（同一批 _sg 静态
-        buffer），差异仅在 GDN 元数据的图安全来源（仅 hybrid）——写基址 host
-        常量列表（gdn_row_bases，capture 期烘进图）+ 行 0 读槽 df_carry 静态
-        buffer（_df_scatter 每轮分发），取代 eager 版的两次 torch.tensor H2D
-        （捕获期会把值烘焙成常量，carry 必须走 blob）。padding 行 base 指向各
-        自行槽区。dense（Qwen3+dflash）无 GDN：上下文 kwargs 整组缺省。"""
+        """Target verification using graph-static buffers."""
         g = self._sg
         k = self.config.spec_num_tokens
         rows = k + 1
-        gdn_extra: dict = {}
-        if self.is_hybrid:
-            ms = self.config.max_num_seqs
-            bases = [ms + i * rows for i in range(bs)]
-            gdn_extra = dict(gdn_state_mode='row',
-                             gdn_carry_slots=g['df_carry'][:bs],
-                             gdn_row_bases=bases,
-                             gdn_row_seg=rows)
         # max_seqlen_k 用 max_model_len 上界（同 _sg_verify/_df_verify 的 varlen
         # grid 口径，避免 capture 烘焙随轮次变化的 python int）
         set_context(True,
@@ -1863,9 +1758,8 @@ class ModelRunner:
                     max_seqlen_k=self.config.max_model_len,
                     slot_mapping=g['v_slots'][:bs * rows],
                     context_lens=g['v_ctx_lens'][:bs * rows],
-                    block_tables=g['v_btables_exp'][:bs * rows],
-                    block_size=self.block_size,
-                    **gdn_extra)
+                    block_tables=self._verify_block_tables(g, bs, rows),
+                    block_size=self.block_size)
         hidden, aux = self.model(g['v_input_ids'][:bs * rows], g['v_positions'][:bs * rows])
         logits = F.linear(
             hidden, getattr(self.model.lm_head, "weight_nz", self.model.lm_head.weight))
@@ -1918,7 +1812,7 @@ class ModelRunner:
             blob.view_i64('v_btables_exp', (M, rows, W)).fill_(pad_block)
             blob.view_i64('df_ctx_pos', (M, rows))[:] = pad_positions
             blob.view_i64('df_ctx_phys_slots', (M, rows))[:] = pad_slots
-            blob.view_i64('df_total_lens').fill_(rows)
+            blob.view_i64('df_total_lens').fill_(self._df_query_rows())
             blob.h2d()
             for bs in reversed(self.spec_graph_bs):
                 # warmup：kernel lazy init 必须在 capture 前完成；warmup 数据用
@@ -2006,17 +1900,12 @@ class ModelRunner:
             # padding 序列 ctx 槽 → 专用 pad 槽（append 零写落 pad 槽，不碰任何
             # 真实序列的上下文；块草稿对 padding 行 gather pad 槽零特征，掩码屏蔽）
             blob.view_i64('df_ctxslot')[n:].fill_(self._df_pad_ctx_slot)
-            blob.view_i64('df_carry')[n:].zero_()
             blob.view_i64('df_ctx_pos', (M, rows))[n:, :] = pad_positions
             blob.view_i64('df_ctx_phys_slots', (M, rows))[n:, :] = pad_slots
-            blob.view_i64('df_total_lens')[n:].fill_(rows)
+            blob.view_i64('df_total_lens')[n:].fill_(self._df_query_rows())
         self._spec_graph_active = bucket
 
         # ---- 装载 append 暂存 → H2D → 单图回放 → 读回 ----
-        # 写基址 host 侧同步重算（图内不跑 python，_df_verify_graph 的 bases 只在
-        # 捕获期存在；读回更新 GDN carry 需要与本桶一致的 host 值——桶静态布局，
-        # 公式即真值）。
-        self._df_bases = [self.config.max_num_seqs + i * rows for i in range(n)]
         self._df_load_ctx_aux(seqs, bucket)
         self._push_spec_meta()
         self.spec_graphs[bucket].replay()
@@ -2030,9 +1919,7 @@ class ModelRunner:
     # → refill（用 verify 的 target aux 回填 draft KV）。每轮仅一次 D2H。
 
     def _alloc_spec_graph_vars(self, max_bs: int, rows: int, k: int) -> dict:
-        # 形状取 text_config（qwen3_5 外层壳无顶层 vocab_size/hidden_size；qwen3
-        # 路径 text_config 即 hf_config，逐字节同值，行为零变化）。
-        tc = self.config.text_config
+        tc = self.config.model_config
         vocab = tc.vocab_size
         draft_vocab = self.draft_config.draft_vocab_size
         # bt 宽度含 +1 余量，与 decode 图捕获的 block_tables 一致（_pin_W）。
@@ -2167,7 +2054,7 @@ class ModelRunner:
                     max_seqlen_k=self.config.max_model_len,
                     slot_mapping=g['v_slots'][:bs * rows],
                     context_lens=g['v_ctx_lens'][:bs * rows],
-                    block_tables=g['v_btables_exp'][:bs * rows],
+                    block_tables=self._verify_block_tables(g, bs, rows),
                     block_size=self.block_size)
         hidden, aux = self.model(g['v_input_ids'][:bs * rows], g['v_positions'][:bs * rows])
         logits = F.linear(hidden, self.model.lm_head.weight)
@@ -2226,7 +2113,7 @@ class ModelRunner:
                     max_seqlen_k=self.config.max_model_len,
                     slot_mapping=g['v_slots'][:bs * rows],
                     context_lens=g['v_ctx_lens'][:bs * rows],
-                    block_tables=g['v_btables_exp'][:bs * rows],
+                    block_tables=self._verify_block_tables(g, bs, rows),
                     block_size=self.block_size)
         h = self.draft_model.forward_prefill(
             g['v_positions'][:bs * rows], seed_r, ids_r)
@@ -2364,10 +2251,7 @@ class ModelRunner:
     def capture_cudagraph(self):
         try:
             config = self.config
-            # 形状取 text_config（qwen3_5 外层多模态壳无顶层 hidden_size/vocab_size，
-            # 实测 None——原 hf_config 直取在 hybrid 下会 TypeError 进降级分支；
-            # qwen3 的 text_config 即 hf_config，逐字节同值，行为零变化）。
-            tc = config.text_config
+            tc = config.model_config
             max_bs = self._graph_max_bs
             # + 1：runtime block_tables 宽度可能比 capture 时更宽
             # （nano-vLLM 公开 bug），static buffer 直接留出余量（_pin_W）。
@@ -2422,16 +2306,8 @@ class ModelRunner:
 
             for bs in reversed(self.graph_bs):
                 graph = self.backend.new_graph()
-                # Graph Context 必须静态：max_context_len 用 config.max_model_len，
-                # 不要用 context_lens.max().item()（capture 后不可变 python 整数）。
-                # hybrid：GDN 状态槽元数据走 device twin 固定地址（prepare_decode
-                # 每步 H2D 刷新 twin 内容，replay 原样读取；capture 期 twin 为
-                # pad 槽/False 的哑值，仅占位——replay 不运行 python，元数据不经
-                # context 传递而是经 twin 内存）。qwen3 路径不注入（恒 None）。
-                gdn_graph_extra = (
-                    dict(gdn_state_slots=self._gdn_slots_dev[:bs],
-                         gdn_has_initial=self._gdn_init_dev[:bs])
-                    if self.is_hybrid else {})
+                # Graph Context must be static: use the configured upper bound,
+                # never context_lens.max().item() during capture.
                 set_context(
                     False,
                     slot_mapping=slot_mapping[:bs],
@@ -2440,10 +2316,9 @@ class ModelRunner:
                     max_context_len=config.max_model_len,
                     use_cuda_graph=True,
                     block_size=self.block_size,
-                    **gdn_graph_extra,
                 )
-                # Warmup：IXFormer kernel lazy init / workspace / torch.compile
-                # 必须在正式 capture 前完成。graph_sample 路径把 lm_head + sampler
+                # Warmup backend kernels and workspaces before capture.
+                # graph_sample 路径把 lm_head + sampler
                 # 一并捕获（含 exponential_ 随机采样——PyTorch CUDA RNG 是
                 # graph-safe 的，replay 每次产生新随机数）。
                 scatter(bs)

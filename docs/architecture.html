@@ -1,0 +1,876 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nano-vLLM · 自研轻量级大模型推理引擎</title>
+<meta name="description" content="Nano-vLLM 设计架构：六层单向调用、三种投机解码草稿、三硬件后端、KV 分页与前缀缓存、整轮图捕获。">
+<style>
+:root{
+  --bg:#04060c;
+  --bg2:#070c17;
+  --panel:rgba(11,19,33,.72);
+  --panel-2:rgba(8,14,26,.55);
+  --line:rgba(80,180,255,.16);
+  --line-strong:rgba(80,220,255,.42);
+  --cyan:#3fe9ff;
+  --blue:#4d8dff;
+  --violet:#9b6bff;
+  --magenta:#ff5ecb;
+  --green:#2ff5a1;
+  --amber:#ffbe4d;
+  --txt:#d9e6f7;
+  --muted:#8296b3;
+  --dim:#5c6f8c;
+  --mono:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{
+  margin:0;background:var(--bg);color:var(--txt);font-family:var(--sans);
+  font-size:15px;line-height:1.75;overflow-x:hidden;
+  background-image:
+    radial-gradient(900px 600px at 12% -8%, rgba(77,141,255,.20), transparent 60%),
+    radial-gradient(800px 520px at 88% 6%, rgba(155,107,255,.18), transparent 62%),
+    radial-gradient(1000px 700px at 50% 108%, rgba(47,245,161,.10), transparent 60%);
+  background-attachment:fixed;
+}
+#bg{position:fixed;inset:0;width:100%;height:100%;z-index:-2;opacity:.55}
+.scan{
+  position:fixed;inset:0;z-index:-1;pointer-events:none;
+  background:repeating-linear-gradient(to bottom,rgba(255,255,255,.028) 0 1px,transparent 1px 3px);
+  mix-blend-mode:overlay;
+}
+.grid-veil{
+  position:fixed;inset:0;z-index:-1;pointer-events:none;opacity:.30;
+  background-image:linear-gradient(rgba(63,233,255,.09) 1px,transparent 1px),
+                   linear-gradient(90deg,rgba(63,233,255,.09) 1px,transparent 1px);
+  background-size:56px 56px;
+  mask-image:radial-gradient(ellipse 90% 70% at 50% 22%,#000 30%,transparent 78%);
+}
+::selection{background:rgba(63,233,255,.30)}
+
+/* ---------- progress + nav ---------- */
+.progress{position:fixed;top:0;left:0;right:0;height:2px;z-index:60;background:rgba(255,255,255,.06)}
+.progress i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--cyan),var(--violet),var(--magenta));box-shadow:0 0 12px var(--cyan)}
+nav{
+  position:fixed;top:0;left:0;right:0;z-index:55;display:flex;gap:4px;align-items:center;
+  padding:10px 18px;backdrop-filter:blur(14px);
+  background:linear-gradient(180deg,rgba(4,6,12,.92),rgba(4,6,12,.55));
+  border-bottom:1px solid var(--line);
+}
+nav .brand{font-family:var(--mono);font-weight:700;letter-spacing:.08em;margin-right:14px;white-space:nowrap;
+  background:linear-gradient(90deg,var(--cyan),var(--violet));-webkit-background-clip:text;background-clip:text;color:transparent}
+nav a{
+  color:var(--muted);text-decoration:none;font-size:12.5px;padding:5px 9px;border-radius:6px;white-space:nowrap;
+  border:1px solid transparent;transition:.18s;font-family:var(--mono)
+}
+nav a:hover{color:var(--cyan);border-color:var(--line-strong);background:rgba(63,233,255,.07)}
+nav .spacer{flex:1}
+nav .chip{font-family:var(--mono);font-size:11px;color:var(--dim);border:1px solid var(--line);border-radius:999px;padding:3px 10px}
+
+/* ---------- layout ---------- */
+main{max-width:1180px;margin:0 auto;padding:120px 22px 90px}
+section{margin:74px 0;scroll-margin-top:76px}
+.kicker{
+  font-family:var(--mono);font-size:11.5px;letter-spacing:.28em;text-transform:uppercase;color:var(--cyan);
+  display:flex;align-items:center;gap:10px;margin-bottom:10px
+}
+.kicker::before{content:"";width:26px;height:1px;background:linear-gradient(90deg,var(--cyan),transparent)}
+h2{
+  font-size:clamp(22px,3.1vw,32px);margin:0 0 8px;letter-spacing:-.01em;font-weight:700;
+  background:linear-gradient(92deg,#eaf6ff 10%,var(--cyan) 45%,var(--violet) 88%);
+  -webkit-background-clip:text;background-clip:text;color:transparent
+}
+h3{font-size:16.5px;margin:0 0 6px;color:#eaf3ff;font-weight:650}
+.lead{color:var(--muted);max-width:900px;margin:0 0 26px}
+p{margin:0 0 10px}
+code,kbd{font-family:var(--mono);font-size:.9em;color:#a8e9ff;background:rgba(63,233,255,.08);border:1px solid rgba(63,233,255,.16);border-radius:4px;padding:1px 5px}
+em.hl{font-style:normal;color:var(--cyan)}
+
+/* ---------- cards ---------- */
+.card{
+  position:relative;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px 22px;
+  backdrop-filter:blur(9px);transition:.25s;overflow:hidden
+}
+.card::before,.card::after{
+  content:"";position:absolute;width:16px;height:16px;border:1px solid var(--line-strong);opacity:.65;pointer-events:none
+}
+.card::before{top:-1px;left:-1px;border-right:0;border-bottom:0;border-radius:12px 0 0 0}
+.card::after{bottom:-1px;right:-1px;border-left:0;border-top:0;border-radius:0 0 12px 0}
+.card:hover{border-color:rgba(63,233,255,.38);transform:translateY(-2px);box-shadow:0 10px 40px -18px rgba(63,233,255,.55)}
+.grid{display:grid;gap:16px}
+.g2{grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}
+.g3{grid-template-columns:repeat(auto-fit,minmax(250px,1fr))}
+.g4{grid-template-columns:repeat(auto-fit,minmax(200px,1fr))}
+
+/* ---------- hero ---------- */
+.hero{padding:34px 0 8px;margin-top:-40px}
+.hero .badge{
+  display:inline-flex;align-items:center;gap:8px;font-family:var(--mono);font-size:11.5px;letter-spacing:.16em;
+  color:var(--cyan);border:1px solid var(--line-strong);border-radius:999px;padding:5px 14px;margin-bottom:22px;
+  background:rgba(63,233,255,.06);text-transform:uppercase
+}
+.pulse{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 0 0 rgba(47,245,161,.7);animation:pulse 2.1s infinite}
+@keyframes pulse{70%{box-shadow:0 0 0 10px rgba(47,245,161,0)}100%{box-shadow:0 0 0 0 rgba(47,245,161,0)}}
+h1{
+  font-size:clamp(34px,6.4vw,68px);line-height:1.05;margin:0 0 14px;font-weight:800;letter-spacing:-.02em;
+  background:linear-gradient(100deg,#ffffff 6%,#9fe9ff 34%,#8f6bff 68%,#ff5ecb 96%);
+  -webkit-background-clip:text;background-clip:text;color:transparent;filter:drop-shadow(0 6px 34px rgba(63,233,255,.22))
+}
+.hero p.sub{font-size:clamp(15px,1.9vw,18.5px);color:#a9bdd8;max-width:840px;margin:0 0 30px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:26px 0 4px}
+.stat{
+  border:1px solid var(--line);border-radius:10px;padding:14px 16px;background:var(--panel-2);
+  position:relative;overflow:hidden
+}
+.stat::after{content:"";position:absolute;left:0;bottom:0;height:2px;width:100%;background:linear-gradient(90deg,var(--cyan),transparent);opacity:.7}
+.stat b{display:block;font-family:var(--mono);font-size:clamp(22px,3vw,30px);color:#eaf8ff;letter-spacing:-.02em}
+.stat span{font-size:12px;color:var(--dim);letter-spacing:.05em}
+
+/* ---------- layer stack ---------- */
+.stack{display:flex;flex-direction:column;gap:0;margin-top:6px}
+.layer{
+  display:grid;grid-template-columns:52px 190px 1fr;gap:16px;align-items:center;
+  border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:9px;background:var(--panel-2);
+  position:relative;transition:.22s
+}
+.layer:hover{border-color:var(--line-strong);background:rgba(63,233,255,.05);transform:translateX(4px)}
+.layer .idx{
+  font-family:var(--mono);font-size:12px;color:var(--dim);width:34px;height:34px;display:grid;place-items:center;
+  border:1px solid var(--line);border-radius:8px;background:rgba(4,8,16,.6)
+}
+.layer:hover .idx{color:var(--cyan);border-color:var(--line-strong)}
+.layer .name{font-weight:650;font-size:15.5px;color:#eaf6ff}
+.layer .name small{display:block;font-family:var(--mono);font-size:11.5px;color:var(--dim);font-weight:400;letter-spacing:.02em}
+.layer .desc{color:var(--muted);font-size:13.4px}
+.layer .desc b{color:#bfe9ff;font-weight:600}
+.arrow{height:16px;display:flex;justify-content:center;margin:-4px 0 5px}
+.arrow span{
+  font-family:var(--mono);font-size:10px;color:var(--dim);letter-spacing:.2em;
+  border-left:1px dashed rgba(63,233,255,.35);padding-left:8px
+}
+.l1{--c:var(--cyan)}.l2{--c:var(--blue)}.l3{--c:var(--violet)}.l4{--c:var(--magenta)}.l5{--c:var(--amber)}.l6{--c:var(--green)}
+.layer .idx{color:var(--c);border-color:color-mix(in srgb,var(--c) 40%,transparent)}
+
+/* ---------- flow ---------- */
+.flow{display:flex;flex-wrap:wrap;gap:10px;align-items:stretch;margin:14px 0}
+.step{
+  flex:1 1 170px;min-width:160px;border:1px solid var(--line);border-radius:10px;padding:13px 14px;background:var(--panel-2);
+  position:relative;transition:.2s
+}
+.step:hover{border-color:var(--line-strong);background:rgba(63,233,255,.05)}
+.step .n{font-family:var(--mono);font-size:10.5px;color:var(--c,var(--cyan));letter-spacing:.2em}
+.step h4{margin:4px 0 5px;font-size:14.5px;color:#eaf6ff;font-weight:650}
+.step p{margin:0;font-size:12.8px;color:var(--muted);line-height:1.6}
+.step::after{
+  content:"›";position:absolute;right:-11px;top:50%;transform:translateY(-50%);color:var(--dim);font-size:18px;z-index:2
+}
+.step:last-child::after{content:""}
+
+/* ---------- tables ---------- */
+.tw{overflow-x:auto;border:1px solid var(--line);border-radius:12px;background:var(--panel-2)}
+table{border-collapse:collapse;width:100%;min-width:640px;font-size:13.2px}
+th,td{padding:11px 14px;text-align:left;border-bottom:1px solid rgba(80,180,255,.09);vertical-align:top}
+th{
+  font-family:var(--mono);font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--cyan);
+  background:rgba(63,233,255,.05);position:sticky;top:0
+}
+tr:last-child td{border-bottom:0}
+tbody tr{transition:.16s}
+tbody tr:hover{background:rgba(63,233,255,.045)}
+td b{color:#dff2ff;font-weight:600}
+td code{font-size:12px}
+.ok{color:var(--green);font-family:var(--mono)}
+.no{color:var(--dim);font-family:var(--mono)}
+.warn{color:var(--amber);font-family:var(--mono)}
+
+/* ---------- bars ---------- */
+.bar{margin:12px 0}
+.bar .top{display:flex;justify-content:space-between;font-size:12.6px;color:var(--muted);margin-bottom:5px;font-family:var(--mono)}
+.bar .top b{color:#eaf6ff}
+.track{height:9px;border-radius:999px;background:rgba(255,255,255,.055);overflow:hidden;border:1px solid rgba(255,255,255,.06)}
+.fill{height:100%;width:0;border-radius:999px;transition:width 1.4s cubic-bezier(.2,.8,.2,1)}
+.in .fill{width:var(--w,0)}
+.f-cyan{background:linear-gradient(90deg,#1d7fa8,var(--cyan));box-shadow:0 0 14px rgba(63,233,255,.55)}
+.f-violet{background:linear-gradient(90deg,#5b3fb0,var(--violet));box-shadow:0 0 14px rgba(155,107,255,.5)}
+.f-green{background:linear-gradient(90deg,#1c8a5e,var(--green));box-shadow:0 0 14px rgba(47,245,161,.45)}
+.f-dim{background:linear-gradient(90deg,#2c3a4d,#5a7290)}
+.f-mag{background:linear-gradient(90deg,#8a2b6c,var(--magenta));box-shadow:0 0 14px rgba(255,94,203,.45)}
+
+/* ---------- tag pills ---------- */
+.pills{display:flex;flex-wrap:wrap;gap:7px;margin:10px 0 2px}
+.pill{
+  font-family:var(--mono);font-size:11.2px;color:#b6d7f2;border:1px solid var(--line);border-radius:999px;
+  padding:3px 10px;background:rgba(255,255,255,.025)
+}
+.pill.c{color:var(--cyan);border-color:rgba(63,233,255,.3)}
+.pill.v{color:#c3aaff;border-color:rgba(155,107,255,.32)}
+.pill.g{color:var(--green);border-color:rgba(47,245,161,.3)}
+.pill.a{color:var(--amber);border-color:rgba(255,190,77,.3)}
+
+/* ---------- kv blocks ---------- */
+.blocks{display:flex;flex-wrap:wrap;gap:7px;margin:14px 0 6px}
+.blk{
+  width:56px;height:44px;border-radius:7px;border:1px solid var(--line);background:rgba(255,255,255,.03);
+  display:grid;place-items:center;font-family:var(--mono);font-size:10.5px;color:var(--dim);position:relative;transition:.25s
+}
+.blk.hit{border-color:rgba(47,245,161,.55);background:rgba(47,245,161,.12);color:var(--green);box-shadow:0 0 18px -6px rgba(47,245,161,.6)}
+.blk.miss{border-color:rgba(255,190,77,.5);background:rgba(255,190,77,.10);color:var(--amber)}
+.blk.tail{border-style:dashed;border-color:rgba(255,94,203,.5);background:rgba(255,94,203,.08);color:var(--magenta)}
+.legend{display:flex;flex-wrap:wrap;gap:16px;font-size:12px;color:var(--muted);margin-top:8px}
+.legend i{display:inline-block;width:11px;height:11px;border-radius:3px;margin-right:6px;vertical-align:-1px}
+
+/* ---------- code tree ---------- */
+pre{
+  margin:0;padding:18px 20px;border-radius:12px;border:1px solid var(--line);background:rgba(3,6,12,.72);
+  font-family:var(--mono);font-size:12.6px;line-height:1.72;color:#a9c8e6;overflow-x:auto
+}
+pre .d{color:var(--cyan)}
+pre .c{color:var(--dim)}
+pre .f{color:#cfe6ff}
+pre .k{color:var(--violet)}
+
+/* ---------- svg diagram ---------- */
+.dg{width:100%;height:auto;display:block;margin:6px 0 2px}
+.dg text{font-family:var(--mono);font-size:11px;fill:#b8d6f2}
+.dg .t-h{font-size:12px;fill:#eaf6ff;font-weight:600}
+.dg .dash{stroke-dasharray:5 5;animation:dash 1.6s linear infinite}
+@keyframes dash{to{stroke-dashoffset:-20}}
+
+/* ---------- notes ---------- */
+.note{
+  border-left:2px solid var(--line-strong);padding:10px 14px;margin:14px 0;background:rgba(63,233,255,.045);
+  border-radius:0 8px 8px 0;font-size:13.2px;color:#a9c6e0
+}
+.note b{color:var(--cyan)}
+.note.a{border-left-color:rgba(255,190,77,.55);background:rgba(255,190,77,.06)}
+.note.a b{color:var(--amber)}
+.note.g{border-left-color:rgba(47,245,161,.5);background:rgba(47,245,161,.055)}
+.note.g b{color:var(--green)}
+
+/* ---------- reveal ---------- */
+.rv{opacity:0;transform:translateY(18px);transition:opacity .7s ease,transform .7s cubic-bezier(.2,.8,.2,1)}
+.rv.in{opacity:1;transform:none}
+
+footer{
+  border-top:1px solid var(--line);margin-top:70px;padding:30px 22px 46px;text-align:center;
+  color:var(--dim);font-size:12.5px;font-family:var(--mono)
+}
+footer a{color:var(--muted);text-decoration:none;border-bottom:1px dotted rgba(255,255,255,.2)}
+footer a:hover{color:var(--cyan)}
+
+@media (max-width:720px){
+  main{padding:104px 16px 60px}
+  .layer{grid-template-columns:38px 1fr;gap:10px}
+  .layer .desc{grid-column:1/-1}
+  nav{overflow-x:auto}
+  nav .chip{display:none}
+  .step::after{display:none}
+}
+@media (prefers-reduced-motion:reduce){
+  *{animation:none!important;transition:none!important}
+  .rv{opacity:1;transform:none}
+}
+</style>
+<noscript><style>.rv{opacity:1!important;transform:none!important}.fill{width:var(--w,0)!important}</style></noscript>
+</head>
+<body>
+<canvas id="bg"></canvas>
+<div class="grid-veil"></div>
+<div class="scan"></div>
+<div class="progress"><i id="bar"></i></div>
+
+<nav>
+  <span class="brand">NANO-VLLM</span>
+  <a href="#layers">六层架构</a>
+  <a href="#lifecycle">请求生命周期</a>
+  <a href="#spec">投机解码</a>
+  <a href="#registry">双注册表</a>
+  <a href="#kv">KV 与前缀缓存</a>
+  <a href="#graph">图捕获</a>
+  <a href="#backends">多硬件后端</a>
+  <a href="#perf">性能</a>
+  <a href="#tree">代码地图</a>
+  <span class="spacer"></span>
+  <span class="chip">main · 2026-09</span>
+</nav>
+
+<main>
+
+<!-- ============ HERO ============ -->
+<header class="hero" id="overview">
+  <div class="badge"><i class="pulse"></i>从零实现 · 无测试套件 · 以 GPU 实跑为唯一验收</div>
+  <h1>Nano-vLLM<br>自研轻量级大模型推理引擎</h1>
+  <p class="sub">
+    在上游 nano-vllm 的前缀缓存与张量并行之上，重新组织了<em class="hl">调度、投机解码、KV 分页与硬件抽象</em>四条主线：
+    连续批处理 + 分块预填充、三种草稿模型的整轮投机、按能力位声明的多后端，以及普通解码与投机整轮都可录制的 CUDA Graph / NPUGraph。
+    全部差异用注册表与能力位表达，引擎主干不出现模型名或后端名的字符串判断。
+  </p>
+  <div class="stats">
+    <div class="stat rv"><b data-count="8972">0</b><span>行 Python（引擎 7382 + 脚本 1590）</span></div>
+    <div class="stat rv"><b data-count="6">0</b><span>层单向调用架构</span></div>
+    <div class="stat rv"><b data-count="3">0</b><span>种草稿：EAGLE3 / DFlash / DSpark</span></div>
+    <div class="stat rv"><b data-count="3">0</b><span>硬件后端：CUDA / CoreX / Ascend 310P</span></div>
+    <div class="stat rv"><b data-count="108.7" data-suffix="">0</b><span>tok/s（4070 · EAGLE3 k=3 · 含 prefill）</span></div>
+  </div>
+  <div class="pills rv">
+    <span class="pill c">Qwen3 目标模型</span>
+    <span class="pill v">连续批处理</span>
+    <span class="pill v">分块预填充</span>
+    <span class="pill g">前缀缓存 + 草稿快照</span>
+    <span class="pill c">CUDA Graph / NPUGraph</span>
+    <span class="pill a">OpenAI 兼容服务（纯标准库）</span>
+    <span class="pill">/metrics Prometheus</span>
+  </div>
+</header>
+
+<!-- ============ LAYERS ============ -->
+<section id="layers">
+  <div class="kicker rv">01 / Architecture</div>
+  <h2 class="rv">六层单向调用架构</h2>
+  <p class="lead rv">上层只依赖下一层：调度逻辑不碰硬件细节，硬件差异全部收在后端层。目标模型与投机方法各自经注册表解析，<code>ModelRunner</code> 只消费适配器与统一的提交契约。</p>
+
+  <div class="stack">
+    <div class="layer l1 rv"><div class="idx">01</div>
+      <div class="name">接口层<small>nanovllm/llm.py · scripts/</small></div>
+      <div class="desc"><b>LLM</b>（继承 <code>LLMEngine</code>）+ <code>SamplingParams</code>，对齐 vLLM 的 <code>generate()</code>；同一引擎另被 <b>OpenAI 兼容服务</b>与 <b>benchmark</b> 驱动。</div></div>
+    <div class="arrow rv"><span>▼ 依赖向下</span></div>
+
+    <div class="layer l2 rv"><div class="idx">02</div>
+      <div class="name">调度层<small>engine/llm_engine · scheduler · block_manager</small></div>
+      <div class="desc">公平轮转的<b>连续批处理</b>、<b>分块预填充</b>、KV <b>分页</b>与<b>前缀复用</b>、显存不足时 LIFO 抢占（抢占即回收 spec 状态）。</div></div>
+    <div class="arrow rv"><span>▼</span></div>
+
+    <div class="layer l3 rv"><div class="idx">03</div>
+      <div class="name">执行层<small>engine/model_runner.py · 2356 行</small></div>
+      <div class="desc">普通解码、<b>图捕获与回放</b>、EAGLE3 的 <code>_sg_*</code> 与块草稿的 <code>_df_*</code> 两套<b>整轮编排</b>；pinned <code>MetaBlob</code> 每轮仅 2 次 H2D。</div></div>
+    <div class="arrow rv"><span>▼</span></div>
+
+    <div class="layer l4 rv"><div class="idx">04</div>
+      <div class="name">模型层<small>models/ · speculative/</small></div>
+      <div class="desc">目标模型 <b>Qwen3</b>；草稿模型 <b>EAGLE3</b>（链式 shifted draft）、<b>DFlash</b>（块草稿）、<b>DSpark</b>（DFlash 骨干 + Markov head）。两个注册表负责识别、归一化与构造。</div></div>
+    <div class="arrow rv"><span>▼</span></div>
+
+    <div class="layer l5 rv"><div class="idx">05</div>
+      <div class="name">算子层<small>layers/</small></div>
+      <div class="desc">Attention / Linear / Embedding / RMSNorm / RoPE / <b>Sampler</b>（top_p≥1 走 top-k 掩码 + Gumbel-argmax，图安全无分支）。</div></div>
+    <div class="arrow rv"><span>▼</span></div>
+
+    <div class="layer l6 rv"><div class="idx">06</div>
+      <div class="name">后端层<small>backends/cuda · corex · ascend</small></div>
+      <div class="desc">attention kernel、<b>KV 排布</b>、slot dtype、图执行器与权重格式转换，全部以<b>能力位</b>声明；引擎侧不做后端名判断。</div></div>
+  </div>
+
+  <div class="note rv"><b>为什么是单向的：</b>后端可以换内核、换 KV 布局、换图实现，但调度层看到的是同一种「同质批 + block table + slot」；模型层可以加草稿，但执行层看到的是同一种「一轮返回 m+1 个已接受 token」的提交契约。</div>
+</section>
+
+<!-- ============ LIFECYCLE ============ -->
+<section id="lifecycle">
+  <div class="kicker rv">02 / Runtime</div>
+  <h2 class="rv">一次请求的生命周期</h2>
+  <p class="lead rv">普通路径每步 <code>schedule → run → postprocess</code>；投机路径为 <code>step_spec()</code>：预填充阶段同时喂草稿模型，解码阶段每步跑一整轮投机。</p>
+
+  <div class="flow">
+    <div class="step rv" style="--c:var(--cyan)"><div class="n">STEP 01</div><h4>接纳 / 分词</h4><p>请求进入 waiting 队列，<code>generate()</code> 分词后按 token 预算决定是否可入批。</p></div>
+    <div class="step rv" style="--c:var(--blue)"><div class="n">STEP 02</div><h4>预填充 prefill</h4><p>长 prompt 跨多个调度步<b>分块</b>处理，逐块写入分页 KV；投机时同步捕获 aux 隐层并让草稿模型吃同一 chunk。</p></div>
+    <div class="step rv" style="--c:var(--violet)"><div class="n">STEP 03</div><h4>解码循环</h4><p>未完成请求组成 batch，每步一次前向各出一个 token；投机时一步 = 一整轮验证，可提交多个 token。</p></div>
+    <div class="step rv" style="--c:var(--magenta)"><div class="n">STEP 04</div><h4>抢占 / 补块</h4><p>逐 token <code>can_append</code>/<code>may_append</code> 补块，不足则 LIFO 抢占并释放 KV，回调 <code>drop_spec_state</code>。</p></div>
+    <div class="step rv" style="--c:var(--green)"><div class="n">STEP 05</div><h4>回传</h4><p>达到 <code>max_tokens</code> 或 EOS 后拼回文本；服务端每产出新 token 即唤醒 HTTP 线程推流。</p></div>
+  </div>
+
+  <div class="grid g2" style="margin-top:18px">
+    <div class="card rv">
+      <h3>公平轮转的连续批处理</h3>
+      <p style="color:var(--muted);font-size:13.6px;margin:0">
+        有 waiting 且有 running 时，<code>schedule()</code> 按 <code>_prefer_decode</code> 在 prefill 与 decode 之间交替；
+        <em class="hl">每步仍是同质批</em>——因为后端 attention 内核不接受 prefill/decode 混合批。一侧无进展立即试另一侧，两侧都无进展才抛错，不再静默空转。
+      </p>
+      <div class="pills">
+        <span class="pill">max_num_batched_tokens</span><span class="pill">max_num_partial_prefills</span><span class="pill">partial prefill 计入 max_num_seqs</span>
+      </div>
+    </div>
+    <div class="card rv">
+      <h3>服务端驱动模型</h3>
+      <p style="color:var(--muted);font-size:13.6px;margin:0">
+        单个后台线程统一 <code>step()</code> 驱动所有排队请求，HTTP 线程只负责收发与推流；引擎初始化时跑一次 <code>max_tokens=2</code> 的 dummy 生成，把 decode/spec kernel 冷启动前移（实测首请求 0.604s → 0.067s）。
+      </p>
+      <div class="pills">
+        <span class="pill c">[REQ ] / [DONE ] / [INFO ] 日志</span><span class="pill g">path= 执行路径标签</span><span class="pill a">/metrics 读 host 计数，不触发设备同步</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ SPEC ============ -->
+<section id="spec">
+  <div class="kicker rv">03 / Speculative Decoding</div>
+  <h2 class="rv">投机解码：一轮多个 token</h2>
+  <p class="lead rv">三种草稿共用同一套「起草 → target 一次验证 → 接受最长匹配前缀 → 采样 bonus」的提交契约，被拒草稿不会进入前缀缓存。差别只在草稿如何产生提案。</p>
+
+  <div class="grid g3">
+    <div class="card rv">
+      <h3 style="color:var(--cyan)">EAGLE3 · 链式草稿</h3>
+      <p style="color:var(--muted);font-size:13.3px">小草稿模型串行猜 <code>k</code> 个 token，每一步以前一步输出为种子；主模型一次前向批量验证。</p>
+      <pre style="font-size:11.8px;padding:12px 14px"><span class="c"># shifted draft 流口径</span>
+位置 p 的行:
+  embed  = <span class="d">tok@p+1</span>
+  条件   = fc(<span class="d">aux@p</span>)   <span class="c"># look-ahead</span>
+  预测   = <span class="k">tok@p+2</span></pre>
+      <div class="pills"><span class="pill c">冷启动首轮走 eager</span><span class="pill">carry 按 seq_id 保存</span></div>
+    </div>
+
+    <div class="card rv">
+      <h3 style="color:var(--violet)">DFlash · 块草稿</h3>
+      <p style="color:var(--muted);font-size:13.3px">一次<b>非因果</b>前向并行产出 <code>k</code> 个提案，没有链式循环，草稿轮延迟更接近常数。</p>
+      <pre style="font-size:11.8px;padding:12px 14px"><span class="c"># 每轮三步</span>
+① 上下文追加  <span class="d">v_aux[0..m]</span>
+② 块草稿     <span class="d">k 个提案并行</span>
+③ verify     <span class="k">[anchor, 提案×k]</span></pre>
+      <div class="pills"><span class="pill v">k = block_size − 1</span><span class="pill">共享 target embed / lm_head</span></div>
+    </div>
+
+    <div class="card rv">
+      <h3 style="color:var(--magenta)">DSpark · Markov head</h3>
+      <p style="color:var(--muted);font-size:13.3px">同样的并行块骨干，串接 vanilla 低秩 <b>Markov head</b>：逐位置在 base logits 上加前一个 token 的偏置。</p>
+      <pre style="font-size:11.8px;padding:12px 14px">base = <span class="d">block_forward()</span>   <span class="c"># k 行并行</span>
+for pos in range(k):
+  logits = base[:, pos]
+         + <span class="k">markov_bias(prev)</span>
+  prev   = sample(logits)</pre>
+      <div class="pills"><span class="pill a">固定 k（confidence head 已加载未启用）</span></div>
+    </div>
+  </div>
+
+  <h3 class="rv" style="margin-top:30px">一整轮投机在图内如何流动</h3>
+  <svg class="dg rv" viewBox="0 0 980 250" role="img" aria-label="投机解码整轮流程图">
+    <defs>
+      <linearGradient id="gA" x1="0" y1="0" x2="1" y2="0">
+        <stop offset="0" stop-color="#3fe9ff" stop-opacity=".25"/><stop offset="1" stop-color="#9b6bff" stop-opacity=".08"/>
+      </linearGradient>
+      <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+        <path d="M0,0 L8,4.5 L0,9 z" fill="#3fe9ff" opacity=".85"/>
+      </marker>
+    </defs>
+    <rect x="10" y="46" width="960" height="150" rx="14" fill="url(#gA)" stroke="rgba(63,233,255,.30)"/>
+    <text x="28" y="34" class="t-h" fill="#3fe9ff">单图整轮 · CUDA Graph / NPUGraph（失败自动降级 eager）</text>
+
+    <g>
+      <rect x="34" y="86" width="150" height="70" rx="9" fill="rgba(6,12,22,.85)" stroke="rgba(63,233,255,.45)"/>
+      <text x="109" y="115" text-anchor="middle">① scatter</text>
+      <text x="109" y="134" text-anchor="middle" fill="#8296b3" font-size="10">pinned meta → 静态 buffer</text>
+
+      <rect x="222" y="86" width="176" height="70" rx="9" fill="rgba(6,12,22,.85)" stroke="rgba(155,107,255,.5)"/>
+      <text x="310" y="112" text-anchor="middle">② 起草 draft</text>
+      <text x="310" y="130" text-anchor="middle" fill="#8296b3" font-size="10">EAGLE3 链步 1..k−1</text>
+      <text x="310" y="146" text-anchor="middle" fill="#8296b3" font-size="10">/ 块草稿一次前向</text>
+
+      <rect x="436" y="86" width="176" height="70" rx="9" fill="rgba(6,12,22,.85)" stroke="rgba(255,94,203,.5)"/>
+      <text x="524" y="112" text-anchor="middle">③ target verify</text>
+      <text x="524" y="130" text-anchor="middle" fill="#8296b3" font-size="10">一次前向 + 图内采样</text>
+      <text x="524" y="146" text-anchor="middle" fill="#8296b3" font-size="10">行 j 预测位置 L+j</text>
+
+      <rect x="650" y="86" width="150" height="70" rx="9" fill="rgba(6,12,22,.85)" stroke="rgba(255,190,77,.5)"/>
+      <text x="725" y="115" text-anchor="middle">④ 图内接受</text>
+      <text x="725" y="134" text-anchor="middle" fill="#8296b3" font-size="10">最长匹配前缀 m</text>
+
+      <rect x="838" y="86" width="112" height="70" rx="9" fill="rgba(6,12,22,.85)" stroke="rgba(47,245,161,.5)"/>
+      <text x="894" y="112" text-anchor="middle">⑤ 提交</text>
+      <text x="894" y="130" text-anchor="middle" fill="#8296b3" font-size="9.5">m + 1 bonus</text>
+      <text x="894" y="145" text-anchor="middle" fill="#8296b3" font-size="9.5">commit_buf</text>
+
+      <path class="dash" d="M184,121 H222" stroke="#3fe9ff" stroke-width="1.4" marker-end="url(#ar)"/>
+      <path class="dash" d="M398,121 H436" stroke="#9b6bff" stroke-width="1.4" marker-end="url(#ar)"/>
+      <path class="dash" d="M612,121 H650" stroke="#ff5ecb" stroke-width="1.4" marker-end="url(#ar)"/>
+      <path class="dash" d="M800,121 H838" stroke="#ffbe4d" stroke-width="1.4" marker-end="url(#ar)"/>
+    </g>
+
+    <path d="M894,156 V214 H109 V156" fill="none" stroke="rgba(47,245,161,.45)" stroke-width="1.3" stroke-dasharray="4 5" marker-end="url(#ar)"/>
+    <text x="500" y="230" text-anchor="middle" fill="#8296b3" font-size="10.5">EAGLE3 额外一步 refill：重放虚构窗口，在行 m 采样出下一轮 draft1（carry 跨轮）</text>
+  </svg>
+
+  <div class="grid g2" style="margin-top:8px">
+    <div class="card rv">
+      <h3>为什么必须有图</h3>
+      <p style="color:var(--muted);font-size:13.5px;margin:0">投机轮把 kernel 数量放大数倍，host 侧 launch 开销会吃掉草稿收益。实测三硬件一致：<em class="hl">eager spec 无收益甚至负收益</em>——4070 上 spec 收益依赖图，CoreX 上 spec eager 仅 11.3 tok/s 而图路径 103.7 tok/s。</p>
+    </div>
+    <div class="card rv">
+      <h3>跨轮状态与冷启动</h3>
+      <p style="color:var(--muted);font-size:13.5px;margin:0">batch 组成每轮都会变，位置索引只在单次回放内自洽，所以状态一律按 <code>seq_id</code> 存字典：<code>spec_carry</code>（采样行隐层 + draft1）、<code>spec_hidden</code>（aux 行 m）、<code>spec_cold</code>（冷启动标记）。prefill 后首轮无 carry → 整批走 eager，之后进图。</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ REGISTRY ============ -->
+<section id="registry">
+  <div class="kicker rv">04 / Extensibility</div>
+  <h2 class="rv">两个正交注册表</h2>
+  <p class="lead rv">新增目标模型 = 注册一个 target adapter + 模型实现；新增投机方法 = 注册一个 spec adapter + 草稿实现。两者都不动 <code>ModelRunner</code> 与 <code>scheduler</code>。</p>
+
+  <div class="grid g2">
+    <div class="card rv">
+      <h3 style="color:var(--cyan)">TargetModelAdapter <span style="font-family:var(--mono);font-size:11.5px;color:var(--dim)">models/registry.py</span></h3>
+      <div class="pills" style="margin-top:2px">
+        <span class="pill c">model_types / architectures 匹配 hf_config</span>
+        <span class="pill">supported_spec_methods</span>
+        <span class="pill">model_config_selector</span>
+        <span class="pill">aux_layer_resolver</span>
+        <span class="pill">build / load_weights 代理</span>
+      </div>
+      <p style="color:var(--muted);font-size:13.3px;margin:12px 0 0">
+        权重加载优先分发模型自带的 <code>load_weights</code>；aux 层换算在这里完成——Qwen3 的捕获钩子是<b>层输入</b>口径，块草稿 checkpoint 的 <code>target_layer_ids</code> 是<b>层输出</b>口径，故自动 <code>+1</code>。
+      </p>
+    </div>
+    <div class="card rv">
+      <h3 style="color:var(--violet)">SpecMethodAdapter <span style="font-family:var(--mono);font-size:11.5px;color:var(--dim)">speculative/registry.py</span></h3>
+      <div class="flow" style="margin:10px 0 0">
+        <div class="step" style="--c:var(--violet)"><div class="n">01</div><h4>识别方法</h4><p>按 draft config 的 <code>architectures</code> 判定 eagle3 / dflash / dspark。</p></div>
+        <div class="step" style="--c:var(--violet)"><div class="n">02</div><h4>normalizer</h4><p>归一化各家 checkpoint 字段命名。</p></div>
+        <div class="step" style="--c:var(--violet)"><div class="n">03</div><h4>num_tokens</h4><p>由 <code>block_size</code> 派生 k。</p></div>
+        <div class="step" style="--c:var(--violet)"><div class="n">04</div><h4>build_draft</h4><p>构造并加载草稿权重。</p></div>
+      </div>
+      <div class="note a" style="margin-top:14px"><b>顺序有坑：</b>DSpark 官方 checkpoint 同时暴露 DFlash 与 DSpark 两种标记，解析循环必须 <code>("dspark", "dflash")</code> 特定优先；<code>DFlash2</code> 显式拒绝。</div>
+    </div>
+  </div>
+
+  <div class="card rv" style="margin-top:16px">
+    <h3>config.py 只做装配与门控</h3>
+    <pre style="margin-top:8px">解析 target adapter ─┐
+                     ├─► <span class="d">target.validate_spec_method(spec_method)</span>   <span class="c"># 配对矩阵在 adapter 上</span>
+解析 spec adapter  ──┘
+        │
+        ├─► 派生 <span class="k">spec_num_tokens</span>（块草稿 = block_size−1；DSpark 视 sample_from_anchor 取 block_size）
+        ├─► 派生 <span class="k">spec_aux_layers</span>（块草稿 +1 换算；EAGLE3 用 (2, n//2, n−3)）
+        └─► 校验 aux 数量与草稿投影宽度一致、索引不越界</pre>
+    <p style="color:var(--muted);font-size:13.2px;margin:10px 0 0">Config 是 slotted dataclass，引擎 kwargs 按其字段过滤——<em class="hl">加配置项必须先加字段</em>。</p>
+  </div>
+</section>
+
+<!-- ============ KV ============ -->
+<section id="kv">
+  <div class="kicker rv">05 / Memory</div>
+  <h2 class="rv">KV 分页与前缀缓存</h2>
+  <p class="lead rv">KV 按固定 block 分页，block 级 xxhash 复用只覆盖 <b>prefill</b> 阶段；投机提交的 token 不参与哈希，避免被拒草稿污染缓存。</p>
+
+  <div class="card rv">
+    <div class="blocks">
+      <div class="blk hit">B0 ✓</div><div class="blk hit">B1 ✓</div><div class="blk hit">B2 ✓</div>
+      <div class="blk hit">B3 ✓</div><div class="blk hit">B4 ✓</div>
+      <div class="blk miss">B5</div><div class="blk miss">B6</div><div class="blk tail">B7 末块</div>
+    </div>
+    <div class="legend">
+      <span><i style="background:rgba(47,245,161,.5)"></i>命中：直接复用已算好的 KV</span>
+      <span><i style="background:rgba(255,190,77,.5)"></i>未命中：本步继续计算并登记哈希</span>
+      <span><i style="background:rgba(255,94,203,.45)"></i>310P 块草稿：被块查询覆盖的末块永不登记</span>
+    </div>
+    <p style="color:var(--muted);font-size:13.2px;margin:14px 0 0">
+      CUDA 默认 <code>kvcache_block_size=256</code>，因此短于 256 token 的共享前缀不命中属于预期；要观察命中，需要一个至少整块的固定 system / tools 前缀。
+      Agent 工作流数据集实测（4070 · k=3 · 24 请求）：命中 23，TTFT 中位 <b style="color:#eaf6ff">38.9ms</b> vs 关缓存 <b style="color:#eaf6ff">121.2ms</b>（−68%），吞吐 +12.6%，E 两侧不变。
+    </p>
+  </div>
+
+  <div class="grid g3" style="margin-top:16px">
+    <div class="card rv">
+      <h3 style="color:var(--green)">target KV：block hash</h3>
+      <p style="color:var(--muted);font-size:13.2px;margin:0">逐块链式哈希，命中即复用物理块；<code>--no-prefix-cache</code> 会连哈希计算与查找一起关闭，便于做冷/热 TTFT A/B。</p>
+    </div>
+    <div class="card rv">
+      <h3 style="color:var(--cyan)">CUDA / CoreX 草稿：CPU 快照</h3>
+      <p style="color:var(--muted);font-size:13.2px;margin:0">块草稿的上下文 KV 由 aux 重投影而来，与分页 token KV 是两种内容，故走稠密缓冲，并把可缓存块的投影结果<b>快照到有界主机内存（上限 1 GiB，LRU 淘汰）</b>。<code>cache_hit_validator</code> 保证：target 块命中但快照已淘汰 → 整体视作未命中、正常 prefill。</p>
+    </div>
+    <div class="card rv">
+      <h3 style="color:var(--magenta)">Ascend 310P：分页 NZ 草稿 KV</h3>
+      <p style="color:var(--muted);font-size:13.2px;margin:0">每层独立 FRACTAL_NZ 草稿 KV，与 target <b>共用物理块索引与 slot</b>，用非因果 SplitFuse 读取；靠「末块不登记哈希」避免污染，不需要主机快照。</p>
+    </div>
+  </div>
+
+  <div class="note rv"><b>代价与对照：</b>快照路径在冷 prefill 多一次 D2H，收益要用 <code>--num-repeats</code>（同 prompt 连跑，第 2 次起全命中）对照；前缀缓存只降 TTFT，对稳态吞吐还略负哈希开销。</div>
+</section>
+
+<!-- ============ GRAPH ============ -->
+<section id="graph">
+  <div class="kicker rv">06 / Graph Capture</div>
+  <h2 class="rv">图捕获与优雅降级</h2>
+  <p class="lead rv">普通解码按 batch 桶各录一张图；投机解码<b>一整轮录一张图</b>。任何捕获失败都打印告警、释放图池、回落到同构 eager 路径——不崩引擎。</p>
+
+  <div class="grid g2">
+    <div class="card rv">
+      <h3>图内必须全静态</h3>
+      <ul style="color:var(--muted);font-size:13.4px;margin:6px 0 0;padding-left:18px">
+        <li>元数据在 host 预展开填 pinned，图内只做 <code>copy_</code> / scatter；</li>
+        <li>禁止捕获期 host 同步（<code>.item()</code> / <code>tolist()</code>）、动态形状、index 写与动态 Add；</li>
+        <li>310P 的接受判定用 float 静态比较，绕开 AICPU Add；</li>
+        <li>padding 复位条件是 <code>n &lt; bucket</code>，且切片轴序为 <code>vs[n:, :]</code>——轴序或条件任一写错，并发下真实序列的 verify 槽会被清成 −1，表现为输出全「！」。</li>
+      </ul>
+    </div>
+    <div class="card rv">
+      <h3>桶表与统计</h3>
+      <p style="color:var(--muted);font-size:13.4px;margin:0">
+        桶表 <code>[1,2,4,8] + 16 步进</code>，未覆盖 <code>max_num_seqs</code> 时追加尾桶并一次性告警（不再静默降级）。
+        计数经 <code>decode_graph_stats</code> / <code>spec_graph_stats</code>（capture_success/failure、replay、eager_rounds、sampling_fallbacks、bucket_hits）暴露给 benchmark 与 server 的 runtime 行。
+      </p>
+      <div class="pills"><span class="pill c">graph_mode(): spec_graph / decode_graph / eager_fallback</span><span class="pill">NANOVLLM_SPEC_GRAPH=0|1</span><span class="pill">NANOVLLM_GRAPH_SAMPLE=0|1</span></div>
+    </div>
+  </div>
+
+  <div class="tw rv" style="margin-top:16px">
+    <table>
+      <thead><tr><th>路径</th><th>CUDA</th><th>CoreX</th><th>Ascend 310P</th></tr></thead>
+      <tbody>
+        <tr><td><b>decode 图</b></td><td class="ok">✓ 实证</td><td class="ok">✓ 实证（launch 税被放大，收益 7.2×）</td><td class="ok">NPUGraph 尝试 + 按桶降级</td></tr>
+        <tr><td><b>spec 整轮图</b></td><td class="ok">✓ 实证</td><td class="ok">✓ 一次捕获成功</td><td class="warn">try + 冒烟，失败降级 eager</td></tr>
+        <tr><td><b>eager spec</b></td><td class="warn">可用但无收益</td><td class="no">11.3 tok/s（近乎不可用）</td><td class="ok">可用（随机采样落此路径）</td></tr>
+        <tr><td><b>图内采样</b></td><td class="ok">默认开（含 Gumbel）</td><td class="ok">默认开</td><td class="no">默认关（NPU RNG 图安全性未验证）</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ============ BACKENDS ============ -->
+<section id="backends">
+  <div class="kicker rv">07 / Hardware</div>
+  <h2 class="rv">三硬件后端，一切差异走能力位</h2>
+  <p class="lead rv">选择顺序：<code>backend=</code> 参数 → <code>NANOVLLM_BACKEND</code> → 自动探测（<code>torch.corex</code> 标记 → corex，<code>torch.npu.is_available()</code> → ascend310p，否则 cuda）。<b>禁止按后端名做字符串判断</b>。</p>
+
+  <div class="tw rv">
+    <table>
+      <thead><tr><th>能力位</th><th>CUDA（NVIDIA）</th><th>CoreX（天数智芯）</th><th>Ascend 310P（Atlas 300I）</th></tr></thead>
+      <tbody>
+        <tr><td><b>KV 布局</b></td><td><code>[2,L,B,block,H,D]</code> BSHD</td><td><code>[2,L,B,H,block,D]</code> HND</td><td>每层 <code>FRACTAL_NZ (B, hidden/16, block, 16)</code></td></tr>
+        <tr><td><b>slot dtype</b></td><td>int32</td><td>int64</td><td>int32</td></tr>
+        <tr><td><b>dtype</b></td><td>跟随 hf_config（bf16）</td><td>跟随 hf_config</td><td class="warn">强制 fp16（ATB 算子不支持 bf16）</td></tr>
+        <tr><td><b>attention</b></td><td>flash-attn varlen / with_kvcache</td><td>ixformer varlen + paged_attention</td><td><code>_npu_flash_attention(_v3)</code> + <code>_npu_paged_attention(_splitfuse_v2)</code></td></tr>
+        <tr><td><b>block size</b></td><td>256 的倍数（默认 256）</td><td>2 的幂（默认 256）</td><td class="warn">仅 64 / 128，且 <code>block × head_dim ≤ 16384</code></td></tr>
+        <tr><td><b>前缀缓存</b></td><td class="ok">✓</td><td class="ok">✓</td><td class="warn">需 SplitFuse，缺失时自动关闭</td></tr>
+        <tr><td><b>块草稿 KV 形态</b></td><td>稠密缓冲 + CPU 快照</td><td>稠密缓冲 + CPU 快照</td><td>分页 NZ + SplitFuse（共用 target block table）</td></tr>
+        <tr><td><b>图执行器</b></td><td>ModelRunner 内置 CUDA Graph</td><td>同左（厂商兼容层）</td><td><code>ascend310p/graph.py</code> 的 NPUGraph 执行器</td></tr>
+        <tr><td><b>TP</b></td><td class="ok">1–8（普通 Qwen3）</td><td class="ok">同左</td><td class="no">仅 TP=1</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="grid g3" style="margin-top:16px">
+    <div class="card rv">
+      <h3 style="color:var(--cyan)">能力位清单</h3>
+      <div class="pills">
+        <span class="pill">dist_name</span><span class="pill">device_name</span><span class="pill">default_dtype</span>
+        <span class="pill c">supports_spec</span><span class="pill c">supports_spec_graph</span><span class="pill c">graph_sample_default</span>
+        <span class="pill v">supports_prefix_cache_attn</span><span class="pill v">supports_paged_context_attn</span><span class="pill v">supports_dflash_paged</span>
+        <span class="pill g">reserve_dummy_kv_block</span><span class="pill g">graph_slot_mapping_dtype</span><span class="pill a">prefix_cache_disable_reason</span>
+        <span class="pill">create_decode_graph_executor</span><span class="pill">optimize_(block_draft_)weights</span>
+      </div>
+    </div>
+    <div class="card rv">
+      <h3 style="color:var(--violet)">实机踩过的坑（已入仓）</h3>
+      <ul style="color:var(--muted);font-size:13.1px;margin:4px 0 0;padding-left:18px">
+        <li>CoreX：<code>context_lens</code> 必须是独立 int32 buffer，不能跟随 slot dtype 变 int64；</li>
+        <li>空板卡 KV 池贴地吃满会让图捕获 OOM，统一 <code>--gpu-mem-util 0.85</code>；</li>
+        <li>旧 transformers 的 <code>apply_chat_template(tokenize=True)</code> 返回 list 而非 dict；</li>
+        <li>310P：pinned host 张量必须显式 <code>device="cpu"</code>；<code>lm_head_weight</code> 是 Parameter，NZ 版本另存独立属性。</li>
+      </ul>
+    </div>
+    <div class="card rv">
+      <h3 style="color:var(--green)">环境开关</h3>
+      <div class="pills">
+        <span class="pill c">NANOVLLM_BACKEND</span><span class="pill c">NANOVLLM_SPEC_GRAPH</span><span class="pill c">NANOVLLM_GRAPH_SAMPLE</span>
+        <span class="pill v">NANOVLLM_310P_FLASH_OP=auto|legacy|v3|atb_v2</span>
+        <span class="pill v">NANOVLLM_310P_DFLASH_PAGED=auto|1|0</span>
+        <span class="pill v">NANOVLLM_ACLGRAPH_PA_UPDATE</span>
+      </div>
+      <p style="color:var(--muted);font-size:13px;margin:10px 0 0">显式设置优先于后端默认门；TP&gt;1 的 lm_head gather 不可捕获，该守卫不受 env 绕过。</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ PERF ============ -->
+<section id="perf">
+  <div class="kicker rv">08 / Measured</div>
+  <h2 class="rv">性能锚点</h2>
+  <p class="lead rv">RTX 4070 Laptop 8GB / WSL2 · spec_bench coding 前 10 条 · 串行 bs=1 · temperature=0 · k=3 · thinking-off · 吞吐含 prefill。数值受显存占用、温度与 thinking 口径影响。</p>
+
+  <div class="grid g2">
+    <div class="card rv">
+      <h3>4070 Laptop 8GB · tokens/s</h3>
+      <div class="bar"><div class="top"><span>本引擎 · EAGLE3 k=3（E=2.095）</span><b>108.7</b></div><div class="track"><i class="fill f-cyan" style="--w:86.5%"></i></div></div>
+      <div class="bar"><div class="top"><span>vLLM 0.26 · EAGLE3 spec</span><b>125.6</b></div><div class="track"><i class="fill f-dim" style="--w:100%"></i></div></div>
+      <div class="bar"><div class="top"><span>vLLM 0.26 · decode</span><b>69.5</b></div><div class="track"><i class="fill f-dim" style="--w:55.3%"></i></div></div>
+      <div class="bar"><div class="top"><span>本引擎 · decode</span><b>66.2</b></div><div class="track"><i class="fill f-violet" style="--w:52.7%"></i></div></div>
+      <p style="color:var(--muted);font-size:12.8px;margin:12px 0 0">投机的<b>结构收益</b>两侧一致：本引擎 108.7 / 66.2 = <em class="hl">1.64×</em>，vLLM 125.6 / 69.5 = 1.81×。剩余 ~14% 差距约一半来自每轮 host 耗时（vLLM 有异步调度重叠），一半来自两边生成文本数值漂移导致的接受率统计差。</p>
+    </div>
+
+    <div class="card rv">
+      <h3>CoreX 32GB · tokens/s（同口径）</h3>
+      <div class="bar"><div class="top"><span>Spec + Graph</span><b>104.1</b></div><div class="track"><i class="fill f-green" style="--w:100%"></i></div></div>
+      <div class="bar"><div class="top"><span>Graph（无 spec）</span><b>76.5</b></div><div class="track"><i class="fill f-cyan" style="--w:73.5%"></i></div></div>
+      <div class="bar"><div class="top"><span>Eager</span><b>8.1</b></div><div class="track"><i class="fill f-mag" style="--w:7.8%"></i></div></div>
+      <p style="color:var(--muted);font-size:12.8px;margin:12px 0 0">图在 CoreX 上是<em class="hl">刚需</em>：eager decode 仅 7.8 tok/s，kernel launch 税被厂商 torch 放大；图后 bs=1 72.9 / bs=8 415.8（TPS sweep 9.3×，远超 4070 的 +23%）。板卡连续高负载会触发温度告警，bench 之间需留冷却间隔。</p>
+    </div>
+  </div>
+
+  <div class="grid g3" style="margin-top:16px">
+    <div class="card rv">
+      <h3 style="color:var(--green)">接受长度 E 是主信号</h3>
+      <p style="color:var(--muted);font-size:13.1px;margin:0">E = 1 + 每轮接受数。位等门对 aux 口径错误<b>不敏感</b>，E 才是最终判据：该配置应显著 &gt; 2，若 E ≈ 1–1.2 先查 aux 换算与 embeds 是否过了 <code>input_layernorm</code>。</p>
+    </div>
+    <div class="card rv">
+      <h3 style="color:var(--amber)">thinking 口径会改变 E</h3>
+      <p style="color:var(--muted);font-size:13.1px;margin:0">同 seed 同题集单变量对照（CoreX）：thinking-on <b>E=1.748 / 85.3</b> → <code>--no-think</code> <b>E=2.125 / 101.3</b>。历史锚点全部是 thinking-off，对比时须两边一致。</p>
+    </div>
+    <div class="card rv">
+      <h3 style="color:var(--magenta)">低接受负载别开 spec</h3>
+      <p style="color:var(--muted);font-size:13.1px;margin:0">中文散文负载 E 仅 ~1.15–1.19，两个引擎都负收益（本引擎 61.7 → 59.7，vLLM 66.7 → 64.4，跨引擎互证）。高接受负载（coding / temp0）收益 +64% 以上。</p>
+    </div>
+  </div>
+
+  <div class="note a rv"><b>对表警告：</b>同命令同机冷态 vs 热态可差 ~1.6×（no-spec 42.6→69.8、spec 60.1→106.8，E 不变），来自持续负载下的热降频。TPS 落差先排除降频，再怀疑代码。</div>
+  <div class="note rv"><b>块草稿现状：</b>DFlash / DSpark 在 main 上目前只有机械冒烟（合成 mini draft 跑通 config 派生 → warmup → eager 轮 → 图捕获 → 回放 → 读回，图/eager 与 base/spec 位等），<em class="hl">尚无真实草稿权重的 TPS / E 锚点</em>；310P 分页 DSpark 也待实机验收。</div>
+</section>
+
+<!-- ============ TREE ============ -->
+<section id="tree">
+  <div class="kicker rv">09 / Source Map</div>
+  <h2 class="rv">代码地图</h2>
+  <p class="lead rv">引擎 7382 行 + 脚本 1590 行；最大文件 <code>engine/model_runner.py</code> 2356 行、<code>backends/ascend.py</code> 886 行、<code>scripts/openai_server.py</code> 1183 行。</p>
+  <div class="grid g2">
+    <pre class="rv"><span class="d">nanovllm/</span>
+├── llm.py                <span class="c"># 用户入口 LLM</span>
+├── config.py             <span class="c"># 配置装配与能力门控</span>
+├── sampling_params.py
+├── <span class="d">engine/</span>
+│   ├── llm_engine.py     <span class="c"># 主循环 / 启动摘要 / close()</span>
+│   ├── scheduler.py      <span class="c"># 公平轮转 + 分块预填充 + 抢占</span>
+│   ├── block_manager.py  <span class="c"># KV 分页与前缀缓存</span>
+│   ├── sequence.py
+│   └── model_runner.py   <span class="c"># 图捕获与投机整轮编排</span>
+├── <span class="d">models/</span>
+│   ├── qwen3.py  registry.py
+│   ├── eagle3.py dflash.py dspark.py
+├── <span class="d">speculative/</span>           <span class="c"># spec 方法识别与草稿构造</span>
+├── <span class="d">layers/</span>               <span class="c"># attn/linear/norm/rope/sampler</span>
+├── <span class="d">backends/</span>
+│   ├── base.py graph.py cuda.py corex.py ascend.py
+│   └── <span class="d">ascend310p/</span>       <span class="c"># NPUGraph 执行器 + ACLGraph attn</span>
+└── <span class="d">utils/</span></pre>
+    <div>
+      <pre class="rv"><span class="d">scripts/</span>
+├── benchmark.py      <span class="c"># jsonl 串行 TPS/TTFT + spec 统计</span>
+└── openai_server.py  <span class="c"># OpenAI 兼容服务 + 实时日志</span>
+
+<span class="d">bench_data/</span>
+├── question.jsonl        <span class="c"># spec_bench 英文</span>
+├── Zh_question.jsonl     <span class="c"># 中文 coding</span>
+└── agent_question.jsonl  <span class="c"># Agent 共享前缀</span>
+
+<span class="d">docs/</span>
+├── EAGLE3.md
+├── DFlash.md
+├── ASCEND310P_GRAPH_SPEC.md
+├── ASCEND310P_OPS.md
+└── architecture.html     <span class="c"># 本页</span></pre>
+      <div class="note rv" style="margin-top:14px"><b>运行约定：</b>必须以模块方式从仓库根目录跑（<code>python -m scripts.benchmark</code>），脚本需要<b>本地模型目录</b>（不接受 HuggingFace hub id）；<code>--questions</code> 默认值仍是历史工作区路径 <code>../question.jsonl</code>，用仓库内数据集须显式传路径。</div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ SUPPORT ============ -->
+<section id="support">
+  <div class="kicker rv">10 / Support Matrix</div>
+  <h2 class="rv">支持矩阵与限制</h2>
+  <div class="tw rv">
+    <table>
+      <thead><tr><th>目标 / 草稿</th><th>后端</th><th>主要限制</th></tr></thead>
+      <tbody>
+        <tr><td><b>Qwen3 / 无</b></td><td class="ok">CUDA · CoreX · 310P</td><td>310P 仅 fp16、TP=1</td></tr>
+        <tr><td><b>Qwen3 + EAGLE3</b></td><td class="ok">CUDA · CoreX · 310P</td><td>spec 恒 TP=1；图捕获失败自动回退 eager spec</td></tr>
+        <tr><td><b>Qwen3 + DFlash</b></td><td class="ok">CUDA · CoreX · 310P</td><td>CUDA/CoreX 用有界 CPU 草稿-KV 快照恢复命中块；310P 用共索引分页 NZ 草稿 KV + SplitFuse，末块不缓存</td></tr>
+        <tr><td><b>Qwen3 + DSpark</b></td><td class="warn">CUDA · CoreX · 310P（待实机验收）</td><td>DeepSeek 官方 vanilla / full-vocab 格式；固定 k，无动态 confidence 调度</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="note rv"><b>多卡现状：</b>普通 Qwen3 保留进程内张量并行（列/行并行 + all-reduce，rank&gt;0 走共享内存命令循环），但投机解码与 310P 均恒 TP=1；data parallel 与跨后端统一的多卡进程管理尚未加入。</div>
+</section>
+
+</main>
+
+<footer>
+  Nano-vLLM · 自研轻量级大模型推理引擎 · 内容与 <code>main</code> 分支工作树对齐（2026-09）<br>
+  详见仓库 <a href="../README.md">README.md</a> · <a href="../AGENTS.md">AGENTS.md</a> · <a href="EAGLE3.md">docs/EAGLE3.md</a> · <a href="DFlash.md">docs/DFlash.md</a> · <a href="ASCEND310P_GRAPH_SPEC.md">docs/ASCEND310P_GRAPH_SPEC.md</a>
+</footer>
+
+<script>
+/* ---------- 背景粒子网络 ---------- */
+(function(){
+  const c=document.getElementById('bg'),x=c.getContext('2d');
+  let w,h,ps=[],raf;
+  const N=window.innerWidth<760?34:64;
+  function size(){w=c.width=innerWidth;h=c.height=innerHeight;}
+  function init(){
+    size();ps=[];
+    for(let i=0;i<N;i++)ps.push({
+      x:Math.random()*w,y:Math.random()*h,
+      vx:(Math.random()-.5)*.22,vy:(Math.random()-.5)*.22,
+      r:Math.random()*1.5+.5,
+      c:Math.random()<.55?'63,233,255':(Math.random()<.6?'155,107,255':'47,245,161')
+    });
+  }
+  function tick(){
+    x.clearRect(0,0,w,h);
+    for(const p of ps){
+      p.x+=p.vx;p.y+=p.vy;
+      if(p.x<0||p.x>w)p.vx*=-1;
+      if(p.y<0||p.y>h)p.vy*=-1;
+      x.beginPath();x.arc(p.x,p.y,p.r,0,6.283);
+      x.fillStyle='rgba('+p.c+',.55)';x.fill();
+    }
+    for(let i=0;i<ps.length;i++)for(let j=i+1;j<ps.length;j++){
+      const a=ps[i],b=ps[j],dx=a.x-b.x,dy=a.y-b.y,d=dx*dx+dy*dy;
+      if(d<17000){
+        x.beginPath();x.moveTo(a.x,a.y);x.lineTo(b.x,b.y);
+        x.strokeStyle='rgba('+a.c+','+(0.16*(1-d/17000))+')';x.lineWidth=.7;x.stroke();
+      }
+    }
+    raf=requestAnimationFrame(tick);
+  }
+  init();tick();
+  addEventListener('resize',()=>{cancelAnimationFrame(raf);init();tick();});
+  if(matchMedia('(prefers-reduced-motion: reduce)').matches){cancelAnimationFrame(raf);x.clearRect(0,0,w,h);}
+})();
+
+/* ---------- 滚动进度 ---------- */
+const bar=document.getElementById('bar');
+addEventListener('scroll',()=>{
+  const m=document.documentElement.scrollHeight-innerHeight;
+  bar.style.width=(m>0?(scrollY/m*100):0)+'%';
+},{passive:true});
+
+/* ---------- 揭示 / 计数 ---------- */
+function countUp(root){
+  root.querySelectorAll('[data-count]').forEach(n=>{
+    const to=parseFloat(n.dataset.count),dec=(n.dataset.count.split('.')[1]||'').length;
+    let t0=null;const dur=1100;
+    requestAnimationFrame(function s(t){
+      if(!t0)t0=t;
+      const k=Math.min(1,(t-t0)/dur),e2=1-Math.pow(1-k,3);
+      n.textContent=(to*e2).toFixed(dec);
+      if(k<1)requestAnimationFrame(s);
+    });
+  });
+}
+const targets=document.querySelectorAll('.rv');
+if('IntersectionObserver' in window){
+  const io=new IntersectionObserver(es=>{
+    es.forEach(e=>{
+      if(!e.isIntersecting)return;
+      e.target.classList.add('in');
+      io.unobserve(e.target);
+      countUp(e.target);
+    });
+  },{threshold:.12,rootMargin:'0px 0px -6% 0px'});
+  targets.forEach(el=>io.observe(el));
+}else{
+  targets.forEach(el=>{el.classList.add('in');countUp(el);});
+}
+</script>
+</body>
+</html>

@@ -4,11 +4,6 @@ from contextlib import contextmanager
 import torch
 import torch.nn.functional as F
 
-# RMSNorm 等编译单元按 (rank, batch) 累积编译版本，默认 recompile_limit=8 很快用尽，
-# 之后的新 shape 回退 eager——浮点运算顺序与已编译 kernel 不同，会造成跨引擎 token
-# 级结果分歧。调高规避（原 layernorm.py 顶部常量随融合点方法迁移至此）。
-torch._dynamo.config.recompile_limit = 256
-
 
 def _apply_rotary_emb(x, cos, sin):
     x1, x2 = torch.chunk(x.float(), 2, dim=-1)
@@ -70,6 +65,20 @@ class BackendBase(ABC):
             "fused_ops": "backend default",
         }
 
+    def create_decode_graph_executor(self, plan):
+        """Return a backend-owned decode graph executor, if one is required.
+
+        CUDA and CoreX use the common graph executor currently hosted by
+        ModelRunner. Ascend overrides this factory with its NPUGraph executor.
+        """
+        return None
+
+    def prefix_cache_disable_reason(self) -> str | None:
+        return None
+
+    def dense_noncausal_attention(self, q, k, v, mask, scale: float):
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=scale)
+
     def optimize_model_weights(self, model) -> int:
         """Apply backend-specific post-load weight layouts.
 
@@ -78,8 +87,8 @@ class BackendBase(ABC):
         """
         return 0
 
-    def optimize_dflash_weights(self, draft_model, target_lm_head) -> int:
-        """Optional post-layout hook for DFlash-only fused/shared weights."""
+    def optimize_block_draft_weights(self, draft_model, target_lm_head) -> int:
+        """Optional post-layout hook for block-draft fused/shared weights."""
         return 0
 
     def dflash_paged_attention(
@@ -139,6 +148,16 @@ class BackendBase(ABC):
     def empty_cache(self):
         torch.cuda.empty_cache()
 
+    def shutdown(self):
+        """Release device resources when an engine is permanently closed.
+
+        CUDA/CoreX do not expose a process-runtime shutdown equivalent here;
+        dropping tensor references followed by an allocator flush is enough.
+        Device-specific backends may override this terminal operation.
+        """
+        self.synchronize()
+        self.empty_cache()
+
     def mem_get_info(self):
         return torch.cuda.mem_get_info()
 
@@ -163,10 +182,9 @@ class BackendBase(ABC):
         with torch.cuda.graph(graph, pool=pool):
             yield
 
-    # ---- 算子融合点：默认实现 = 现行为逐字迁移（CUDA/CoreX 位等保真，含编译装饰）；
-    # Ascend 覆盖为 npu 融合算子（npu_rms_norm/npu_add_rms_norm/...，见 ascend.py）----
+    # ---- Operator hooks. Ascend overrides these with fused NPU operators;
+    # CUDA/CoreX keep small eager implementations and rely on graph replay. ----
     @staticmethod
-    @torch.compile
     def rms_norm(x, weight, eps):
         orig_dtype = x.dtype
         x = x.float()
@@ -176,7 +194,6 @@ class BackendBase(ABC):
         return x
 
     @staticmethod
-    @torch.compile
     def add_rms_norm(x, residual, weight, eps):
         orig_dtype = x.dtype
         x = x.float().add_(residual.float())
@@ -187,7 +204,6 @@ class BackendBase(ABC):
         return x, residual
 
     @staticmethod
-    @torch.compile
     def silu_and_mul(x):
         x, y = x.chunk(2, -1)
         return F.silu(x) * y
