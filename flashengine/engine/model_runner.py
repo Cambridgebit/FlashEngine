@@ -235,7 +235,7 @@ class ModelRunner:
                 )
         self.startup_stats["weight_layout_conversions"] = float(weight_nz_count)
         self.startup_stats["model_load_s"] = time.perf_counter() - model_load_t0
-        self.sampler = Sampler()
+        self.sampler = Sampler(device_rng=self.backend.supports_device_sampling_rng)
         warmup_t0 = time.perf_counter()
         self.warmup_model()
         self.startup_stats["model_warmup_s"] = time.perf_counter() - warmup_t0
@@ -1830,6 +1830,8 @@ class ModelRunner:
                     if self.graph_sample:
                         token_ids[:bs] = self.sampler(
                             self.model.compute_logits(hidden), temperatures[:bs], top_ps[:bs], top_ks[:bs])
+                    else:
+                        outputs[:bs].copy_(hidden)
                 if self.graph_pool is None:
                     self.graph_pool = self.backend.graph_pool(graph)
                 self.graphs[bs] = graph

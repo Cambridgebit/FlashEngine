@@ -52,7 +52,7 @@ python3 -m scripts.benchmark /path/to/Qwen3-1.7B \
     --max-model-len 2048 --max-num-seqs 4 --gpu-mem-util 0.85 --no-think
 ```
 
-`--spec-model` 开启投机基准，`--no-prefix-cache` 关闭前缀缓存。脚本以 `python3 -m scripts.<名称>` 运行。多方法、多 batch 的统一测量见 [压测说明](docs/BENCH_MATRIX.md)。
+`--spec-model` 开启投机基准，`--no-prefix-cache` 关闭前缀缓存。脚本以 `python3 -m scripts.<名称>` 运行。HTTP 并发压测使用 `scripts.bench_concurrent`，与进程内串行基准分别记录，不混用测量口径。
 
 ## 代码目录与项目架构
 
@@ -126,6 +126,11 @@ CUDA/CoreX 使用其兼容的图接口，310P 使用 NPUGraph/ACLGraph。捕获�
 算法说明：[EAGLE3](docs/EAGLE3.md)、[DFlash / DSpark](docs/DFlash.md)。
 
 ### 后端算子与 Ascend 310P 的 NZ 格式
+
+CUDA 可设置 `FLASHENGINE_CUDA_ATTENTION=flashinfer` 使用与 vLLM 相同的 FlashInfer
+公开算子库，默认仍为 `flash-attn`。普通 decode 支持 Graph、前缀缓存和分块 prefill；
+FlashInfer 整轮投机图当前关闭，投机走 eager。安装、WSL 命令与回归说明见
+[FlashInfer 适配](docs/FLASHINFER.md)。
 
 CUDA 使用 FlashAttention；CoreX 使用 IXFormer。310P 使用厂商 FlashAttention、PagedAttention 与 SplitFuse，并调用融合 RMSNorm、残差加归一化、SwiGLU 和 RoPE 算子，减少中间张量与独立 kernel 调用。
 

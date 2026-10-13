@@ -28,6 +28,7 @@ class BackendBase(ABC):
     device_name = "cuda"
     default_dtype = None
     graph_sample_default = True
+    supports_device_sampling_rng = False
     spec_graph_try_default = True
 
     def normalize_config(self, config) -> None:
