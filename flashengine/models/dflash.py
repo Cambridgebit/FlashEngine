@@ -11,7 +11,11 @@ from flashengine.layers.layernorm import RMSNorm
 from flashengine.layers.linear import ReplicatedLinear, QKVParallelLinear, RowParallelLinear
 from flashengine.layers.rotary_embedding import get_rope
 from flashengine.models.qwen3 import PACKED_MODULES_MAPPING, Qwen3MLP
-from flashengine.utils.loader import default_weight_loader
+from flashengine.utils.loader import (
+    default_weight_loader,
+    iter_with_progress,
+    safetensors_total_bytes,
+)
 
 
 class DFlashBlockAttention(nn.Module):
@@ -292,14 +296,20 @@ def load_dflash_draft(model: DFlashDraftModel, path: str) -> None:
                     for name in f.keys():
                         yield name, f.get_tensor(name)
 
-    for name, tensor in items():
+    total_bytes = safetensors_total_bytes(path)
+    for name, tensor in iter_with_progress(items(), "Draft model loading (DFlash)",
+                                           total_bytes):
         if name == "embed_tokens.weight":
             if model.embed_tokens.weight.shape != tensor.shape:
                 raise ValueError("DFlash embedding size differs from the target vocabulary")
-            with torch.device("cpu"):
-                _emb = nn.Embedding(tensor.shape[0], tensor.shape[1],
-                                    dtype=model.fc.weight.dtype)
-            model.embed_tokens = _emb.to(model.fc.weight.device)
+            # 不做默认随机初始化：ARM CPU 上 6 亿元素 normal_ 约 40s（实测），
+            # 且随后会被 checkpoint 覆盖；直接在目标设备上建空权重交给下方加载器。
+            _emb = nn.Embedding(tensor.shape[0], tensor.shape[1],
+                                dtype=model.fc.weight.dtype,
+                                _weight=torch.empty(tensor.shape,
+                                                    dtype=model.fc.weight.dtype,
+                                                    device=model.fc.weight.device))
+            model.embed_tokens = _emb
         if name == "lm_head.weight":
             if model.lm_head_weight.shape != tensor.shape:
                 raise ValueError("DFlash LM-head size differs from the target vocabulary")

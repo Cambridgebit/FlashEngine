@@ -6,7 +6,13 @@ from importlib import import_module
 from typing import Any
 
 from flashengine.support_matrix import supported_spec_methods
-from flashengine.utils.loader import iter_safetensors, iter_safetensors_dequant, load_model
+from flashengine.utils.loader import (
+    iter_safetensors,
+    iter_safetensors_dequant,
+    iter_with_progress,
+    load_model,
+    safetensors_total_bytes,
+)
 
 
 def _identity_model_config(hf_config: Any) -> Any:
@@ -63,6 +69,9 @@ class TargetModelAdapter:
             iter_safetensors_dequant(model_path, dtype)
             if dequant else iter_safetensors(model_path)
         )
+        # 加载期反量化会把 int8 展开成 2 倍字节，文件头总量对不上，故不传总量。
+        total_bytes = None if dequant else safetensors_total_bytes(model_path)
+        weights = iter_with_progress(weights, "Target model loading", total_bytes)
         if hasattr(model, "load_weights"):
             model.load_weights(weights)
         else:

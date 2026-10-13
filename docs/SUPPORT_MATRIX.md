@@ -3,7 +3,7 @@
 本文是 FlashEngine 当前**声明支持**的组合清单：目标模型 × 后端 × 量化 × 投机方法。
 单一事实来源是 `flashengine/support_matrix.py`；`Config` 在启动时调用
 `require_supported(...)`，不支持的组合会**干净拒绝**（`NotImplementedError`，不静默降级）。
-本文件与该模块保持一致，`tests/test_support_matrix.py` 交叉校验代码与已注册 adapter。
+本文件与 `flashengine/support_matrix.py` 保持一致（后者为代码单一事实来源，启动即校验）。
 
 > 「声明支持」≠「已实机验收」。运行时能力（310P 缺 SplitFuse、图捕获失败、草稿 aux 层
 > 不匹配等）可能进一步收紧并优雅降级，见各 backend 的 `normalize_config`/`validate_config`
@@ -75,7 +75,7 @@
 |---|---|
 | qwen3 / qwen3_moe 普通（cuda） | 已实机冒烟：`tiny_qwen3moe_hf` 跑通 benchmark，decode 图 100% 捕获；与 HF bf16 贪心 2/3 prompt 逐 token 全等，1 条为 bf16 平票翻转（HF fp32 top-1 = 引擎选择） |
 | qwen3 / qwen3_moe 普通（corex） | 与 cuda 同源的纯 torch 专家前向；待 CoreX 实机位等 |
-| qwen3 / qwen3_moe 普通（310P） | 算子链已静态对齐 vllm-ascend 310P 并由 `tests/test_ascend_moe_contract.py` 无硬件回归覆盖；与 transformers 逐 token 位等（含 decoder_sparse_step>1 的混合 dense/稀疏层结构）仍待实机 |
+| qwen3 / qwen3_moe 普通（310P） | 算子链已静态对齐 vllm-ascend 310P（接线与数值经无硬件纯 torch 桩回归验证）；与 transformers 逐 token 位等（含 decoder_sparse_step>1 的混合 dense/稀疏层结构）仍待实机 |
 | qwen3 dense + EAGLE3/DFlash/DSpark | 与现有基线一致（E 锚点） |
 | qwen3 / qwen3_moe W8A8 | 与 fp16 输出对齐（或已知 ULP 平票豁免）；量化尺度键名/shape 与真实 checkpoint 对齐 |
 | qwen3_moe 普通 | MoE decode 图捕获率（失败按桶降级 eager） |

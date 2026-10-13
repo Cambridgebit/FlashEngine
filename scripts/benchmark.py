@@ -80,6 +80,10 @@ def main():
     parser.add_argument("--gpu-mem-util", type=float, default=0.9)
     args = parser.parse_args()
 
+    # 先给一行反馈：torch/torch_npu 导入在板卡上需 ~20s，期间没有任何输出。
+    print("[FlashEngine] Importing runtime (torch / torch_npu / transformers, "
+          "may take ~20s on Ascend boards) ...", flush=True)
+
     from flashengine import LLM, SamplingParams
     from flashengine.engine.sequence import Sequence
 

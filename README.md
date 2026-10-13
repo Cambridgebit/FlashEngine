@@ -73,7 +73,6 @@ flashengine/
 └── utils/                                 # 执行上下文与权重加载
 scripts/                                   # HTTP 服务、Web 控制台、基准脚本
 bench_data/                                # 英文、中文、共享前缀数据集
-tests/                                     # 主机逻辑与架构契约检查
 docs/                                      # 算法、后端与压测说明
 ```
 
@@ -177,18 +176,18 @@ CUDA 使用 FlashAttention；CoreX 使用 IXFormer。310P 使用厂商 FlashAtte
 
 ## 代码规模
 
-按 2026-10-02 当前工作区统计物理行数，含注释和空行。按模块互斥分组；Graph、投机与缓存共享执行代码，不将同一段重复计为各功能的独立成本。
+按 2026-10-13 当前工作区统计物理行数，含注释和空行。按模块互斥分组；Graph、投机与缓存共享执行代码，不将同一段重复计为各功能的独立成本。
 
 | 功能模块 | 统计范围 | Python 行数 |
 |---|---|---:|
-| 接口、配置与公共工具 | 包根目录、`llm_engine`、`observer`、目标注册表、`utils/` | 702 |
+| 接口、配置与公共工具 | 包根目录、`llm_engine`、`observer`、目标注册表、`utils/` | 1062 |
 | 调度、KV 分页与前缀缓存 | `scheduler`、`block_manager`、`sequence` | 542 |
-| 模型执行、Graph 与投机轮编排 | `model_runner` | 1856 |
-| 目标模型与通用算子 | `qwen3`、`layers/` | 682 |
-| 草稿模型与投机策略 | `eagle3`、`dflash`、`dspark`、`speculative/` | 948 |
-| 多后端适配 | `backends/`，含 310P 图执行器 | 1985 |
-| HTTP 服务 | `scripts/openai_server.py` | 1307 |
-| 基准与校验工具 | `scripts/` 中其余 Python 文件 | 1186 |
-| **运行代码合计** | **`flashengine/` + `scripts/`** | **9208** |
+| 模型执行、Graph 与投机轮编排 | `model_runner` | 1864 |
+| 目标模型与通用算子 | `qwen3`、`layers/` | 1123 |
+| 草稿模型与投机策略 | `eagle3`、`dflash`、`dspark`、`speculative/` | 1003 |
+| 多后端适配 | `backends/`，含 310P 图执行器 | 2345 |
+| HTTP 服务 | `scripts/openai_server.py` | 1318 |
+| 基准与校验工具 | `scripts/` 中其余 Python 文件 | 1190 |
+| **运行代码合计** | **`flashengine/` + `scripts/`** | **10447** |
 
-其中引擎 6715 行、脚本 2493 行。主机侧检查 `tests/` 另有 251 行；服务实际加载的 `scripts/webui.html` 为 3661 行 HTML，备用页面 `webui-aero.html` 为 5555 行，均不计入 Python 合计。行数用于说明维护规模，不作为性能指标。
+其中引擎 7939 行、脚本 2508 行。服务实际加载的 `scripts/webui.html` 为 3661 行 HTML，备用页面 `webui-aero.html` 为 5555 行，均不计入 Python 合计。行数用于说明维护规模，不作为性能指标。

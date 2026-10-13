@@ -1,5 +1,6 @@
 
 import os
+import threading
 from contextlib import contextmanager
 
 import torch
@@ -8,6 +9,7 @@ import torch.nn.functional as F
 from .base import BackendBase
 
 _npu = None
+_vllm_import_thread = None
 
 _COMPRESSED_MASK_SEQ_LEN = 2048
 _MASK_TYPE_NORM_COMPRESS_SELF_ATTENTION = 3
@@ -22,6 +24,36 @@ _REQUIRED_OPS = (
     "npu_add_rms_norm",
     "npu_swiglu",
 )
+
+
+def _start_vllm_gemm_import():
+    """后台线程导入 vllm_ascend，注册 torch.ops.vllm.unquantized_gemm。
+
+    导入 vllm/vllm_ascend 全套在 310P 板上实测约 6s，同步执行会直接阻塞启动；
+    放到后台与权重加载（20s 量级）重叠，GEMM 算子在首次使用时惰性解析。
+    未安装 / 导入失败时静默回退 torch（与旧行为一致）；环境变量
+    FLASHENGINE_VLLM_GEMM=0 可完全跳过该导入。
+    """
+    global _vllm_import_thread
+    if _vllm_import_thread is not None:
+        return _vllm_import_thread
+    if os.environ.get("FLASHENGINE_VLLM_GEMM", "auto").strip().lower() in (
+            "0", "off", "false"):
+        return None
+
+    def _load():
+        try:
+            import vllm_ascend.ops.linear  # noqa: F401
+        except ImportError:
+            pass
+        except Exception as exc:  # noqa: BLE001 -- 仅是可选 GEMM，失败不影响引擎
+            print("[FlashEngine] vllm_ascend GEMM import failed "
+                  f"(falling back to torch): {exc}", flush=True)
+
+    _vllm_import_thread = threading.Thread(
+        target=_load, name="flashengine-vllm-gemm-import", daemon=True)
+    _vllm_import_thread.start()
+    return _vllm_import_thread
 
 
 def _torch_npu():
@@ -40,10 +72,7 @@ def _torch_npu():
                 "torch_npu missing required ops: " + ", ".join(missing)
                 + " -- upgrade torch_npu/CANN (torch-npu==2.10.0.post4 / CANN 9.1.0)"
             )
-        try:
-            import vllm_ascend.ops.linear  # noqa: F401
-        except ImportError:
-            pass
+        _start_vllm_gemm_import()
         _npu = torch_npu
     return _npu
 
@@ -115,11 +144,10 @@ class Ascend310PBackend(BackendBase):
         self._decode_out = {}
         self._rope_cache = {}
         self._rope_apply_cache = {}
-        vllm_ops = getattr(torch.ops, "vllm", None)
-        self._unquantized_gemm = (
-            getattr(vllm_ops, "unquantized_gemm", None)
-            if vllm_ops is not None else None
-        )
+        # vllm_ascend 的 unquantized_gemm 在后台线程导入（见 _start_vllm_gemm_import），
+        # 这里只登记未解析状态，首次 linear()/runtime_info() 时再惰性取算子。
+        self._unquantized_gemm = None
+        self._gemm_op_resolved = False
         self._splitfuse_v2 = getattr(tn, "_npu_paged_attention_splitfuse_v2", None)
         self._splitfuse_legacy = getattr(tn, "_npu_paged_attention_splitfuse", None)
         self.supports_splitfuse = (
@@ -169,7 +197,7 @@ class Ascend310PBackend(BackendBase):
             "fused_ops": (
                 f"RMSNorm, AddRMSNorm, SwiGLU, RoPE={rope}, "
                 "Linear/LM-head weights=FRACTAL_NZ, "
-                f"GEMM={'vllm.unquantized_gemm' if self._unquantized_gemm is not None else 'torch-fallback'}"
+                "GEMM={gemm}"  # 首次 runtime_info() 时解析（vllm 在后台导入）
             ),
             "dflash_backend": (
                 f"paged-KV/SplitFuse-{splitfuse}" if self.supports_dflash_paged
@@ -178,11 +206,30 @@ class Ascend310PBackend(BackendBase):
         }
 
     def runtime_info(self) -> dict[str, str]:
-        return dict(self._runtime_info)
+        info = dict(self._runtime_info)
+        gemm = ("vllm.unquantized_gemm" if self._gemm_op() is not None
+                else "torch-fallback")
+        info["fused_ops"] = info["fused_ops"].format(gemm=gemm)
+        return info
+
+    def _gemm_op(self):
+        """取 vllm_ascend 的 unquantized_gemm（后台导入完成后解析一次）。"""
+        if not self._gemm_op_resolved:
+            thread = _vllm_import_thread
+            if thread is not None:
+                thread.join(timeout=120)
+            vllm_ops = getattr(torch.ops, "vllm", None)
+            self._unquantized_gemm = (
+                getattr(vllm_ops, "unquantized_gemm", None)
+                if vllm_ops is not None else None
+            )
+            self._gemm_op_resolved = True
+        return self._unquantized_gemm
 
     def linear(self, x, weight, bias=None):
-        if self._unquantized_gemm is not None:
-            return self._unquantized_gemm(x, weight, bias)
+        gemm = self._gemm_op()
+        if gemm is not None:
+            return gemm(x, weight, bias)
         return F.linear(x, weight, bias)
 
     def optimize_model_weights(self, model) -> int:

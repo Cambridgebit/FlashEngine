@@ -17,7 +17,11 @@ from flashengine.layers.activation import SiluAndMul
 from flashengine.layers.rotary_embedding import get_rope
 from flashengine.backends import get_backend
 from flashengine.models.qwen3 import PACKED_MODULES_MAPPING
-from flashengine.utils.loader import default_weight_loader
+from flashengine.utils.loader import (
+    default_weight_loader,
+    iter_with_progress,
+    safetensors_total_bytes,
+)
 
 
 class Eagle3MidLayer(nn.Module):
@@ -177,7 +181,9 @@ def load_eagle3_draft(model: Eagle3DraftModel, path: str) -> None:
                     for name in f.keys():
                         yield name, f.get_tensor(name)
 
-    for name, tensor in items():
+    total_bytes = safetensors_total_bytes(path)
+    for name, tensor in iter_with_progress(items(), "Draft model loading (EAGLE3)",
+                                           total_bytes):
         if name in ("d2t", "t2d"):
             buf = getattr(model, name)
             buf.data.copy_(tensor.to(buf.device))

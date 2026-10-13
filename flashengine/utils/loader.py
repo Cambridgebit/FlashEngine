@@ -1,8 +1,11 @@
+import json
 import os
+import struct
 from glob import glob
 import torch
 from torch import nn
 from safetensors import safe_open
+from tqdm import tqdm
 
 
 def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -14,6 +17,67 @@ def iter_safetensors(path: str):
         with safe_open(file, "pt", "cpu") as f:
             for name in f.keys():
                 yield name, f.get_tensor(name)
+
+
+def safetensors_total_bytes(path: str, skip=None) -> int | None:
+    """只读 safetensors 头部，统计权重字节总数（用作加载进度条总量）。
+
+    手工解析头部 JSON（格式 v1：8 字节小端长度 + JSON），不加载任何张量；
+    目录里没有 .safetensors（如 pytorch_model.bin）或解析失败时返回 None，
+    调用方退化为"只显示已加载张量数"的进度条。skip(name) 可排除已知不加载
+    的键（如 DSpark 的 t2d/d2t）。
+    """
+    files = sorted(glob(os.path.join(path, "*.safetensors")))
+    if not files:
+        return None
+    total = 0
+    for filepath in files:
+        try:
+            with open(filepath, "rb") as stream:
+                header_len = struct.unpack("<Q", stream.read(8))[0]
+                header = json.loads(stream.read(header_len))
+        except (OSError, ValueError, struct.error):
+            return None
+        for name, info in header.items():
+            if name == "__metadata__":
+                continue
+            if skip is not None and skip(name):
+                continue
+            begin, end = info["data_offsets"]
+            total += end - begin
+    return total
+
+
+def iter_with_progress(weights, label: str, total_bytes: int | None = None):
+    """包装权重迭代器，用 tqdm 进度条显示加载进度。
+
+    8B 级权重在板上加载需几十秒，期间完全静默会被误认为卡死；目标模型与
+    草稿模型的加载循环都套它输出进度。total_bytes 由调用方经
+    safetensors_total_bytes() 从文件头取得（进度按已加载字节走）；拿不到
+    总量时（pytorch_model.bin、加载期反量化等）退化为按张量数计数。
+    """
+    if total_bytes:
+        pbar = tqdm(total=total_bytes, desc=label, unit="B", unit_scale=True,
+                    unit_divisor=1024, dynamic_ncols=True)
+    else:
+        pbar = tqdm(desc=label, unit="tensor", dynamic_ncols=True)
+    count = 0
+    nbytes = 0
+    try:
+        for name, tensor in weights:
+            count += 1
+            nbytes += tensor.numel() * tensor.element_size()
+            pbar.update(tensor.numel() * tensor.element_size() if total_bytes else 1)
+            pbar.set_postfix_str(f"{count} tensors, {nbytes / 2**30:.2f} GiB",
+                                 refresh=False)
+            yield name, tensor
+    finally:
+        if total_bytes and pbar.n >= total_bytes:
+            pbar.n = total_bytes
+        if not total_bytes:
+            pbar.total = count
+        pbar.refresh()
+        pbar.close()
 
 
 def dequantize_int8_weight(

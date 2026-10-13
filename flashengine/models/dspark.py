@@ -7,16 +7,22 @@ from torch import nn
 from safetensors import safe_open
 
 from flashengine.models.dflash import DFlashDraftModel
-from flashengine.utils.loader import default_weight_loader
+from flashengine.utils.loader import (
+    default_weight_loader,
+    iter_with_progress,
+    safetensors_total_bytes,
+)
 
 
 class _MarkovHead(nn.Module):
     def __init__(self, vocab_size: int, rank: int, device=None):
         super().__init__()
-        # 310P: build on CPU (default init uses AI-CPU random ops, broken on old
-        # drivers), then move. Weights are overwritten when the checkpoint loads.
+        # 跳过随机初始化：默认 init 的 normal_ 在 310P 上走 AI-CPU 慢路径（旧
+        # 驱动直接报错），在 ARM CPU 上 6 亿元素也要 ~40s（实测）；权重反正会被
+        # checkpoint 覆盖。markov_w2 的 Linear 保留默认占位初始化。
         with torch.device("cpu"):
-            self.markov_w1 = nn.Embedding(vocab_size, rank)
+            self.markov_w1 = nn.Embedding(vocab_size, rank,
+                                          _weight=torch.empty(vocab_size, rank))
             self.markov_w2 = nn.Linear(rank, vocab_size, bias=False)
         if device is not None:
             self.to(device)
@@ -101,20 +107,28 @@ def load_dspark_draft(model: DSparkDraftModel, path: str) -> None:
                     for name in handle.keys():
                         yield name, handle.get_tensor(name)
 
+    def skipped(name: str) -> bool:
+        return name.removeprefix("model.").startswith(
+            ("t2d", "d2t", "mask_embedding"))
+
+    total_bytes = safetensors_total_bytes(path, skip=skipped)
     loaded = set()
-    for source_name, tensor in items():
+    for source_name, tensor in iter_with_progress(items(), "Draft model loading (DSpark)",
+                                                  total_bytes):
         name = source_name.removeprefix("model.")
         if name.startswith("t2d") or name.startswith("d2t") or name.startswith("mask_embedding"):
             continue
         if name == "embed_tokens.weight":
             if model.embed_tokens.weight.shape != tensor.shape:
                 raise ValueError("DSpark embedding size differs from the target vocabulary")
-            # 310P: build on CPU (nn.Embedding default init uses normal_, an
-            # AI-CPU op broken on old drivers), then move to the target device.
-            with torch.device("cpu"):
-                _emb = nn.Embedding(tensor.shape[0], tensor.shape[1],
-                                    dtype=model.fc.weight.dtype)
-            model.embed_tokens = _emb.to(model.fc.weight.device)
+            # 不做默认随机初始化：ARM CPU 上 6 亿元素 normal_ 约 40s（实测），
+            # 且随后会被 checkpoint 覆盖；直接在目标设备上建空权重交给下方加载器。
+            _emb = nn.Embedding(tensor.shape[0], tensor.shape[1],
+                                dtype=model.fc.weight.dtype,
+                                _weight=torch.empty(tensor.shape,
+                                                    dtype=model.fc.weight.dtype,
+                                                    device=model.fc.weight.device))
+            model.embed_tokens = _emb
         if name == "lm_head.weight":
             if model.lm_head_weight.shape != tensor.shape:
                 raise ValueError("DSpark LM-head size differs from the target vocabulary")
