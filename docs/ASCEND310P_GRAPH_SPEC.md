@@ -1,6 +1,6 @@
 # Ascend 310P Graph、EAGLE3 与 DFlash 适配说明
 
-本文说明 nano-vLLM 针对 Atlas 300V Pro / Ascend 310P 所做的推理加速适配，重点描述普通
+本文说明 FlashEngine 针对 Atlas 300V Pro / Ascend 310P 所做的推理加速适配，重点描述普通
 decode、EAGLE3 和 DFlash 的算子路径、KV-cache 布局、NPUGraph 捕获方法，以及它们与
 vLLM-Ascend 310P 路径的对应关系。
 
@@ -13,7 +13,7 @@ vLLM-Ascend 310P 路径的对应关系。
 - 避免图中的 AICPU 整数算子、动态分配和设备到主机同步；
 - 图捕获不兼容时安全降级到 eager，保证功能优先。
 
-nano-vLLM 没有复制 vLLM 的编译器和调度框架。vLLM-Ascend 的
+FlashEngine 没有复制 vLLM 的编译器和调度框架。vLLM-Ascend 的
 `compilation-config mode=3 + PIECEWISE` 由 vLLM compilation backend 负责切图；本项目则用
 更轻量的手工静态 buffer、batch bucket 和 `torch.npu.NPUGraph` 实现相同的执行目标。
 
@@ -68,7 +68,7 @@ scatter metadata
 
 ## 2. 与 vLLM-Ascend 的路径对应
 
-| 维度 | vLLM-Ascend 310P 的方向 | nano-vLLM 310P 实现 |
+| 维度 | vLLM-Ascend 310P 的方向 | FlashEngine 310P 实现 |
 |---|---|---|
 | 权重布局 | 310P GEMM 使用 NZ 内部格式 | 加载后把 Linear 权重转为 `FRACTAL_NZ`；LM head 保留 ND embedding 权重并增加独立 NZ 投影视图 |
 | KV-cache | 分页 NZ KV | 每层 `(blocks, hidden/16, block_size, 16)` 的 `FRACTAL_NZ` K/V |
@@ -133,7 +133,7 @@ Weights will be converted while loading.
 
 ## 4. 普通 decode 的 NPUGraph 对齐
 
-实现文件：`nanovllm/backends/ascend310p/graph.py`。
+实现文件：`flashengine/backends/ascend310p/graph.py`。
 
 ### 4.1 Batch bucket
 
@@ -324,13 +324,13 @@ gather dense context
 
 ```bash
 # 默认：存在 SplitFuse 时自动启用分页路径
-NANOVLLM_310P_DFLASH_PAGED=auto
+FLASHENGINE_310P_DFLASH_PAGED=auto
 
 # 强制旧的稠密 SDPA 路径
-NANOVLLM_310P_DFLASH_PAGED=0
+FLASHENGINE_310P_DFLASH_PAGED=0
 
 # 要求分页路径；缺少 SplitFuse 时启动直接报错
-NANOVLLM_310P_DFLASH_PAGED=1
+FLASHENGINE_310P_DFLASH_PAGED=1
 ```
 
 ### 6.4 DFlash 整轮图
@@ -434,7 +434,7 @@ int32 graph buffer，不在 attention 调用内部临时 `.to()`。
 | EAGLE3/DFlash 整轮图捕获失败 | 释放图池，全部 spec round 使用同构 eager 路径 |
 | spec 请求非 greedy，310P graph sampler 关闭 | 自动 eager spec，不改变采样语义 |
 | DFlash 无 SplitFuse | 默认使用 dense-KV/SDPA fallback |
-| `NANOVLLM_SPEC_GRAPH=0` | 不尝试 spec graph |
+| `FLASHENGINE_SPEC_GRAPH=0` | 不尝试 spec graph |
 | `--eager` | decode/spec 均不捕获图 |
 
 当前边界：
@@ -442,7 +442,7 @@ int32 graph buffer，不在 attention 调用内部临时 `.to()`。
 - 310P speculative decoding 只支持 TP=1；
 - 310P 强制 fp16；
 - 当前 target model 为 dense Qwen3；
-- nano-vLLM 没有 vLLM 的异步调度重叠，因此即使算子与图路径对齐，吞吐仍可能存在 host
+- FlashEngine 没有 vLLM 的异步调度重叠，因此即使算子与图路径对齐，吞吐仍可能存在 host
   scheduling 差距；
 - 不同 CANN/torch-npu 版本对 SplitFuse v2、compressed mask 和 graph-task update 的支持不同，
   实际能力以启动信息为准。
@@ -528,12 +528,12 @@ python3 -m scripts.benchmark ...
 python3 -m scripts.benchmark ... --eager
 
 # DFlash paged SplitFuse vs dense SDPA
-NANOVLLM_310P_DFLASH_PAGED=1 python3 -m scripts.benchmark ... --spec-model DFLASH
-NANOVLLM_310P_DFLASH_PAGED=0 python3 -m scripts.benchmark ... --spec-model DFLASH
+FLASHENGINE_310P_DFLASH_PAGED=1 python3 -m scripts.benchmark ... --spec-model DFLASH
+FLASHENGINE_310P_DFLASH_PAGED=0 python3 -m scripts.benchmark ... --spec-model DFLASH
 
 # Spec graph vs eager spec
-NANOVLLM_SPEC_GRAPH=1 python3 -m scripts.benchmark ... --spec-model DRAFT
-NANOVLLM_SPEC_GRAPH=0 python3 -m scripts.benchmark ... --spec-model DRAFT
+FLASHENGINE_SPEC_GRAPH=1 python3 -m scripts.benchmark ... --spec-model DRAFT
+FLASHENGINE_SPEC_GRAPH=0 python3 -m scripts.benchmark ... --spec-model DRAFT
 ```
 
 A/B 时必须保持模型、prompt 顺序、`--no-think`、temperature、max tokens、max model length 和
@@ -563,11 +563,11 @@ max sequences 完全一致，同时报告：
 
 ## 12. 关键源码索引
 
-- `nanovllm/backends/ascend.py`：310P 算子、NZ 权重/KV、SplitFuse、图能力声明；
-- `nanovllm/backends/ascend310p/graph.py`：普通 decode NPUGraph bucket runner；
-- `nanovllm/engine/model_runner.py`：spec metadata、EAGLE3/DFlash 整轮图、捕获与降级；
-- `nanovllm/models/eagle3.py`：EAGLE3 draft 模型与 shifted-stream 前向；
-- `nanovllm/models/dflash.py`：DFlash context projection、分页/稠密 attention 分支；
-- `nanovllm/backends/ascend310p/aclgraph_attn.py`：paged-attention graph-task update 能力探测；
+- `flashengine/backends/ascend.py`：310P 算子、NZ 权重/KV、SplitFuse、图能力声明；
+- `flashengine/backends/ascend310p/graph.py`：普通 decode NPUGraph bucket runner；
+- `flashengine/engine/model_runner.py`：spec metadata、EAGLE3/DFlash 整轮图、捕获与降级；
+- `flashengine/models/eagle3.py`：EAGLE3 draft 模型与 shifted-stream 前向；
+- `flashengine/models/dflash.py`：DFlash context projection、分页/稠密 attention 分支；
+- `flashengine/backends/ascend310p/aclgraph_attn.py`：paged-attention graph-task update 能力探测；
 - `docs/EAGLE3.md`：EAGLE3 算法说明；
 - `docs/DFlash.md`：DFlash 算法与多后端说明。

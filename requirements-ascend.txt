@@ -1,0 +1,42 @@
+# ---------------------------------------------------------------------------
+# FlashEngine — Ascend 310P (Atlas 300I Duo / 200I Pro) 独立依赖清单
+#
+# 本清单不含 vLLM / vLLM-Ascend：FlashEngine 在 310P 上不依赖它们。
+#   flashengine/backends/ascend.py 中 `import vllm_ascend.ops.linear` 仅用于
+#   尝试注册可选算子 torch.ops.vllm.unquantized_gemm，且被 try/except ImportError
+#   包裹；算子缺失时线性层自动回退 F.linear（NZ 权重）。
+#   实机实测：该算子在本镜像中始终不可用（引擎日志恒为 GEMM=torch-fallback），
+#   屏蔽 vllm + vllm_ascend 后引擎正常加载/推理，吞吐与时延完全一致。
+#
+# 安装：python3 -m pip install -r requirements-ascend.txt
+# 注意：CANN 与 NPU 驱动是系统组件（非 pip 包），需单独安装 Ascend toolkit + driver。
+#       本清单版本按下方实测环境钉定；torch-npu 必须与 torch 主次版本一致。
+#
+# 实测环境（开发板，已跑通 8B / 30B-A3B / EAGLE3 / DFlash / DSpark）：
+#   OS      : openEuler 24.03 LTS (aarch64)
+#   Python  : 3.11.10
+#   CANN    : 9.0.T3 (toolkit compiler/opp version 9.0.0)
+#   驱动    : 24.1.rc4 (7.6.T7.0.B052)
+# ---------------------------------------------------------------------------
+
+# --- 核心运行时（flashengine 直接 import）---
+torch==2.9.0                          # PyPI 上即 CPU 构建；NPU 设备由 torch-npu 提供
+torch-npu==2.9.0.post2.dev20260401    # 必须与 torch 主次版本一致；来自华为 Ascend 源
+transformers==4.57.6
+safetensors==0.7.0
+xxhash==3.6.0
+numpy==1.26.4
+tqdm==4.67.3
+
+# --- transformers 传递依赖（钉定以保证离线可复现）---
+tokenizers==0.22.2
+huggingface_hub==0.36.2
+regex==2026.4.4
+PyYAML==6.0.3
+filelock==3.29.0
+packaging==26.1
+requests==2.33.1
+
+# --- 可选：性能算子（实测默认不需要，可不装）---
+# vllm-ascend==0.18.0rc2.dev28+g7b3aa263a   # 仅提供 torch.ops.vllm.unquantized_gemm；
+#                                           # 本环境实测不可用，装了也不生效

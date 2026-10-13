@@ -1,14 +1,14 @@
 # Ascend 310P 算子清单
 
-本文列出 nano-vLLM 在 Ascend 310P（Atlas 300I Duo / 200I Pro）上实际使用的推理算子，
+本文列出 FlashEngine 在 Ascend 310P（Atlas 300I Duo / 200I Pro）上实际使用的推理算子，
 并给出与一份历史算子清单、以及 vLLM-Ascend 310P 官方实现的逐项对照。
 
-- 本项目路径：`nanovllm/backends/ascend.py` 及调用它的通用层（`nanovllm/layers/*.py`）。
+- 本项目路径：`flashengine/backends/ascend.py` 及调用它的通用层（`flashengine/layers/*.py`）。
 - vLLM-Ascend 路径：`vllm_ascend/_310p/`（`attention/attention_v1.py`、`ops/layernorm.py`、
   `ops/activation.py`、`ops/rotary_embedding.py`、`ops/linear.py`、
   `ops/vocab_parallel_embedding.py`、`device/device_op.py`、`sample/sampler.py`）。
 
-| 算子作用 | 本项目（nano-vLLM 310P） | 历史清单 | vLLM-Ascend 310P 官方 |
+| 算子作用 | 本项目（FlashEngine 310P） | 历史清单 | vLLM-Ascend 310P 官方 |
 |---|---|---|---|
 | Token Embedding | `F.embedding` | `F.embedding` | `F.embedding` |
 | QKV 投影 | `F.linear`（NZ 权重） | `F.linear` | `F.linear`（NZ 权重，custom op `unquantized_gemm`） |

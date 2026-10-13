@@ -8,9 +8,9 @@ current support surface.
 
 Target models and speculative methods are registered independently:
 
-- `nanovllm/models/registry.py` owns target-model construction, weight loading,
+- `flashengine/models/registry.py` owns target-model construction, weight loading,
   auxiliary-layer semantics, and the list of compatible speculative methods.
-- `nanovllm/speculative/registry.py` detects a draft checkpoint, normalizes its
+- `flashengine/speculative/registry.py` detects a draft checkpoint, normalizes its
   configuration, derives the proposal length, and constructs the draft model.
 - `ModelRunner` operates on the resolved adapters and the common speculative
   commit contract. It does not select concrete model classes by name.
@@ -65,7 +65,7 @@ is accepted only when the backend-specific draft state can also be restored.
 ## Graph execution
 
 Decode/spec graph support is a backend capability. Ascend 310P owns its
-NPUGraph implementation under `nanovllm/backends/ascend310p/`; CUDA and CoreX
+NPUGraph implementation under `flashengine/backends/ascend310p/`; CUDA and CoreX
 continue to use their graph APIs through the common runner path. Capture failure
 falls back to the equivalent eager speculative round rather than changing the
 commit semantics.

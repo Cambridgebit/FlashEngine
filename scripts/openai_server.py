@@ -1,70 +1,38 @@
-"""OpenAI 兼容 HTTP server（continuous batching + SSE 流式，纯 stdlib 零新依赖）。
-
-端点：/v1/models、/v1/chat/completions、/v1/completions、/health（含无 /v1 前缀别名）。
-参数：max_tokens（未传 = 生成到上下文顶）/ temperature / top_p / top_k / stop（文本级截断并中止生成）/
-stream / stream_options.include_usage；n 仅支持 1。
-上下文淘汰：chat 请求 prompt 超出 max_model_len 时，保留 system + 最近轮次、从最旧历史起逐条丢弃
-（不再砍尾巴吞掉最新提问）；为客户未指定 max_tokens 的请求预留 --reserve-output（默认 512）token
-作为输出预算。completions 超长时保留尾部（最新内容）。
-并发模型：后台引擎驱动线程统一 step() 驱动所有排队请求（continuous batching），
-HTTP 线程只负责收发与流式推送。
-
-服务端日志（固定 5 字符标签 + 毫秒时间戳；TTY 下自动上色；rid 贯穿 HTTP/REQ/DONE）：
-- [HTTP ] 传输层：rid/method/path/status/client/响应字节/耗时；
-- [REQ  ] 引擎受理（首次被调度时）：rid/端点/stream/prompt/max_out/采样/thinking/淘汰数/引擎调度等待 wait；
-- [DONE ] 单请求完成：rid/in(输入 prompt token)/out(输出 token)/E(平均接受长度)/TTFT(实际模型处理)/TPS/ctx(上下文占用)/cache(本请求命中)/finish；
-- [INFO ] 周期聚合（默认每 10 秒）：prompt/generation throughput、running/waiting、
-  KV cache、prefix hit、engine busy、Graph replay rate 与 speculative E；
-- [WARN ] / [ERROR] 异常（同宽度）。
-
-用法（必须从仓库根目录以 -m 方式运行，直跑 scripts/X.py 会 ModuleNotFoundError）：
-    python3 -m scripts.openai_server /path/to/Qwen3-1.7B [--port 8000]
-        [--spec-model <draft 目录>] [--spec-num-tokens k] [--eager] [--no-think] [--reserve-output N] [--api-key xxx]
-"""
 import argparse
 import json
 import pathlib
 import sys
 import threading
 import time
+from urllib.parse import urlsplit
 
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from nanovllm import LLM, SamplingParams
-from nanovllm.engine.sequence import Sequence, SequenceStatus
+from flashengine.engine.observer import EngineObserver
 
 
-# ---------------------------------------------------------------------------
-# 全局引擎 + 并发控制
-# ---------------------------------------------------------------------------
 
 engine = None
 _tokenizer = None
 _eos = None
-_model_name = "nanovllm"
+_model_name = "flashengine"
 _api_key = None
 _default_temperature = 0.0
 _max_model_len = 4096
-# chat template 的 enable_thinking 默认：None = 交给模板默认（Qwen3 = on）；
-# False = 显式关（--no-think，对齐 benchmark 历史 E 锚点口径）。每请求可用
-# chat_template_kwargs.enable_thinking 覆盖。
 _default_thinking = None
-# 上下文淘汰：客户端未显式给 max_tokens 时，为输出预留的 token 数（--reserve-output）。
-# prompt（system + 历史 + 最新）超出 max_model_len - reserve 时，从最旧历史起淘汰。
 _default_reserve = 512
-# 内置 Web 控制台（对话 + 性能面板）：随 API 同端口挂在 / 上，页面本身不鉴权，
-# 但其中所有 /v1/* 调用仍受 --api-key 约束；--no-ui 连 /v1/stats 一起关闭。
 _ui_enabled = True
+_ui_html_path = None
 _ui_html_cache = None
 _ui_html_failed = False
 
 
 def _webui_html():
-    """读取并缓存 scripts/webui.html（自包含单文件：零外部依赖、离线可用）。"""
     global _ui_html_cache, _ui_html_failed
     if _ui_html_cache is None and not _ui_html_failed:
-        path = pathlib.Path(__file__).with_name("webui.html")
+        path = (pathlib.Path(_ui_html_path) if _ui_html_path
+                else pathlib.Path(__file__).with_name("webui.html"))
         try:
             _ui_html_cache = path.read_bytes()
         except OSError as exc:
@@ -72,7 +40,6 @@ def _webui_html():
             _log("WARN", f"Web 控制台不可用（读不到 {path}：{exc}）")
     return _ui_html_cache
 
-# ---- 日志（固定宽度标签 + 毫秒时间戳 + TTY 上色）----
 _TAG_W = 5
 _TAG_COLORS = {
     "HTTP": "\033[90m", "REQ": "\033[94m", "DONE": "\033[92m",
@@ -87,7 +54,6 @@ def _ts():
 
 
 def _log(tag, msg):
-    """统一日志：`HH:MM:SS.mmm [TAG  ] msg`；标签内容固定 _TAG_W 宽，TTY 上色。"""
     label = f"[{tag:<{_TAG_W}}]"
     if _use_color:
         color = _TAG_COLORS.get(tag)
@@ -97,7 +63,6 @@ def _log(tag, msg):
 
 
 class _CountingWriter:
-    """包一层 wfile 以统计每次 HTTP 响应的字节数（[HTTP] 行用）。"""
 
     def __init__(self, wfile, box):
         self._wfile = wfile
@@ -118,10 +83,6 @@ class _CountingWriter:
         return getattr(self._wfile, name)   # 透传 closed 等底层属性
 
 
-# 投机解码窗口统计（[INFO] 的平均 E）；非 spec 恒 0。
-_spec_rounds_window = 0
-_spec_committed_window = 0
-
 engine_lock = threading.RLock()      # 保护 add / step / abort / _active
 _wakeup = threading.Event()          # 有请求加入 / 中止时唤醒 driver
 _shutdown = threading.Event()
@@ -129,18 +90,12 @@ _active = {}                         # seq_id -> _Request
 
 TPS_INTERVAL = 10.0                  # [INFO] 周期聚合打印间隔（秒，vLLM 默认风格）
 _gen_lock = threading.Lock()
-_gen_window = 0                      # 当前 TPS 统计窗口内的生成 token 数
-_prompt_window = 0                   # 当前窗口实际计算的 prompt token 数（cache hit 不重复计）
-_step_window = 0
-_prefill_steps_window = 0
-_decode_steps_window = 0
-_engine_busy_window = 0.0
+_window = dict(gen=0, prompt=0, steps=0, prefill_steps=0, decode_steps=0,
+               busy=0.0, spec_rounds=0, spec_committed=0)
 _warned_execution_paths = set()
 _metrics_started = time.time()
-# Web 控制台的高频轮询端点：不逐条打 [HTTP ]，改为计数并进 [INFO ] 聚合行。
 _QUIET_HTTP_PATHS = frozenset({"/v1/stats", "/stats"})
 _ui_polls = 0
-# 前端性能面板的数据源：最近完成的请求明细（环形缓冲，host 侧，无设备同步）。
 _requests_recent = deque(maxlen=200)
 _engine_info_cache = None
 _metrics_total = {
@@ -161,11 +116,12 @@ _metrics_total = {
 
 
 class _Request:
-    """单个请求的状态：driver 写入，HTTP 线程读取。"""
 
-    def __init__(self, seq, max_tokens, rid, t_http=None):
+    def __init__(self, seq, max_tokens, rid, t_http=None, auto_continue=False):
         self.seq = seq
         self.max_tokens = max_tokens
+        self.auto_continue = auto_continue
+        self.segment = 0
         self.rid = rid
         self.prompt_tokens = seq.num_prompt_tokens
         self.t_add = time.perf_counter()   # 入队（引擎受理）时刻
@@ -175,15 +131,15 @@ class _Request:
         self.t_done = None                 # 完成时刻
         self.cached_prompt_tokens = 0
         self.tokens = deque()        # driver 追加已生成的 token（eos 已剔除）
+        self.recent_tokens = deque(maxlen=256)
+        self.generated_tokens = 0    # host-side hard limit, independent of engine path
         self.n_seen = 0
         self.event = threading.Event()
         self.finished = False
         self.finish_reason = None
         self.error = None
-        # 投机解码 per-request 统计（spec_round 埋点累计；非 spec 恒 0）
         self.spec_rounds = 0
         self.spec_committed = 0
-        # [REQ] 展示用元数据（_generate 填充）
         self.endpoint = ""
         self.stream = False
         self.client = ""
@@ -194,116 +150,101 @@ class _Request:
         self.evicted = 0
         self.preview = ""
         self.execution_path = "eager"
-        # 诊断：该请求存活期间发生过多少次 KV 抢占（scheduler.stats 计数差值）
         self.preempt0 = 0
 
 
 def _bump_tokens(n):
-    """driver 每产出 n 个 token 调用一次，供 [INFO] 聚合线程统计。"""
-    global _gen_window
     with _gen_lock:
-        _gen_window += n
+        _window["gen"] += n
         _metrics_total["generated_tokens"] += n
 
 
 def _record_engine_step(num_tokens, elapsed):
-    """Accumulate low-overhead engine metrics for the periodic vLLM-style log."""
-    global _prompt_window, _step_window, _prefill_steps_window
-    global _decode_steps_window, _engine_busy_window
     with _gen_lock:
-        _step_window += 1
-        _engine_busy_window += elapsed
+        _window["steps"] += 1
+        _window["busy"] += elapsed
         _metrics_total["engine_steps"] += 1
         _metrics_total["engine_busy_seconds"] += elapsed
         if num_tokens > 0:
-            _prompt_window += num_tokens
-            _prefill_steps_window += 1
+            _window["prompt"] += num_tokens
+            _window["prefill_steps"] += 1
             _metrics_total["prompt_tokens_computed"] += num_tokens
             _metrics_total["prefill_steps"] += 1
         elif num_tokens < 0:
-            _decode_steps_window += 1
+            _window["decode_steps"] += 1
             _metrics_total["decode_steps"] += 1
 
 
 def _metrics_values():
-    """累计计数器与实时仪表（JSON-safe 扁平字典）。
-
-    /metrics（Prometheus 文本）与 /v1/stats（前端面板）共用同一份取值，保证两个
-    端点永不漂移；只读 host 计数，不触发设备同步。
-    """
     with engine_lock:
         with _gen_lock:
             totals = _metrics_total.copy()
-        scheduler = engine.scheduler
-        scheduler_stats = scheduler.get_stats()
-        bm = scheduler.block_manager
-        cache = bm.get_prefix_stats()
+        runtime = engine.runtime_snapshot()
+        scheduler_stats = runtime["scheduler"]
+        cache = runtime["cache"]
         graph_kind, graph = _graph_stats()
         values = {
-            "nanovllm_start_time_seconds": _metrics_started,
-            **{f"nanovllm_{key}_total": value for key, value in totals.items()
+            "flashengine_start_time_seconds": _metrics_started,
+            **{f"flashengine_{key}_total": value for key, value in totals.items()
                if not key.startswith("ttft_")},
-            "nanovllm_ttft_seconds_sum": totals["ttft_seconds_sum"],
-            "nanovllm_ttft_seconds_count": totals["ttft_seconds_count"],
-            "nanovllm_running_requests": len(scheduler.running),
-            "nanovllm_waiting_requests": len(scheduler.waiting),
-            "nanovllm_active_requests": scheduler_stats["active"],
-            "nanovllm_partial_prefills": scheduler_stats["partial_prefills"],
-            "nanovllm_scheduler_chunked_prefill_steps_total": (
+            "flashengine_ttft_seconds_sum": totals["ttft_seconds_sum"],
+            "flashengine_ttft_seconds_count": totals["ttft_seconds_count"],
+            "flashengine_running_requests": scheduler_stats["running"],
+            "flashengine_waiting_requests": scheduler_stats["waiting"],
+            "flashengine_active_requests": scheduler_stats["active"],
+            "flashengine_partial_prefills": scheduler_stats["partial_prefills"],
+            "flashengine_scheduler_chunked_prefill_steps_total": (
                 scheduler_stats["chunked_prefill_steps"]
             ),
-            "nanovllm_scheduler_preemptions_total": scheduler_stats["preemptions"],
-            "nanovllm_kv_blocks_used": len(bm.used_block_ids),
-            "nanovllm_kv_blocks_total": len(bm.blocks),
-            "nanovllm_prefix_requests_total": cache["requests"],
-            "nanovllm_prefix_hit_requests_total": cache["prefix_hits"],
-            "nanovllm_prefix_cached_blocks_total": cache["cached_blocks"],
-            "nanovllm_prefix_new_blocks_total": cache["new_blocks"],
+            "flashengine_scheduler_preemptions_total": scheduler_stats["preemptions"],
+            "flashengine_kv_blocks_used": cache["used_blocks"],
+            "flashengine_kv_blocks_total": cache["total_blocks"],
+            "flashengine_prefix_requests_total": cache["requests"],
+            "flashengine_prefix_hit_requests_total": cache["prefix_hits"],
+            "flashengine_prefix_hit_blocks_total": cache.get(
+                "prefix_hit_blocks", cache["cached_blocks"]),
+            "flashengine_prefix_cached_blocks_total": cache["cached_blocks"],
+            "flashengine_prefix_new_blocks_total": cache["new_blocks"],
         }
-        runner = engine.model_runner
-        if hasattr(runner, "df_prefix_snapshot_stats"):
-            snapshot = runner.df_prefix_snapshot_stats
-            values["nanovllm_draft_prefix_snapshots_saved_total"] = snapshot["saved"]
-            values["nanovllm_draft_prefix_snapshots_restored_total"] = snapshot["restored"]
-            values["nanovllm_draft_prefix_snapshots_evicted_total"] = snapshot["evicted"]
-            values["nanovllm_draft_prefix_snapshot_bytes"] = runner._df_prefix_snapshot_bytes
+        for key, value in runtime["prefill"].items():
+            values[f"flashengine_prefill_{key}_total"] = value
+        draft_prefix = runtime["draft_prefix"]
+        values["flashengine_draft_prefix_snapshots_saved_total"] = draft_prefix["saved"]
+        values["flashengine_draft_prefix_snapshots_restored_total"] = draft_prefix["restored"]
+        values["flashengine_draft_prefix_snapshots_evicted_total"] = draft_prefix["evicted"]
+        values["flashengine_draft_prefix_snapshot_bytes"] = draft_prefix["bytes"]
         if graph_kind and graph is not None:
-            values[f"nanovllm_{graph_kind}_graph_replays_total"] = graph.get("replay", 0)
-            values[f"nanovllm_{graph_kind}_graph_fallbacks_total"] = graph.get(
+            values[f"flashengine_{graph_kind}_graph_replays_total"] = graph.get("replay", 0)
+            values[f"flashengine_{graph_kind}_graph_fallbacks_total"] = graph.get(
                 "eager_rounds", graph.get("fallback", 0))
     return values
 
 
 def _prometheus_metrics():
-    """Prometheus text exposition of the cumulative counters and live gauges."""
     return "".join(
         f"{key} {value}\n" for key, value in _metrics_values().items()
     ).encode("ascii")
 
 
 def _engine_info():
-    """启动后不再变化的引擎画像（供前端标题栏/面板一次性展示）。"""
     global _engine_info_cache
     if _engine_info_cache is not None:
         return _engine_info_cache
-    mr = engine.model_runner
-    cfg = mr.config
-    backend_info = {}
-    try:
-        backend_info = dict(mr.backend.runtime_info())
-    except Exception:     # 画像只是展示用途，后端实现差异不应拖垮面板
-        pass
+    runtime = engine.runtime_snapshot()
+    core = runtime["engine"]
+    spec = runtime["spec"]
+    cfg = engine.config
     info = {
         "model": _model_name,
         "model_path": cfg.model,
-        "backend": getattr(mr.backend, "name", "?"),
-        "backend_info": backend_info,
-        "graph_mode": mr.graph_mode(),
-        "enforce_eager": bool(mr.enforce_eager),
-        "spec_enabled": bool(getattr(mr, "spec_enabled", False)),
-        "spec_method": getattr(cfg, "spec_method", "") or "",
-        "spec_model": getattr(cfg, "spec_model", "") or "",
-        "spec_num_tokens": getattr(cfg, "spec_num_tokens", 0),
+        "backend": core["backend"],
+        "backend_info": core["backend_info"],
+        "graph_mode": core["graph_mode"],
+        "enforce_eager": core["enforce_eager"],
+        "spec_enabled": spec["enabled"],
+        "spec_method": spec["method"],
+        "spec_model": core["spec_model"],
+        "spec_num_tokens": spec["num_tokens"],
         "max_model_len": cfg.max_model_len,
         "max_num_seqs": cfg.max_num_seqs,
         "max_num_batched_tokens": cfg.max_num_batched_tokens,
@@ -311,9 +252,9 @@ def _engine_info():
         "max_num_partial_prefills": cfg.max_num_partial_prefills,
         "enable_prefix_cache": bool(cfg.enable_prefix_cache),
         "kvcache_block_size": cfg.kvcache_block_size,
-        "num_kvcache_blocks": len(engine.scheduler.block_manager.blocks),
-        "dtype": str(mr.dtype),
-        "tensor_parallel_size": getattr(cfg, "tensor_parallel_size", 1),
+        "num_kvcache_blocks": runtime["cache"]["total_blocks"],
+        "dtype": core["dtype"],
+        "tensor_parallel_size": cfg.tensor_parallel_size,
         "default_temperature": _default_temperature,
         "default_thinking": "off" if _default_thinking is False else "template",
         "reserve_output": _default_reserve,
@@ -324,11 +265,6 @@ def _engine_info():
 
 
 def _stats_json():
-    """/v1/stats：引擎画像 + 与 /metrics 同名计数器 + 最近请求明细。
-
-    时序曲线由前端对累计量做差得到（服务端不额外起采样线程，避免与 [INFO ] 的
-    窗口排他读取打架）。
-    """
     with _gen_lock:
         requests = list(_requests_recent)
     return {
@@ -340,35 +276,17 @@ def _stats_json():
 
 
 def _graph_stats():
-    """Return the active graph runtime counters and a short graph kind."""
-    mr = engine.model_runner
-    if getattr(mr, "spec_enabled", False):
-        return "spec", mr.get_spec_graph_stats()
-    if getattr(mr, "graph_capture_attempted", False) and hasattr(mr, "get_decode_graph_stats"):
-        return "decode", mr.get_decode_graph_stats()
-    return None, None
+    runtime = engine.runtime_snapshot()
+    kind = "spec" if runtime["spec"]["enabled"] else "decode"
+    graph = runtime["graph"]
+    return (kind, graph) if graph else (None, None)
 
 
 def _execution_path(temperature):
-    """Describe the path this request can take without changing sampling semantics."""
-    mr = engine.model_runner
-    if mr.enforce_eager:
-        return "eager"
-    if getattr(mr, "spec_enabled", False):
-        if not getattr(mr, "spec_graphs", None):
-            return "eager_spec"
-        sampling_compatible = bool(mr.graph_sample or temperature <= 1e-10)
-        return "spec_graph" if sampling_compatible else "eager_spec(sampling)"
-    if getattr(mr, "graph_runner", None) is not None or getattr(mr, "graphs", None) is not None:
-        return "decode_graph"
-    return "eager"
+    return engine.execution_path(temperature)
 
 
 def _tps_loop():
-    """Print vLLM-style rolling engine metrics using the real elapsed interval."""
-    global _gen_window, _prompt_window, _step_window, _prefill_steps_window
-    global _decode_steps_window, _engine_busy_window
-    global _spec_rounds_window, _spec_committed_window
     global _ui_polls
     last_t = time.perf_counter()
     last_graph_replay = 0
@@ -378,22 +296,14 @@ def _tps_loop():
         elapsed = max(now - last_t, 1e-9)
         last_t = now
         with _gen_lock:
-            gen = _gen_window
-            prompt = _prompt_window
-            steps = _step_window
-            prefill_steps = _prefill_steps_window
-            decode_steps = _decode_steps_window
-            busy = _engine_busy_window
-            rounds = _spec_rounds_window
-            committed = _spec_committed_window
-            _gen_window = 0
-            _prompt_window = 0
-            _step_window = 0
-            _prefill_steps_window = 0
-            _decode_steps_window = 0
-            _engine_busy_window = 0.0
-            _spec_rounds_window = 0
-            _spec_committed_window = 0
+            current = _window.copy()
+            for key in _window:
+                _window[key] = 0.0 if key == "busy" else 0
+        gen, prompt, steps = (current[key] for key in ("gen", "prompt", "steps"))
+        prefill_steps, decode_steps, busy = (
+            current[key] for key in ("prefill_steps", "decode_steps", "busy"))
+        rounds, committed = (current[key]
+                             for key in ("spec_rounds", "spec_committed"))
         with engine_lock:
             n_active = len(_active)
             n_running = len(engine.scheduler.running)
@@ -445,10 +355,11 @@ def _drain(queue):
 
 
 def _abort(seq):
-    """立即终止一个 seq：标记 FINISHED 并释放其 KV blocks、移出调度队列。"""
     with engine_lock:
         seq.status = SequenceStatus.FINISHED
         scheduler = engine.scheduler
+        if scheduler.on_preempt is not None:
+            scheduler.on_preempt(seq)
         scheduler.block_manager.deallocate(seq)
         try:
             scheduler.running.remove(seq)
@@ -461,17 +372,16 @@ def _abort(seq):
 
 
 def _log_request(st):
-    """[REQ] 引擎首次调度该请求时打印：含引擎调度等待（受理→被调度）。"""
     wait_ms = (st.t_started - st.t_add) * 1000
+    max_out = "auto(EOS)" if st.auto_continue else f"{st.max_tokens}tok"
     _log("REQ", f"{st.rid} {st.endpoint} stream={'on' if st.stream else 'off'} "
-                f"client={st.client} prompt={st.prompt_tokens}tok max_out={st.max_tokens}tok "
+                f"client={st.client} prompt={st.prompt_tokens}tok max_out={max_out} "
                 f"temp={st.temperature:g} top_p={st.top_p:g} top_k={st.top_k} "
                 f"think={st.thinking} path={st.execution_path} evict={st.evicted} "
                 f"queue={wait_ms:.0f}ms | {st.preview}")
 
 
 def _log_done(st, ct, reason):
-    """[DONE] 单请求完成：TTFT 为实际模型处理时间（被调度→首 token），不含引擎调度等待。"""
     now = st.t_done if st.t_done is not None else time.perf_counter()
     st.t_done = now
     prefill_ms = (st.t_first - st.t_started) * 1000 if (st.t_first and st.t_started) else 0.0
@@ -493,6 +403,11 @@ def _log_done(st, ct, reason):
     cacheable = max((st.prompt_tokens - 1) // Sequence.block_size, 0)
     cached = st.cached_prompt_tokens // Sequence.block_size
     cache = f"{cached / cacheable * 100:.0f}%({cached}/{cacheable}blk)" if cacheable else "-"
+    seq = st.seq
+    hit_blocks = seq.prefix_cache_hit_blocks
+    query_tokens = seq.prefill_query_tokens
+    splitfuse = seq.prefill_splitfuse_used
+    recomputed = seq.prefill_prefix_recomputed
     with _gen_lock:
         _requests_recent.appendleft({
             "t": time.time(),
@@ -513,6 +428,10 @@ def _log_done(st, ct, reason):
             "e": round(st.spec_committed / st.spec_rounds, 3) if st.spec_rounds else None,
             "prefix_hit_blocks": cached,
             "prefix_cacheable_blocks": cacheable,
+            "prefill_cache_hit_blocks": hit_blocks,
+            "prefill_query_tokens": query_tokens,
+            "prefill_splitfuse": bool(splitfuse),
+            "prefix_recomputed": bool(recomputed),
             "temperature": st.temperature,
             "evicted": st.evicted,
             "finish": reason,
@@ -522,6 +441,9 @@ def _log_done(st, ct, reason):
                  f"TTFT={prefill_ms:.0f}ms TPOT={tpot_ms:.1f}ms/tok TPS={tps:.1f}tok/s "
                  f"queue={queue_ms:.0f}ms E2E={e2e_wall * 1000:.0f}ms "
                  f"ctx={used}/{_max_model_len}({used_pct:.0f}%) cache={cache} "
+                 f"prefill_hit={hit_blocks}blk query={query_tokens}tok "
+                 f"splitfuse={'yes' if splitfuse else 'no'} "
+                 f"prefix_recompute={'yes' if recomputed else 'no'} "
                  f"path={st.execution_path} finish={reason}"
                  + (f" preempt={preempts}" if preempts else ""))
     if used_pct >= 95 or preempts:
@@ -531,12 +453,66 @@ def _log_done(st, ct, reason):
                      f"--max-model-len，KV 池不足则调低 --gpu-mem-util 或 --max-num-seqs")
 
 
-# ---------------------------------------------------------------------------
-# 后台引擎驱动线程（continuous batching）
-# ---------------------------------------------------------------------------
+
+def _roll_auto_context(st):
+    old_seq = st.seq
+    max_len = engine.config.max_model_len
+    reserve = min(max(_default_reserve, 1), max_len - 1)
+    prompt_cap = max(1, max_len - reserve)
+    prompt_ids = old_seq.token_ids[-prompt_cap:]
+    if not prompt_ids:
+        return False
+    segment_max = max_len - len(prompt_ids)
+    if segment_max < 1:
+        return False
+
+    new_seq = Sequence(prompt_ids, SamplingParams(
+        temperature=old_seq.temperature,
+        max_tokens=segment_max,
+        top_p=old_seq.top_p,
+        top_k=old_seq.top_k,
+        ignore_eos=old_seq.ignore_eos,
+    ))
+    new_seq.prefix_cache_hit_blocks = old_seq.prefix_cache_hit_blocks
+    new_seq.prefill_query_tokens = old_seq.prefill_query_tokens
+    new_seq.prefill_splitfuse_used = old_seq.prefill_splitfuse_used
+    new_seq.prefill_prefix_recomputed = old_seq.prefill_prefix_recomputed
+
+    scheduler = engine.scheduler
+    if scheduler.on_preempt is not None:
+        scheduler.on_preempt(old_seq)
+    scheduler.block_manager.deallocate(old_seq)
+    try:
+        scheduler.running.remove(old_seq)
+    except ValueError:
+        pass
+    try:
+        scheduler.waiting.remove(old_seq)
+    except ValueError:
+        pass
+    scheduler.add(new_seq)
+    _active.pop(old_seq.seq_id, None)
+    st.seq = new_seq
+    st.n_seen = 0
+    st.segment += 1
+    _active[new_seq.seq_id] = st
+    return True
+
+
+def _has_repetition_loop(tokens):
+    values = list(tokens)
+    if len(values) < 32:
+        return False
+    max_period = min(64, len(values) // 4)
+    for period in range(1, max_period + 1):
+        tail = values[-period * 4:]
+        if (tail[:period] == tail[period:2 * period]
+                == tail[2 * period:3 * period]
+                == tail[3 * period:]):
+            return True
+    return False
 
 def _engine_loop():
-    """循环调用 engine.step()，把新增 token / 结束事件分发给各请求。"""
     while not _shutdown.is_set():
         with engine_lock:
             if _active and not engine.is_finished():
@@ -545,8 +521,6 @@ def _engine_loop():
                     _, num_tokens = engine.step()
                     step_elapsed = time.perf_counter() - step_t0
                     _record_engine_step(num_tokens, step_elapsed)
-                    # 活跃期连续步进：不等待 _wakeup（旧的 50ms 等待门会让每个
-                    # decode 步白等 50ms，流式 TPS 被压到 ~14）。
                 except Exception as exc:    # 引擎异常：让所有存活请求报错退出
                     with _gen_lock:
                         _metrics_total["request_errors"] += len(_active)
@@ -561,27 +535,59 @@ def _engine_loop():
                 step_new_tokens = 0
                 for st in list(_active.values()):
                     seq = st.seq
-                    # 用 num_tokens（O(1)）算增量，只切新增尾部——避免每步全量拷贝
-                    # completion_token_ids（随输出长度线性增长的 host 开销）。
                     n_comp = seq.num_tokens - seq.num_prompt_tokens
                     if n_comp > st.n_seen:
                         new_tokens = [t for t in seq.token_ids[
                             seq.num_prompt_tokens + st.n_seen: seq.num_tokens]
                             if t != _eos]
+                        if not st.auto_continue:
+                            remaining = st.max_tokens - st.generated_tokens
+                            new_tokens = new_tokens[:max(remaining, 0)]
                         if new_tokens:
                             if st.t_first is None:
                                 st.t_first = time.perf_counter()
                             st.tokens.extend(new_tokens)
+                            st.generated_tokens += len(new_tokens)
+                            if st.auto_continue:
+                                st.recent_tokens.extend(new_tokens)
                             step_new_tokens += len(new_tokens)
                             st.event.set()   # 立即唤醒 HTTP 线程（原先仅 finish 时 set，
-                                             # 生成期 _run_llm 只能 50ms 轮询 → 流式延迟地板）
                         st.n_seen = n_comp
+                        if (not st.auto_continue
+                                and st.generated_tokens >= st.max_tokens):
+                            _abort(seq)
+                            st.t_done = time.perf_counter()
+                            st.finish_reason = "length"
+                            st.finished = True
+                            st.event.set()
+                            done.append(seq.seq_id)
+                            continue
+                        if (st.auto_continue
+                                and _has_repetition_loop(st.recent_tokens)):
+                            _abort(seq)
+                            st.t_done = time.perf_counter()
+                            st.finish_reason = "stop"
+                            st.finished = True
+                            st.event.set()
+                            _log("WARN", f"{st.rid} auto continuation stopped by "
+                                 "repetition guard; set max_tokens explicitly or "
+                                 "use a clean chat-template boundary")
+                            done.append(seq.seq_id)
+                            continue
                     if seq.is_finished:
+                        if (st.auto_continue and
+                                (not _eos or seq.last_token != _eos) and
+                                seq.num_tokens >= _max_model_len):
+                            if _roll_auto_context(st):
+                                continue
                         st.t_done = time.perf_counter()
-                        st.finish_reason = (
-                            "length" if seq.num_completion_tokens >= st.max_tokens
-                            else "stop"
-                        )
+                        if st.auto_continue:
+                            st.finish_reason = "stop" if _eos and seq.last_token == _eos else "length"
+                        else:
+                            st.finish_reason = (
+                                "length" if seq.num_completion_tokens >= st.max_tokens
+                                else "stop"
+                            )
                         st.finished = True
                         st.event.set()
                         done.append(seq.seq_id)
@@ -590,9 +596,6 @@ def _engine_loop():
                 for seq_id in done:
                     _active.pop(seq_id, None)
                 continue
-            # 空转前清扫残留：stop 命中 / 客户端断连等路径会把 seq 置为 FINISHED，
-            # 但不经过上面的 fanout 分支（调度器已空时 is_finished() 恒真，分支不再
-            # 进入），残留的 _active 条目会造成 20Hz 空转轮询与小泄漏——统一在此清理。
             done = [seq_id for seq_id, st in _active.items() if st.seq.is_finished]
             for seq_id in done:
                 _active.pop(seq_id, None)
@@ -600,12 +603,8 @@ def _engine_loop():
         _wakeup.clear()
 
 
-# ---------------------------------------------------------------------------
-# 生成辅助
-# ---------------------------------------------------------------------------
 
 def _apply_stop(text, stop):
-    """在文本里找第一个 stop 串出现位置；未命中返回原文本。"""
     if not stop:
         return text, False
     p = -1
@@ -617,17 +616,6 @@ def _apply_stop(text, stop):
 
 
 def _run_llm(st, stop, emit):
-    """驱动到结束；返回 (text, finish_reason, completion_tokens)。
-
-    emit(delta_text) 在流式下逐 delta 调用；None 表示非流式。
-    客户端断连（emit 抛 IOError）后继续跑完请求但不推送。
-    增量 detokenization：每次唤醒只解码新增 token 中能完整落在 UTF-8 字符
-    边界上的前缀（pending 携带跨字节残留）；finish 时全量解码兜底，保证最终
-    文本与全量解码逐字节一致。
-    """
-    # Common non-streaming requests without textual stop sequences do not need
-    # per-step detokenization.  Waiting for completion and decoding once avoids
-    # tokenizer/GIL work running in parallel with every accelerator replay.
     if emit is None and not stop:
         while not st.finished:
             if st.event.wait(timeout=0.05):
@@ -670,10 +658,6 @@ def _run_llm(st, stop, emit):
             continue    # 无新 token：跳过解码（上一轮文本已推送）
         gen.extend(new)
         pending.extend(new)
-        # 边界回退策略：整段 pending 解码若以替换符 \ufffd 结尾，说明末尾
-        # token 可能只覆盖了某个多字节字符的前半部分 —— 从尾部回退一个
-        # token 再试；单 token 仍不完整时整体留到下次唤醒（finish 全量
-        # 解码兜底）。
         piece = ""
         keep = len(pending)
         while keep > 0:
@@ -704,7 +688,6 @@ def _run_llm(st, stop, emit):
 
 
 def _normalize_messages(messages):
-    """OpenAI messages → 模板可用的 {role, content} 列表（多模态 content 取文本）。"""
     normalized = []
     for msg in messages:
         role = msg.get("role")
@@ -722,33 +705,29 @@ def _normalize_messages(messages):
 
 
 def _template_ids(normalized, enable_thinking=None):
-    """套 chat template 并 encode。enable_thinking=None 时不传该 kwarg（tokenize 结果
-    与 benchmark 默认逐字节一致）；False 时显式关 thinking（模板插入空
-    <think></think> 直答）。"""
     think_kwargs = {} if enable_thinking is None else {"enable_thinking": enable_thinking}
     out = _tokenizer.apply_chat_template(
         normalized, tokenize=True, add_generation_prompt=True, **think_kwargs)
-    # 兼容旧 transformers（<4.44 return_dict=False 直接返回 list）
     return out if isinstance(out, (list, tuple)) else out["input_ids"]
 
 
-def _chat_prompt_ids(messages, enable_thinking=None):
-    return _template_ids(_normalize_messages(messages), enable_thinking)
+def _truncate_last(messages, enable_thinking, prompt_cap):
+    fitted = list(messages)
+    last = dict(fitted[-1])
+    content_ids = _tokenizer.encode(last["content"] or "")
+    allow = len(content_ids)
+    while allow >= 0:
+        content = _tokenizer.decode(content_ids[-allow:]) if allow else ""
+        fitted[-1] = dict(last, content=content)
+        ids = _template_ids(fitted, enable_thinking)
+        if len(ids) <= prompt_cap:
+            return fitted, ids
+        allow -= max(1, len(ids) - prompt_cap)
+        content_ids = _tokenizer.encode(fitted[-1]["content"])
+    return fitted, ids
 
 
 def _chat_prompt_ids_fit(messages, enable_thinking, prompt_cap):
-    """聊天感知的滑动窗口淘汰：保留开头连续的 system 消息 + 最近的消息，从**最旧的
-    非 system 消息**开始逐条丢弃，直到 token 数 <= prompt_cap；始终保留最后一条
-    消息（最新提问）。返回 (prompt_ids, 丢弃的消息数)。
-
-    只剩一条仍放不下时，裁的是这条消息**文本的 token 尾部**并重新套模板——绝不切
-    渲染后的 id 流：ChatML 的角色标记与结尾 generation prompt 一旦被截断，模型会
-    退化成重复同一个 token（表现为满屏 "1111"/"！！！！"），而不是报上下文超限。
-
-    不变式：返回的 `len(prompt_ids) <= prompt_cap`，否则抛 ValueError（外层转 400）；
-    绝不返回超预算的 prompt——那样的话 `max_tokens` 会被夹成 1，表现为「请求秒结束」
-    而不是「窗口不够」，且可能越过引擎的上下文硬停边界。
-    """
     msgs = _normalize_messages(messages)
     n_sys = 0
     while n_sys < len(msgs) and msgs[n_sys].get("role") == "system":
@@ -760,18 +739,12 @@ def _chat_prompt_ids_fit(messages, enable_thinking, prompt_cap):
         keep.pop(0)                      # 丢最旧的非 system 消息
         ids = _template_ids(system + keep, enable_thinking)
     if len(ids) > prompt_cap and keep:
-        last = dict(keep[-1])
-        content_ids = _tokenizer.encode(last["content"] or "")
-        allow = prompt_cap - (len(ids) - len(content_ids))
-        # 重套模板后的长度不是线性的（BPE 边界合并可能反而变长），因此按实测超出量
-        # 精确回退；allow 每轮至少减 1，必然收敛或走到 allow < 8 退出。
-        while allow >= 8:
-            keep[-1] = dict(last, content=_tokenizer.decode(content_ids[-allow:]))
-            ids = _template_ids(system + keep, enable_thinking)
-            if len(ids) <= prompt_cap:
-                break
-            allow -= max(1, len(ids) - prompt_cap)
-            content_ids = _tokenizer.encode(keep[-1]["content"])
+        fitted, ids = _truncate_last(system + keep, enable_thinking, prompt_cap)
+        keep[-1] = fitted[-1]
+    if len(ids) > prompt_cap and (keep or system):
+        keep = [keep[-1] if keep else system[-1]]
+        system = []
+        keep, ids = _truncate_last(keep, enable_thinking, prompt_cap)
     if len(ids) > prompt_cap:
         raise ValueError(
             f"上下文窗口不足：system + 最新提问裁剪后仍需 {len(ids)} token，可用 "
@@ -798,7 +771,6 @@ def _completion_prompt_ids(body):
 
 
 def _preview(body, mode, limit=40):
-    """请求内容预览（日志用）：chat 取最后一条 user 消息，completion 取 prompt。"""
     if mode == "chat":
         content = next((m.get("content") for m in reversed(body.get("messages") or [])
                         if m.get("role") == "user"), "")
@@ -859,13 +831,10 @@ def _chunk(req_id, model, mode, delta_text, finish_reason=None, role=False):
     }
 
 
-# ---------------------------------------------------------------------------
-# HTTP handler
-# ---------------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
 
-    server_version = "nanovllm-openai/0.2"
+    server_version = "flashengine-openai/0.2"
 
     def setup(self):
         super().setup()
@@ -893,8 +862,6 @@ class Handler(BaseHTTPRequestHandler):
         global _ui_polls
         dur_ms = (time.perf_counter() - self._t0) * 1000
         nbytes = self._box["n"] - self._n0
-        # Web 控制台每秒轮询 /v1/stats，逐条打印会刷掉真实请求的 [HTTP ] 行——
-        # 静默并计数，由 [INFO ] 聚合行以 ui_polls=N 汇总（其余端点不受影响）。
         if self.command == "GET" and self.path.split("?", 1)[0] in _QUIET_HTTP_PATHS:
             with _gen_lock:
                 _ui_polls += 1
@@ -902,7 +869,6 @@ class Handler(BaseHTTPRequestHandler):
         _log("HTTP", f"{self._rid or '-'} {self.command} {self.path} {self._status} "
                      f"client={self.client_address[0]} {nbytes}B {dur_ms:.0f}ms")
 
-    # ---- CORS / 预检 ----
 
     def _cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -918,13 +884,17 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             self._http_end()
 
-    # ---- 工具 ----
 
     def _json(self, obj, code=200):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self._bytes(body, "application/json", code)
+
+    def _bytes(self, body, content_type, code=200, headers=()):
         self.send_response(code)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        for key, value in headers:
+            self.send_header(key, value)
         self._cors()
         self.end_headers()
         self.wfile.write(body)
@@ -944,61 +914,53 @@ class Handler(BaseHTTPRequestHandler):
         auth = self.headers.get("Authorization", "")
         return auth == f"Bearer {_api_key}"
 
-    # ---- 路由 ----
 
     def do_GET(self):
         self._http_begin()
         try:
-            if _ui_enabled and self.path in ("/", "/index.html", "/ui", "/webui"):
+            path = urlsplit(self.path).path
+            if path.startswith("/v1/") and not self._check_auth():
+                self._error("invalid api key", 401)
+                return
+            if _ui_enabled and path in ("/", "/index.html", "/ui", "/webui"):
                 body = _webui_html()
                 if body is None:
                     self._error("webui.html is missing next to scripts/openai_server.py", 404)
                     return
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Cache-Control", "no-store")
-                self._cors()
-                self.end_headers()
-                self.wfile.write(body)
+                self._bytes(body, "text/html; charset=utf-8",
+                            headers=(("Cache-Control", "no-store"),))
                 return
-            if _ui_enabled and self.path in ("/v1/stats", "/stats"):
+            if _ui_enabled and path in ("/v1/stats", "/stats"):
                 self._json(_stats_json())
                 return
-            if self.path in ("/v1/models", "/models"):
+            if path in ("/v1/models", "/models"):
                 self._json({
                     "object": "list",
                     "data": [{
                         "id": _model_name,
                         "object": "model",
                         "created": 0,
-                        "owned_by": "nanovllm",
+                        "owned_by": "flashengine",
                     }],
                 })
                 return
-            if self.path in ("/health", "/v1/health"):
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain")
-                self.end_headers()
-                self.wfile.write(b"OK")
+            if path in ("/health", "/v1/health"):
+                self._bytes(b"OK", "text/plain")
                 return
-            if self.path in ("/metrics", "/v1/metrics"):
-                body = _prometheus_metrics()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+            if path in ("/metrics", "/v1/metrics"):
+                self._bytes(_prometheus_metrics(),
+                            "text/plain; version=0.0.4; charset=utf-8")
                 return
-            self._error(f"unknown path: {self.path}", 404)
+            self._error(f"unknown path: {path}", 404)
         finally:
             self._http_end()
 
     def do_POST(self):
         self._http_begin()
         try:
-            if self.path not in ("/v1/chat/completions", "/v1/completions"):
-                self._error(f"unknown path: {self.path}", 404)
+            path = urlsplit(self.path).path
+            if path not in ("/v1/chat/completions", "/v1/completions"):
+                self._error(f"unknown path: {path}", 404)
                 return
             if not self._check_auth():
                 self._error("invalid api key", 401)
@@ -1008,53 +970,69 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 self._error("invalid json body", 400)
                 return
-            mode = "chat" if self.path == "/v1/chat/completions" else "completion"
+            mode = "chat" if path == "/v1/chat/completions" else "completion"
             self._generate(body, mode)
         finally:
             self._http_end()
 
-    # ---- 生成 ----
 
     def _generate(self, body, mode):
-        model = body.get("model", _model_name)
-        stream = bool(body.get("stream", False))
-        n = int(body.get("n", 1))
+        if not isinstance(body, dict):
+            self._error("JSON body must be an object", 400)
+            return
+        try:
+            model = body.get("model", _model_name)
+            stream = bool(body.get("stream", False))
+            n = int(body.get("n", 1))
+            raw_max_tokens = body.get(
+                "max_tokens", body.get("max_completion_tokens"))
+            auto_continue = raw_max_tokens is None
+            requested_max_tokens = None if auto_continue else int(raw_max_tokens)
+        except (TypeError, ValueError) as exc:
+            self._error(f"invalid request parameters: {exc}", 400)
+            return
         if n != 1:
             self._error("'n' != 1 is not supported", 400)
             return
-        max_tokens = int(body.get("max_tokens") or 0)    # 未传 / 0 / 负数 = 生成到上下文顶
-        temperature = body.get("temperature")
-        if temperature is None:
-            temperature = _default_temperature
-        temperature = max(float(temperature), 0.0)    # 0 = greedy（引擎已支持）
-        top_p = body.get("top_p")
-        if top_p is None:
-            top_p = 1.0
-        top_p = min(max(float(top_p), 1e-6), 1.0)
-        top_k = body.get("top_k")
-        top_k = max(int(top_k), 0) if top_k is not None else 0
+        if requested_max_tokens is not None and requested_max_tokens < 1:
+            self._error("'max_tokens' must be a positive integer when supplied; "
+                        "omit it for automatic EOS continuation", 400)
+            return
+        try:
+            temperature = body.get("temperature")
+            if temperature is None:
+                temperature = _default_temperature
+            temperature = max(float(temperature), 0.0)    # 0 = greedy
+            top_p = body.get("top_p")
+            if top_p is None:
+                top_p = 1.0
+            top_p = min(max(float(top_p), 1e-6), 1.0)
+            top_k = body.get("top_k")
+            top_k = max(int(top_k), 0) if top_k is not None else 0
+        except (TypeError, ValueError) as exc:
+            self._error(f"invalid sampling parameters: {exc}", 400)
+            return
         stop = body.get("stop")
         if isinstance(stop, str):
             stop = [stop]
         elif not isinstance(stop, list):
             stop = []
         stop = [s for s in stop if isinstance(s, str) and s]
-        include_usage = bool((body.get("stream_options") or {}).get("include_usage", False))
+        stream_options = body.get("stream_options") or {}
+        if not isinstance(stream_options, dict):
+            self._error("'stream_options' must be an object", 400)
+            return
+        include_usage = bool(stream_options.get("include_usage", False))
 
-        # 上下文淘汰：先为输出预留 budget（客户端显式 max_tokens 优先，否则用
-        # --reserve-output），把 prompt 压进 max_model_len 的剩余窗口。
-        reserve = max_tokens if max_tokens >= 1 else _default_reserve
+        reserve = requested_max_tokens if requested_max_tokens is not None else _default_reserve
         reserve = min(max(reserve, 1), _max_model_len - 1)
         prompt_cap = _max_model_len - reserve
         dropped = 0
         try:
-            # thinking 口径优先级：请求 chat_template_kwargs.enable_thinking /
-            # 顶层 enable_thinking > --no-think > 模板默认（on）。
             ctk = body.get("chat_template_kwargs") or {}
             enable_thinking = ctk.get("enable_thinking", body.get("enable_thinking",
                                                                   _default_thinking))
             if mode == "chat":
-                # 保 system + 最近轮次，丢最旧中间历史（不再砍尾巴吞掉最新提问）。
                 prompt_ids, dropped = _chat_prompt_ids_fit(
                     body["messages"], enable_thinking, prompt_cap)
                 if dropped:
@@ -1071,21 +1049,28 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._error(f"prompt build failed: {exc}", 400)
             return
+        if not prompt_ids:
+            self._error("prompt must contain at least one token", 400)
+            return
 
-        # 输出预算：绝不超过剩余上下文（旧实现允许客户端 max_tokens 与历史叠加越界）。
         remaining = _max_model_len - len(prompt_ids)
-        max_tokens = min(max_tokens, remaining) if max_tokens >= 1 else remaining
-        max_tokens = max(1, max_tokens)    # 长文本：到上下文顶为止（vLLM 语义）
+        max_tokens = (min(requested_max_tokens, remaining)
+                      if requested_max_tokens is not None else remaining)
+        max_tokens = max(1, max_tokens)
 
         req_id = f"chatcmpl-{time.time_ns()}" if mode == "chat" else f"cmpl-{time.time_ns()}"
         rid = req_id[-6:]
         self._rid = rid    # [HTTP] 行关联
 
         seq = Sequence(prompt_ids, SamplingParams(
-            temperature=temperature, max_tokens=max_tokens, top_p=top_p, top_k=top_k))
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            top_k=top_k))
         with engine_lock:
             engine.scheduler.add(seq)
-            st = _Request(seq, max_tokens, rid, t_http=self._t0)
+            st = _Request(seq, None if auto_continue else max_tokens, rid,
+                          t_http=self._t0, auto_continue=auto_continue)
             st.endpoint = self.path
             st.stream = stream
             st.client = self.client_address[0]
@@ -1107,7 +1092,6 @@ class Handler(BaseHTTPRequestHandler):
                     "this request keeps its stochastic sampling semantics and falls back to eager spec. "
                     "Use temperature=0 for the benchmark-equivalent Graph path.",
                 )
-        # [REQ] 行由 scheduler.schedule 钩子在首次被调度时打印（含引擎调度等待 wait=）。
 
         usage = {
             "prompt_tokens": st.prompt_tokens,
@@ -1130,7 +1114,6 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(_openai_body(req_id, model, mode, text, reason, usage))
                 return
 
-            # ---- SSE 流式 ----
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-cache")
@@ -1176,101 +1159,66 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
 
-def _install_schedule_hook():
-    """挂 scheduler.schedule：记录每个请求首次被引擎调度的时刻，并在此时打 [REQ]
-    行（含引擎调度等待 wait=受理→被调度）。"""
-    sched = engine.scheduler
-    orig = sched.schedule
-
-    def wrapped():
-        seqs, is_prefill = orig()
-        now = time.perf_counter()
+class _ServerObserver(EngineObserver):
+    def on_schedule(self, seqs, is_prefill, timestamp):
         for seq in seqs:
             st = _active.get(seq.seq_id)
             if st is not None and st.t_started is None:
-                st.t_started = now
+                st.t_started = timestamp
                 st.cached_prompt_tokens = seq.num_cached_tokens
                 _log_request(st)
-        return seqs, is_prefill
 
-    sched.schedule = wrapped
-
-
-def _install_spec_stats():
-    """包 model_runner.spec_round：累计每请求/全局的投机轮数与提交 token 数（accept/E）。
-    非 spec 直通（rounds 恒 0 → DONE/INFO 显示 -）。"""
-    mr = engine.model_runner
-    if not getattr(mr, "spec_enabled", False):
-        return
-    orig = mr.spec_round
-
-    def wrapped(seqs):
-        out = orig(seqs)
-        global _spec_rounds_window, _spec_committed_window
+    def on_commit(self, seqs, committed, timestamp):
         with _gen_lock:
-            for seq, toks in zip(seqs, out):
+            for seq, toks in zip(seqs, committed):
                 n = len(toks)
                 st = _active.get(seq.seq_id)
                 if st is not None:
                     st.spec_rounds += 1
                     st.spec_committed += n
-                _spec_rounds_window += 1
-                _spec_committed_window += n
+                _window["spec_rounds"] += 1
+                _window["spec_committed"] += n
                 _metrics_total["spec_rounds"] += 1
                 _metrics_total["spec_committed_tokens"] += n
                 _metrics_total["spec_accepted_tokens"] += max(n - 1, 0)
-        return out
-
-    mr.spec_round = wrapped
 
 
 def main():
     global engine, _tokenizer, _eos, _model_name, _api_key
-    global _default_temperature, _max_model_len, _default_thinking, _default_reserve
-    global TPS_INTERVAL
+    global SamplingParams, Sequence, SequenceStatus
+    global _default_temperature
+    global _max_model_len, _default_thinking, _default_reserve
+    global TPS_INTERVAL, _ui_html_path
 
-    parser = argparse.ArgumentParser(description="nano-vLLM OpenAI-compatible server (TP=1)")
-    parser.add_argument("model", help="model directory path")
+    parser = argparse.ArgumentParser(description="FlashEngine OpenAI-compatible server (TP=1)")
+    parser.add_argument("model")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--api-key", default=None)
-    parser.add_argument("--eager", action="store_true",
-                        help="Set enforce_eager=True and skip graph capture.")
+    parser.add_argument("--eager", action="store_true")
     parser.add_argument("--backend", default="auto", choices=["auto", "cuda", "corex", "ascend310p"])
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--max-num-seqs", type=int, default=None)
-    parser.add_argument("--max-num-batched-tokens", type=int, default=16384,
-                        help="Maximum prompt tokens processed in one prefill step.")
-    parser.add_argument("--disable-chunked-prefill", action="store_true",
-                        help="Require every prompt prefill to fit in one scheduler step.")
-    parser.add_argument("--max-num-partial-prefills", type=int, default=1,
-                        help="Maximum admitted requests with an unfinished prompt prefill.")
-    parser.add_argument("--block-size", type=int, default=None,
-                        help="KV-cache block size; must be supported by the selected backend.")
-    parser.add_argument("--spec-model", default="",
-                        help="Draft model directory; enables speculative decoding.")
-    parser.add_argument("--spec-num-tokens", type=int, default=3,
-                        help="Number of draft tokens per speculative round.")
-    parser.add_argument(
-        "--temperature", type=float, default=0.0,
-        help=("Default request temperature when the JSON body omits it. "
-              "The default is greedy (0) to match scripts.benchmark and keep "
-              "Ascend speculative decoding on the captured Graph path."),
-    )
-    parser.add_argument("--no-think", action="store_true",
-                        help="Pass enable_thinking=False to the chat template by default.")
-    parser.add_argument("--reserve-output", type=int, default=512,
-                        help="Output-token reserve used during context eviction.")
-    # KV 池按 (total*util - used) 贴地分配；空板卡（无桌面占用）需调低 util
-    # 给图捕获/运行峰值留余量（32GB CoreX 卡贴地后仅剩 ~112MB，spec 图捕获必 OOM 降级）。
+    parser.add_argument("--max-num-batched-tokens", type=int, default=16384)
+    parser.add_argument("--disable-chunked-prefill", action="store_true")
+    parser.add_argument("--max-num-partial-prefills", type=int, default=1)
+    parser.add_argument("--block-size", type=int, default=None)
+    parser.add_argument("--spec-model", default="")
+    parser.add_argument("--spec-num-tokens", type=int, default=3)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--no-think", action="store_true")
+    parser.add_argument("--reserve-output", type=int, default=512)
     parser.add_argument("--gpu-mem-util", type=float, default=0.9)
+    parser.add_argument("--stats-interval", type=float, default=10.0)
+    parser.add_argument("--no-ui", action="store_true")
     parser.add_argument(
-        "--stats-interval", type=float, default=10.0,
-        help="Seconds between vLLM-style engine statistics logs; 0 disables them.",
-    )
-    parser.add_argument("--no-ui", action="store_true",
-                        help="Disable the built-in web console (/) and /v1/stats.")
+        "--webui", default=None, metavar="HTML",
+        help="Web 控制台 HTML 文件路径（默认 scripts/webui.html；"
+             "内置可选 scripts/webui-aero.html）")
     args = parser.parse_args()
+
+    from flashengine import LLM, SamplingParams
+    from flashengine.engine.sequence import Sequence, SequenceStatus
 
     global _ui_enabled
     _api_key = args.api_key
@@ -1279,6 +1227,7 @@ def main():
     _default_reserve = max(1, args.reserve_output)
     TPS_INTERVAL = max(0.0, args.stats_interval)
     _ui_enabled = not args.no_ui
+    _ui_html_path = args.webui or None
 
     kwargs = dict(
         model=args.model,
@@ -1296,8 +1245,6 @@ def main():
     if args.max_num_seqs is not None:
         kwargs["max_num_seqs"] = args.max_num_seqs
     else:
-        # 8GB 卡上大 max_num_seqs 的宽桶/宽 buffer 拖慢单步回放，实测 nospec
-        # 512→8 = 59.0→66.8 tok/s；需要更高并发的用户显式传 --max-num-seqs。
         kwargs["max_num_seqs"] = 8
     if args.block_size is not None:
         kwargs["kvcache_block_size"] = args.block_size
@@ -1305,21 +1252,17 @@ def main():
     engine = LLM(**kwargs)
     _tokenizer = engine.tokenizer
     _eos = engine.scheduler.eos
-    _max_model_len = engine.model_runner.config.max_model_len
+    _max_model_len = engine.config.max_model_len
     _model_name = args.model.rstrip("/").rsplit("/", 1)[-1]
-    _install_schedule_hook()
-    _install_spec_stats()
-    if hasattr(engine.model_runner, "reset_decode_graph_runtime_stats"):
-        engine.model_runner.reset_decode_graph_runtime_stats()
-    if getattr(engine.model_runner, "spec_enabled", False):
-        engine.model_runner.reset_spec_graph_runtime_stats()
+    engine.observer = _ServerObserver()
+    engine.reset_measurement_stats()
     engine_thread = threading.Thread(
-        target=_engine_loop, name="nanovllm-engine", daemon=True)
+        target=_engine_loop, name="flashengine-engine", daemon=True)
     engine_thread.start()
     stats_thread = None
     if TPS_INTERVAL > 0:
         stats_thread = threading.Thread(
-            target=_tps_loop, name="nanovllm-stats", daemon=True)
+            target=_tps_loop, name="flashengine-stats", daemon=True)
         stats_thread.start()
 
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
@@ -1338,10 +1281,10 @@ def main():
         f"Request defaults: temperature={_default_temperature:g}, thinking="
         f"{'off' if _default_thinking is False else 'on(template default)'}, "
         f"reserve_output={_default_reserve}tok, max_num_seqs="
-        f"{engine.model_runner.config.max_num_seqs}, chunked_prefill="
-        f"{'on' if engine.model_runner.config.enable_chunked_prefill else 'off'}"
-        f"(budget={engine.model_runner.config.max_num_batched_tokens}, partial="
-        f"{engine.model_runner.config.max_num_partial_prefills}), stats_interval="
+        f"{engine.config.max_num_seqs}, chunked_prefill="
+        f"{'on' if engine.config.enable_chunked_prefill else 'off'}"
+        f"(budget={engine.config.max_num_batched_tokens}, partial="
+        f"{engine.config.max_num_partial_prefills}), stats_interval="
         f"{TPS_INTERVAL:g}s",
     )
     try:
@@ -1351,9 +1294,6 @@ def main():
     finally:
         _shutdown.set()
         _wakeup.set()
-        # Wake request handlers and remove queued/running sequences before the
-        # device is torn down. Do not close the engine while its driver thread
-        # may still be executing an NPU kernel.
         with engine_lock:
             for st in list(_active.values()):
                 _abort(st.seq)

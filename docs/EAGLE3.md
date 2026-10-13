@@ -1,9 +1,9 @@
-# EAGLE3 在 nano-vLLM 上的实现说明
+# EAGLE3 在 FlashEngine 上的实现说明
 
 > 本文面向要读懂或修改本引擎投机解码路径的开发者，说明 EAGLE3 的草稿模型是如何与引擎
 > （调度、KV 缓存、计算图、多硬件后端）配合的。
-> 内容以源码为准：`nanovllm/models/eagle3.py`、`nanovllm/engine/model_runner.py`、
-> `nanovllm/engine/llm_engine.py`、`nanovllm/engine/scheduler.py`、`nanovllm/models/qwen3.py`。
+> 内容以源码为准：`flashengine/models/eagle3.py`、`flashengine/engine/model_runner.py`、
+> `flashengine/engine/llm_engine.py`、`flashengine/engine/scheduler.py`、`flashengine/models/qwen3.py`。
 > 性能数据与历史口径见 [AGENTS.md](../AGENTS.md)。
 
 ---
