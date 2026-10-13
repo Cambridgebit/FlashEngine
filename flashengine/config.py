@@ -78,6 +78,13 @@ class Config:
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.target_adapter = resolve_target_model(self.hf_config)
         self.model_config = self.target_adapter.model_config(self.hf_config)
+        if self.target_adapter.recurrent_state:
+            if self.tensor_parallel_size != 1:
+                raise NotImplementedError("带 recurrent 状态的目标模型当前要求 TP=1")
+            if self.enable_prefix_cache:
+                print("[FlashEngine] Recurrent 模型关闭 prefix cache：尚无块级状态快照。", flush=True)
+                self.enable_prefix_cache = False
+            self.max_num_batched_tokens = min(self.max_num_batched_tokens, self.max_model_len)
         self.max_model_len = min(
             self.max_model_len, self.model_config.max_position_embeddings
         )

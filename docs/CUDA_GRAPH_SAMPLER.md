@@ -22,7 +22,7 @@ CPU RNG 不进入设备图，回放会重复读取捕获时的噪声，不能产
 ## 修复
 
 - CUDA 后端声明 `supports_device_sampling_rng=True`，sampler 在 logits 所在设备生成噪声。
-- 其他后端沿用保守的 CPU RNG 能力默认值；没有在引擎里按后端名称分支。
+- Ascend 沿用保守的 CPU RNG 能力默认值；CoreX 在 Qwen3.5 扩展中也启用设备 RNG。
 - fast 与 legacy 采样路径都使用同一 RNG 入口。CUDA Graph 每次回放会推进随机状态。
 - 修复 fast 路径忽略 `top_p`：先过滤 top-k，再归一化计算 nucleus。
 - greedy 行直接返回原 logits 的 argmax，不受随机噪声和候选排序影响。
@@ -62,4 +62,5 @@ python3 -m scripts.check_cuda_attention /home/yjq040828/vllm-lab/models/Qwen3-0.
   --allow-bf16-ties
 ```
 
-此次没有真实 EAGLE3/DFlash/DSpark 草稿实机回归，也没有 CoreX/310P 实机验证。
+该 sampler 修复阶段没有真实草稿实机回归；后续 Qwen3.5+DFlash 的验收见
+[Qwen3.5 说明](QWEN35.md)。CoreX/310P 仍无实机验证。

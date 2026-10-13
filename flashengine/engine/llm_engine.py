@@ -170,8 +170,7 @@ class LLMEngine:
         self.scheduler.add(seq)
 
     def _on_preempt_release(self, seq):
-        if self.model_runner.spec_enabled:
-            self.model_runner.call("drop_spec_state", seq.seq_id)
+        self.model_runner.call("drop_seq_state", seq.seq_id)
 
     def _notify_schedule(self, seqs, is_prefill):
         if self.observer is not None:
@@ -186,6 +185,7 @@ class LLMEngine:
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        self._drop_finished_spec_state(seqs)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens
 
@@ -205,7 +205,14 @@ class LLMEngine:
             self._drop_finished_spec_state(capped)
         if not active:
             return self._collect_outputs(capped), 0
-        committed = self.model_runner.call("spec_round", active)
+        limited = [seq for seq in active if self.config.max_model_len - len(seq) < num_draft + 1]
+        normal = [seq for seq in active if seq not in limited]
+        by_id = {}
+        if normal:
+            by_id.update(zip((seq.seq_id for seq in normal), self.model_runner.call("spec_round", normal)))
+        if limited:
+            by_id.update(zip((seq.seq_id for seq in limited), self.model_runner.call("context_limited_spec_round", limited)))
+        committed = [by_id[seq.seq_id] for seq in active]
         if self.observer is not None:
             self.observer.on_commit(active, committed, perf_counter())
         finished = self.scheduler.commit_spec(active, committed)
@@ -219,7 +226,7 @@ class LLMEngine:
     def _drop_finished_spec_state(self, seqs):
         for seq in seqs:
             if seq.is_finished:
-                self.model_runner.call("drop_spec_state", seq.seq_id)
+                self.model_runner.call("drop_seq_state", seq.seq_id)
 
     def _collect_outputs(self, seqs):
         return [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]

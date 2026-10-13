@@ -1,6 +1,6 @@
 import unittest
 
-from flashengine.support_matrix import evaluate, format_matrix, supported_spec_methods
+from flashengine.support_matrix import TARGETS, evaluate, format_matrix, supported_spec_methods
 
 
 class SupportMatrixTests(unittest.TestCase):
@@ -56,8 +56,17 @@ class SupportMatrixTests(unittest.TestCase):
     def test_format_matrix_covers_all_combinations(self):
         text = format_matrix()
         rows = [line for line in text.splitlines() if line.startswith("| qwen3")]
-        # 2 targets × 3 backends × 3 quantizations × 4 spec methods
-        self.assertEqual(len(rows), 2 * 3 * 3 * 4)
+        # 注册目标 × 3 后端 × 3 量化方式 × 4 投机方法。
+        self.assertEqual(len(rows), len(TARGETS) * 3 * 3 * 4)
+
+    def test_recurrent_targets_all_backends_and_dflash_only(self):
+        for target in ("qwen3_5", "qwen3_5_moe"):
+            for backend in ("cuda", "corex", "ascend310p"):
+                for method in ("none", "dflash"):
+                    self.assertTrue(evaluate(target, backend, "none", method).supported)
+                for method in ("eagle3", "dspark"):
+                    self.assertFalse(evaluate(target, backend, "none", method).supported)
+                self.assertFalse(evaluate(target, backend, "w8a8", "none").supported)
 
 
 if __name__ == "__main__":

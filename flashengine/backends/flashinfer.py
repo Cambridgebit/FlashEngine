@@ -151,6 +151,8 @@ class FlashInferDecodeGraphRunner(DecodeGraphExecutor):
         set_context(False, slot_mapping=entry.slots, use_cuda_graph=True,
                     block_size=self.plan.block_size)
         get_context().attn_scratch = {"flashinfer_graph_decode": entry.wrapper}
+        if self.plan.state_runtime:
+            self.plan.state_runtime.bind_decode(get_context(), entry.batch_size)
 
     def _forward(self, entry):
         self._bind(entry)
@@ -159,6 +161,8 @@ class FlashInferDecodeGraphRunner(DecodeGraphExecutor):
 
     @torch.inference_mode()
     def capture_all(self):
+        if self.plan.state_runtime:
+            self.plan.state_runtime.prepare_capture()
         if self.plan.config.tensor_parallel_size != 1:
             self.stats["capture_failure"] = len(self.sizes)
             print("[FlashEngine] FlashInfer decode Graph 当前要求 TP=1，回退 eager。", flush=True)
@@ -212,6 +216,8 @@ class FlashInferDecodeGraphRunner(DecodeGraphExecutor):
             self.stats["fallback"] += 1
             return None
         entry = self.entries[bs]
+        if self.plan.state_runtime:
+            self.plan.state_runtime.prepare_decode(seqs)
         pad = bs - n
         lengths = [len(seq) for seq in seqs] + [1] * pad
         tables = [seq.block_table for seq in seqs] + [[0]] * pad

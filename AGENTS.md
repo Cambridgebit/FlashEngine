@@ -1,6 +1,6 @@
 # AGENTS.md
 
-FlashEngine：从零实现的极简 vLLM（研究/学习用代码库，非生产项目）。上游分叉点实测 1450 行 Python；当前 `flashengine/` 7425 行 + `scripts/` 2192 行 = 9617 行 Python（最大文件 `engine/model_runner.py` 2374 行、`scripts/openai_server.py` 1374 行、`scripts/bench_concurrent.py` 411 行、`backends/ascend.py` 886 行），另有内置控制台的自包含前端 `scripts/webui.html` 1321 行。**无测试套件、无 CI、无 lint/typecheck 配置**；引擎侧唯一验证手段是在有 GPU 的机器上对本地模型目录跑 `scripts/` 下的两个引擎脚本（`bench_concurrent.py` 只需 HTTP，任何机器都能对着 server 跑）。当前支持面 = **Qwen3 目标模型 ×（EAGLE3 / DFlash / DSpark）三种草稿 × CUDA / CoreX / Ascend 310P 三后端**，另加 **Qwen3 MoE（Qwen3-30B-A3B）×（普通 / DFlash）× 三后端**、**W8A8 int8 量化推理（310P 真 int8；cuda/corex 为 Quark int8 检查点加载期反量化）**；完整声明支持清单见 [`docs/SUPPORT_MATRIX.md`](docs/SUPPORT_MATRIX.md)（代码单一事实来源 `flashengine/support_matrix.py`，启动即校验）。Qwen3.5 hybrid 已移出 main（见「未并入 main 的工作」）。
+FlashEngine：基于 nano-vllm 演进的极简多后端推理引擎（研究/学习用，非生产项目）。当前支持 Qwen3 dense、Qwen3 MoE、Qwen3.5 dense/MoE 文本模型与 CUDA/CoreX/Ascend 310P。Qwen3 dense 支持 EAGLE3/DFlash/DSpark；Qwen3 MoE 与 Qwen3.5 支持普通推理/DFlash。Qwen3 的 W8A8/Quark 支持范围不变，Qwen3.5 当前只支持 fp16/bf16、TP=1。已有主机契约测试与 CUDA 实机验收脚本，无 CI/lint/typecheck 配置。支持矩阵代码事实源为 `flashengine/support_matrix.py`，Qwen3.5 说明与验证记录见 `docs/QWEN35.md`。
 
 ## 命令
 
@@ -189,14 +189,16 @@ python3 -m scripts.benchmark /data/Qwen3-0.6B \
   EAGLE3：`--spec-model DRAFT --no-think`。块草稿（DFlash/DSpark）：paged target verify + paged draft SplitFuse，整轮 NPUGraph 捕获失败自动降级 eager spec，分页形态靠 `keep_last_block_unhashed` 与前缀缓存共存（`FLASHENGINE_310P_DFLASH_PAGED=0` 可强制回稠密缓冲）。310P 分页 DFlash 路径已实机跑通（问题与修复清单见 `docs/ASCEND310P_GRAPH_SPEC.md` 第 11 节），DSpark 尚未在 310P 验收；本文件也未记录 310P 的 TPS/E 锚点——对表请按该文档 10.4 的 A/B 口径自测并补数。
 - 环境钉：torch-npu==2.10.0.post4 / CANN 9.1.0 / 310p 专用镜像。
 
-## 未并入 main 的工作（分支 qwen35-dflash）
+## Qwen3.5 系列（已并入 main）
 
-- **Qwen3.5 hybrid 目标模型与 GDN 状态路径不在 main**：`flashengine/models/qwen3_5.py`、`scripts/check_qwen35.py` 及块草稿的 `is_hybrid` 分叉（conv/ssm 状态池、verify 的 `'row'` 模式逐行落槽、`gdn_row_bases` host 段界、warmup dummy 状态回收）整体留在分支 `qwen35-dflash`（origin 可见），main 的合并前快照见提交 `64f752a`。main 的支持面因此只有 **Qwen3 目标模型 ×（EAGLE3 / DFlash / DSpark）× 三后端**，`hybrid`/`qwen3_5`/`GDN` 在 main 源码里应 grep 不到。
-- **该分支自己的架构口径事实不在本文件维护**（18×Gated DeltaNet + 6×门控全注意力与 `full_attention_interval=4`、NeoX 半分式 partial rope 64/256、Gemma 式 RMSNorm(weight+1) 仅主体而 draft 用标准 RMSNorm、门控注意力 q_proj 输出翻倍且 decode 的 `[n,1,H,D]` 必须先归形再过 gate、多模态壳 `model.language_model.` 前缀剥离 + `mtp.*`/`visual.*` 跳过、GDN 状态池 × spec 的正确性口径）——要动那条分支去读它的文档，勿凭记忆往 main 上搬。
-- **移植回 main 时已有的接缝**：新增目标模型只需注册 `TargetModelAdapter`（`models/registry.py`）并实现 `validate_spec_method` 放行矩阵，`ModelRunner`/scheduler 不按模型名分支；但 hybrid 的逐序列状态池必须一起接上 spec 状态生命周期——目前 `on_preempt → drop_spec_state` 只回收 KV 与 draft carry/上下文槽，没有 GDN 状态概念。分支上 `eagle3 + hybrid` 这一格本来就是干净拒绝（`_sg` 路径的 GDN verify 分叉未实现，硬跑会静默错乱），移植时保持拒绝。
-- **位等判定口径（多阶段实测沉淀，与具体模型无关，仍适用）**：串行 bs=1 temp0 期望逐 token 全等，或 bf16 平票翻转（分歧点 top-1/top-2 打平或差 1 ULP、top-8 其余逐位一致）；**并发/图 padding 下的深位置翻转 = 批形状漂移**（eager bs=n vs 图 bs=桶 的 GEMM/attention 归约序差，见「数值确定性」条）——base-vs-base 独立重跑 5/5 确证 base 自身确定，故翻转判豁免、不判 bug。图门的验收锚点：decode 图串行 12/12、spec 图串行 12/12 且 E 守恒（ΔE=0.000，收尾截断口径差 ≤0.003）、双路径捕获降级干净。
-- **块草稿的 E 参考值（分支上 Qwen3.5 + DFlash 实测，勿直接当 main 的锚点）**：raw prompt E=2.502、benchmark coding E=5.179（与论文 AL 4.78@block16 同量级互证）。
-- **显存现实（8GB 卡，分支 Qwen3.5-2B 实测）**：spec 引擎 init 后 ~5.7GB（权重 4.0 + GDN 池 ~0.65 + draft 上下文 0.04 + 杂项），KV 池只剩百 MB 级——spec 图 `ms=4` 需 `mml=512 / util 0.99`，`ms=8` 不现实；无 spec 的 decode 图 `ms=4 / mml=1024` 可全桶捕获。main 上稠密 draft KV 不含 GDN 池，占用更低但同量级风险仍需实测定。
+- 注册目标 `qwen3_5` / `qwen3_5_moe`，读取多模态壳的 `text_config` 或纯文本配置；只加载文本权重，视觉塔/MTP 不加载。普通推理与 DFlash 三后端放行，EAGLE3/DSpark/量化/TP>1 明确拒绝。
+- `models/qwen3_5.py` 的 GDN 数学参考历史 `origin/qwen35-dflash:nanovllm/models/qwen3_5.py` 与 Transformers；按当前 adapter 和后端接口重接，而不是整支合并旧包。
+- 门控全注意力采用 partial NeoX RoPE（2B 为 64/256）、Gemma RMSNorm（weight+1）和逐头输出门控；decode 输出先归形再乘 gate。MoE 复用三后端路由/专家前向并加入门控共享专家。
+- `engine/recurrent_state.py` 管理每请求主槽、每批 verify 行槽与专用 dummy 槽。验证后把行 `count-1` 的 conv/SSM 状态复制回请求主槽；bonus 尚未消费，留给下一轮。完成/抢占/取消均释放槽，预热假请求清空槽映射。
+- 只为 full_attention 层分配 KV；prefix cache 暂时关闭（没有 GDN 块级状态快照），分块 prefill 保留 conv/SSM 初始状态。DFlash aux 直接使用 0-based 层输出 `target_layer_ids`，不做 Qwen3 的 +1。
+- CUDA FlashAttention 支持普通 decode 图与 DFlash 整轮图；FlashInfer 普通图支持状态元数据，投机仍 eager。CoreX 采用共享 CUDA 兼容 Graph/GDN 路径与设备 RNG；310P 采用静态短卷积展开、fp16/NZ full attention、NPUGraph 状态绑定，head_dim=256 自动选 KV block=64。CoreX/310P 尚未实机验收。
+- 捕获窗口必须使用有效物理页，-1 只用于跳写 padding。稠密草稿 padding 槽是 `max_num_seqs`，不能用负物理 KV 槽当草稿槽。MetaBlob 的设备孪生显式指定后端设备，不能依赖初始化结束后已改为 CPU 的默认设备。
+- 实机入口：`python3 -m scripts.check_qwen35 TARGET --draft DRAFT`。8GB 卡建议 `max_model_len=512 / max_num_seqs=1`；并发测试用 `--seqs 4`，DFlash 小显存 padding 测试可用 `--spec-num-tokens 2`。实际验收结果和基准口径见 `docs/QWEN35.md`。
 
 ## 支持矩阵与 Qwen3 MoE + W8A8（三后端）
 

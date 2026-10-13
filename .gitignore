@@ -202,3 +202,4 @@ cython_debug/
 
 # FlashInfer 实机回归工件
 /bench_results/flashinfer-check/
+/bench_results/qwen35-check/

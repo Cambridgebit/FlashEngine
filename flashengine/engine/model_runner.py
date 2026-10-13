@@ -50,7 +50,8 @@ def _refill_ids(t2d, m_idx, rows: int, k: int, ar_f=None, shift_idx=None):
 
 class MetaBlob:
 
-    def __init__(self, i64_segments, f32_segments):
+    def __init__(self, i64_segments, f32_segments, device):
+        self.device = device
         self._i64_off, self._i64_size = {}, {}
         pos = 0
         for name, size in i64_segments:
@@ -95,7 +96,7 @@ class MetaBlob:
     def _device(self, plane):
         if self._dev.get(plane) is None:
             source = getattr(self, plane)
-            self._dev[plane] = torch.zeros(source.numel(), dtype=source.dtype)
+            self._dev[plane] = torch.zeros(source.numel(), dtype=source.dtype, device=self.device)
         return self._dev[plane]
 
     def device_i64(self):
@@ -179,7 +180,7 @@ class ModelRunner:
         self._dblob = MetaBlob(
             [('ids', M), ('pos', M), ('slots', M), ('ctx', M),
              ('ctx_cu', M + 1), ('bt', M * W), ('topks', M)],
-            [('temperatures', M), ('top_ps', M)])
+            [('temperatures', M), ('top_ps', M)], device=self.device)
 
         dist.init_process_group(self.backend.dist_name, f"tcp://localhost:{config.hccl_port}", world_size=self.world_size, rank=rank)
         self.backend.set_device(rank)
@@ -199,6 +200,7 @@ class ModelRunner:
         self.target_adapter.load_weights(
             self.model, config.model,
             dequant=config.dequant_int8_weights, dtype=self.dtype)
+        self.state_runtime = self.target_adapter.create_state_runtime(self.model, config)
         if self.spec_enabled:
             self.model.model.aux_hidden_state_layers = tuple(config.spec_aux_layers)
             self.draft_config = config.draft_config
@@ -256,7 +258,7 @@ class ModelRunner:
                  ('v_cu_k', M + 1), ('ctopks', M), ('v_topks', rows * M), ('btables', M * W),
                  ('v_ctx_lens', rows * M), ('v_btables_exp', rows * M * W)]
                 + df_segments,
-                [('ctemps', M), ('ctopps', M), ('v_temps', rows * M), ('v_topps', rows * M)])
+                [('ctemps', M), ('ctopps', M), ('v_temps', rows * M), ('v_topps', rows * M)], device=self.device)
             self._sg = self._alloc_spec_graph_vars(self._graph_max_bs, rows, k)
             if self.config.spec_is_block_draft:
                 self._sg.update(self._alloc_df_graph_vars(self._graph_max_bs, rows))
@@ -269,6 +271,7 @@ class ModelRunner:
             "replay": 0,
             "eager_rounds": 0,
             "sampling_fallbacks": 0,
+            "context_limited_rounds": 0,
             "bucket_hits": {},
         }
         self.spec_accept_stats = {
@@ -305,6 +308,7 @@ class ModelRunner:
                     max_batch_size=self._graph_max_bs,
                     max_block_columns=self._pin_W,
                     warmup_iters=self.backend.graph_warmup_iters(),
+                    state_runtime=self.state_runtime,
                 )
                 self.graph_runner = self.backend.create_decode_graph_executor(graph_plan)
                 if self.graph_runner is not None:
@@ -366,7 +370,7 @@ class ModelRunner:
         for stats, keys in (
             (self.decode_graph_stats, ("replay", "fallback", "bucket_hits")),
             (self.spec_graph_stats,
-             ("replay", "eager_rounds", "sampling_fallbacks", "bucket_hits")),
+             ("replay", "eager_rounds", "sampling_fallbacks", "bucket_hits", "context_limited_rounds")),
             (self.prefill_cache_stats, tuple(self.prefill_cache_stats)),
         ):
             for key in keys:
@@ -386,6 +390,7 @@ class ModelRunner:
         spec = dict(self.spec_accept_stats)
         spec["positions"] = list(spec["positions"])
         return {
+            "recurrent": self.state_runtime.snapshot() if self.state_runtime else None,
             "mode": self.graph_mode(),
             "graph": graph,
             "prefill": dict(self.prefill_cache_stats),
@@ -426,7 +431,10 @@ class ModelRunner:
         self.spec_runtime.after_prefill(seqs)
 
     def startup_details(self) -> list[tuple[str, str]]:
-        return self.spec_runtime.startup_details() if self.spec_runtime else []
+        details = self.spec_runtime.startup_details() if self.spec_runtime else []
+        if self.state_runtime:
+            details.append(("Recurrent state", f"{self.state_runtime.slot_count} slots / {self.state_runtime.bytes / 2**20:.1f} MiB"))
+        return details
 
     def exit(self):
         if getattr(self, "_closed", False):
@@ -511,6 +519,8 @@ class ModelRunner:
         else:
             self.run(seqs, True)
         self.backend.empty_cache()
+        if self.state_runtime:
+            self.state_runtime.clear()
         if self.config.spec_is_block_draft:
             # Reclaim draft context slots held by warmup-only sequences.
             self.spec_ctx_pending.clear()
@@ -521,7 +531,7 @@ class ModelRunner:
     def allocate_kv_cache(self):
         config = self.config
         tc = config.model_config
-        num_attn_layers = tc.num_hidden_layers
+        num_attn_layers = getattr(self.model.model, "num_attention_layers", tc.num_hidden_layers)
         num_kv_heads = tc.num_key_value_heads // self.world_size
         head_dim = getattr(tc, "head_dim", tc.hidden_size // tc.num_attention_heads)
         block_bytes = 2 * num_attn_layers * self.block_size * num_kv_heads * head_dim * self.dtype.itemsize
@@ -629,7 +639,13 @@ class ModelRunner:
             attn.v_cache = self.draft_kv_cache[1, 0]
 
     def drop_spec_state(self, seq_id: int):
-        self.spec_runtime.drop_state(seq_id)
+        self.drop_seq_state(seq_id)
+
+    def drop_seq_state(self, seq_id: int):
+        if self.state_runtime:
+            self.state_runtime.drop(seq_id)
+        if self.spec_runtime:
+            self.spec_runtime.drop_state(seq_id)
 
     def _graph_pad_block(self) -> int:
         return self.backend.graph_pad_block(self.config.num_kvcache_blocks)
@@ -748,6 +764,8 @@ class ModelRunner:
             prefix_reused_tokens=prefix_reused_tokens,
             prefix_recomputed=prefix_recomputed,
         )
+        if self.state_runtime:
+            self.state_runtime.bind_prefill(get_context(), seqs)
         return input_ids, positions
 
     def _record_prefill_cache_state(self, seqs: list[Sequence]):
@@ -780,6 +798,8 @@ class ModelRunner:
 
     def prepare_decode(self, seqs: list[Sequence]):
         n = len(seqs)
+        if self.state_runtime:
+            self.state_runtime.prepare_decode(seqs)
         block_size = self.block_size
         blob = self._dblob
         ids_v = blob.view_i64('ids')
@@ -824,6 +844,8 @@ class ModelRunner:
                                 max_context_len=self.config.max_model_len,
                                 use_cuda_graph=True,
                                 block_size=self.block_size)
+                    if self.state_runtime:
+                        self.state_runtime.bind_decode(get_context(), bucket)
                 return gv['input_ids'][:n], gv['positions'][:n]
         with torch.inference_mode():
             slot_dtype = self.backend.graph_slot_mapping_dtype()
@@ -842,6 +864,8 @@ class ModelRunner:
                     cu_seqlens_k=cu_seqlens_k,
                     max_context_len=self.config.max_model_len,
                     block_size=self.block_size)
+        if self.state_runtime:
+            self.state_runtime.bind_decode(get_context(), n)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence], is_prefill: bool = False):
@@ -968,6 +992,10 @@ class ModelRunner:
             or all(seq.temperature <= 1e-10 for seq in seqs)
         )
         result = self.spec_runtime.round(seqs, sampling_compatible)
+        self._record_spec_acceptance(result)
+        return result
+
+    def _record_spec_acceptance(self, result):
         stats = self.spec_accept_stats
         for tokens in result:
             accepted = len(tokens) - 1
@@ -976,10 +1004,23 @@ class ModelRunner:
             stats["accepted"] += accepted
             for position in range(accepted):
                 stats["positions"][position] += 1
-        return result
 
     def _bucket_for_spec(self, batch_size):
         return _bucket(self.spec_graph_bs, batch_size)
+
+    @torch.inference_mode()
+    def context_limited_spec_round(self, seqs):
+        # 固定宽度 verify 不应越过窗口；剩余不足一整轮时只消费当前 anchor。
+        ids, positions = self.prepare_decode(seqs)
+        hidden, _ = self.model(ids, positions)
+        logits = self.model.compute_logits(hidden)
+        tokens = self.sampler(logits, *self.prepare_sample(seqs)).tolist()
+        result = [[token] for token in tokens]
+        self._record_spec_acceptance(result)
+        self.spec_graph_stats["eager_rounds"] += 1
+        self.spec_graph_stats["context_limited_rounds"] += 1
+        reset_context()
+        return result
 
     def _fill_spec_meta(self, seqs: list[Sequence]) -> int:
         k = self.config.spec_num_tokens
@@ -1258,6 +1299,8 @@ class ModelRunner:
             self.spec_ctx_pending[seq.seq_id] = self._sg['v_aux'][
                 i * rows:i * rows + count].clone()
             seq.num_scheduled_tokens = 0
+        if self.state_runtime:
+            self.state_runtime.commit_verify(seqs, [len(tokens) for tokens in results])
         return results
 
     @torch.inference_mode()
@@ -1289,6 +1332,8 @@ class ModelRunner:
         )
 
     def _fill_df_meta(self, seqs: list[Sequence]):
+        if self.state_runtime:
+            self.state_runtime.prepare_verify(seqs)
         blob = self._sblob
         l1 = blob.view_i64('df_l1')
         c = blob.view_i64('df_c')
@@ -1439,7 +1484,7 @@ class ModelRunner:
             M, W = self._pin_M, self._pin_W
             rows = self.config.spec_num_tokens + 1
             blob = self._sblob
-            pad_block = self._graph_pad_block()
+            pad_block = self.backend.graph_capture_block(self.config.num_kvcache_blocks)
             pad_base = pad_block * self.block_size
             pad_slots = torch.arange(
                 pad_base, pad_base + rows, dtype=torch.int64, device="cpu")
@@ -1452,7 +1497,10 @@ class ModelRunner:
             blob.view_i64('v_ctx_lens', (M, rows))[:] = pad_context_lens
             blob.view_i64('v_btables_exp', (M, rows, W)).fill_(pad_block)
             blob.view_i64('df_ctx_pos', (M, rows))[:] = pad_positions
-            blob.view_i64('df_ctx_phys_slots', (M, rows))[:] = pad_slots
+            if self.dflash_paged:
+                blob.view_i64('df_ctx_phys_slots', (M, rows))[:] = pad_slots
+            else:
+                blob.view_i64('df_ctx_phys_slots', (M, rows)).fill_(self._df_pad_ctx_slot)
             blob.view_i64('df_total_lens').fill_(self._df_query_rows())
         self._capture_spec_graphs(prepare, self._df_round_body,
                                   "Block-draft speculative")
@@ -1469,15 +1517,19 @@ class ModelRunner:
         slots = blob.view_i64('v_slots', (M, rows))
         contexts = blob.view_i64('v_ctx_lens', (M, rows))
         if block_draft:
-            pad_slots = torch.arange(pad_block * self.block_size,
-                                     pad_block * self.block_size + rows,
-                                     dtype=torch.int64, device="cpu")
+            pad_slots = (torch.arange(pad_block * self.block_size,
+                                      pad_block * self.block_size + rows,
+                                      dtype=torch.int64, device="cpu")
+                         if pad_block >= 0 else torch.full((rows,), -1, dtype=torch.int64, device="cpu"))
             positions = torch.arange(rows, dtype=torch.int64, device="cpu")
             slots[n:] = pad_slots
             contexts[n:] = positions + 1
             blob.view_i64('v_pos', (M, rows))[n:] = positions
             blob.view_i64('df_ctx_pos', (M, rows))[n:] = positions
-            blob.view_i64('df_ctx_phys_slots', (M, rows))[n:] = pad_slots
+            if self.dflash_paged:
+                blob.view_i64('df_ctx_phys_slots', (M, rows))[n:] = pad_slots
+            else:
+                blob.view_i64('df_ctx_phys_slots', (M, rows))[n:].fill_(self._df_pad_ctx_slot)
             blob.view_i64('df_l1')[n:].zero_()
             blob.view_i64('df_c')[n:].zero_()
             blob.view_i64('df_ctxslot')[n:].fill_(self._df_pad_ctx_slot)
@@ -1626,6 +1678,8 @@ class ModelRunner:
                     context_lens=g['v_ctx_lens'][:bs * rows],
                     block_tables=self._verify_block_tables(g, bs, rows),
                     block_size=self.block_size)
+        if self.state_runtime:
+            self.state_runtime.bind_verify(get_context(), bs)
         hidden, aux = self.model(g['v_input_ids'][:bs * rows], g['v_positions'][:bs * rows])
         logits = self.backend.linear(
             hidden, getattr(self.model.lm_head, "weight_nz", self.model.lm_head.weight))
@@ -1734,6 +1788,8 @@ class ModelRunner:
     @torch.inference_mode()
     def capture_cudagraph(self):
         try:
+            if self.state_runtime:
+                self.state_runtime.prepare_capture()
             config = self.config
             tc = config.model_config
             max_bs = self._graph_max_bs
@@ -1817,6 +1873,8 @@ class ModelRunner:
                     use_cuda_graph=True,
                     block_size=self.block_size,
                 )
+                if self.state_runtime:
+                    self.state_runtime.bind_decode(get_context(), bs)
                 scatter(bs)
                 for _ in range(self.backend.graph_warmup_iters()):
                     hidden = self.model(input_ids[:bs], positions[:bs])    # warmup

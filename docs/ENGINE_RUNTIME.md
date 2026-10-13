@@ -60,6 +60,11 @@ monkey-patching engine methods.
 - Per-sequence draft state follows target KV lifetime and is dropped on both
   completion and preemption.
 
+Qwen3.5 dense/MoE 使用注册模型的 recurrent state runtime，conv/SSM 状态按请求主槽管理。
+DFlash verify 使用独立逐行状态槽，接受后把相应终态复制回主槽；分块 prefill 续接历史，
+完成/抢占/取消均回收。prefix cache 在实现 GDN 快照前关闭。上下文剩余空间不足一整轮时
+只执行单 token target fallback，避免固定宽度 verify 越界。详见 `QWEN35.md`。
+
 Algorithm details and hardware-specific operator contracts remain in
 `EAGLE3.md`, `DFlash.md`, and `ASCEND310P_GRAPH_SPEC.md`.
 

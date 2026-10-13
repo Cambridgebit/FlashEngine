@@ -95,6 +95,9 @@ class Scheduler:
             if not was_partial:
                 num_cached_blocks = self.block_manager.can_allocate(seq)
                 if num_cached_blocks == -1:
+                    # 已选入本步的 prefill 尚未执行，不能抢占并清空它的 KV 页表。
+                    if scheduled:
+                        break
                     if not self._preempt_lru_for(seq):
                         break
                     num_cached_blocks = self.block_manager.can_allocate(seq)

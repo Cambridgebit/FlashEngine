@@ -27,6 +27,12 @@ class Context:
     prefix_reused_tokens: int = 0
     splitfuse_used: bool = False
     prefix_recomputed: bool = False
+    gdn_state_slots: torch.Tensor | None = None
+    gdn_has_initial: torch.Tensor | None = None
+    gdn_state_mode: str = "final"
+    gdn_carry_slots: torch.Tensor | None = None
+    gdn_row_bases: tuple[int, ...] | None = None
+    gdn_row_seg: int = 0
 
 _CONTEXT = Context()
 

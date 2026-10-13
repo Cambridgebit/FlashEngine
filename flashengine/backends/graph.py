@@ -12,6 +12,7 @@ class DecodeGraphPlan:
     max_batch_size: int
     max_block_columns: int
     warmup_iters: int
+    state_runtime: Any = None
 
 
 class DecodeGraphExecutor:

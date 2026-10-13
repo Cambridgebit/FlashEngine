@@ -1,0 +1,7 @@
+# 先安装与硬件匹配的 PyTorch；CUDA/CoreX/Ascend 算子库按后端另装。
+torch
+transformers>=5.6,<6
+xxhash
+numpy
+safetensors
+tqdm

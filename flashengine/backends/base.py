@@ -6,7 +6,11 @@ import torch.nn.functional as F
 
 # Match the 0924 CUDA/CoreX fast path: keep enough Dynamo variants for
 # dynamic batch shapes instead of falling back to eager after the default limit.
-torch._dynamo.config.recompile_limit = 256
+if hasattr(torch._dynamo.config, "recompile_limit"):
+    torch._dynamo.config.recompile_limit = 256
+else:
+    # 兼容厂商环境中旧版 PyTorch 的配置名。
+    torch._dynamo.config.cache_size_limit = 256
 
 
 def _apply_rotary_emb(x, cos, sin):
@@ -62,6 +66,10 @@ class BackendBase(ABC):
 
     def dense_noncausal_attention(self, q, k, v, mask, scale: float):
         return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=scale)
+
+    def gdn_causal_conv1d(self, inputs, weight):
+        """GDN 的已补历史窗口深度卷积，输入为 [batch, channels, length]。"""
+        return F.conv1d(inputs, weight, groups=weight.shape[0])
 
     def linear(self, x, weight, bias=None):
         return F.linear(x, weight, bias)
@@ -309,10 +317,11 @@ class BackendBase(ABC):
         return 0
 
     def graph_capture_block(self, num_blocks: int) -> int:
-        return self.graph_pad_block(num_blocks)
+        # 捕获用有效的物理页，-1 仅表示回放 padding，不能给暖启动窗口读取。
+        return max(0, self.graph_pad_block(num_blocks))
 
     def graph_capture_context_len(self) -> int:
-        return self.graph_pad_context_len()
+        return max(1, self.graph_pad_context_len())
 
     def reserve_dummy_kv_block(self) -> bool:
         return False

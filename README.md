@@ -1,10 +1,10 @@
-# FlashEngine V2.0
+# FlashEngine V2.1
 
 ## Introduction
 
 本项目基于 [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm)，用于研究和学习大模型推理引擎。代码覆盖请求调度、模型执行、KV cache 管理和硬件后端，提供 Python API 与 OpenAI 兼容 HTTP 服务。
 
-当前目标模型为 Qwen3 与 Qwen3 MoE（Qwen3-30B-A3B），支持 EAGLE3、DFlash、DSpark 三种投机解码方法、W8A8 int8 量化推理，以及 NVIDIA CUDA、天数智芯 CoreX、华为 Ascend 310P 三种后端。完整的目标 × 后端 × 量化 × 投机支持矩阵见 [支持矩阵](docs/SUPPORT_MATRIX.md)（启动即校验，不支持的组合会明确报错）。Qwen3.5 不在此版本中。DSpark 的 310P 路径仍待实机验收。
+当前目标模型为 Qwen3、Qwen3 MoE 与 Qwen3.5 dense/MoE 文本模型，后端为 NVIDIA CUDA、天数智芯 CoreX、华为 Ascend 310P。Qwen3 支持 EAGLE3、DFlash、DSpark；Qwen3 MoE 与 Qwen3.5 系列支持 DFlash。Qwen3 的 W8A8 支持范围不变，Qwen3.5 当前为 fp16/bf16、TP=1，不加载视觉塔和 MTP。完整组合见 [支持矩阵](docs/SUPPORT_MATRIX.md)，Qwen3.5 的实现与验证边界见 [适配说明](docs/QWEN35.md)。CoreX/310P 的 Qwen3.5 路径尚无实机验收。
 
 ## Quickstart
 
