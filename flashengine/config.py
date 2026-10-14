@@ -7,7 +7,7 @@ from transformers import AutoConfig
 
 from flashengine.backends import get_backend
 from flashengine.models.registry import resolve_target_model
-from flashengine.speculative.registry import resolve_spec_method
+from flashengine.speculative.registry import load_draft_config, resolve_spec_method
 from flashengine.support_matrix import require_supported
 
 
@@ -116,7 +116,7 @@ class Config:
                 raise ValueError(f"Draft model must be a local directory: {self.spec_model}")
             if self.spec_num_tokens < 1:
                 raise ValueError("spec_num_tokens must be positive")
-            self.draft_config = AutoConfig.from_pretrained(self.spec_model)
+            self.draft_config = load_draft_config(self.spec_model)
             self.spec_adapter = resolve_spec_method(self.draft_config)
             self.spec_method = self.spec_adapter.name
             self.spec_is_block_draft = self.spec_adapter.block_draft

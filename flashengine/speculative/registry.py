@@ -17,12 +17,25 @@ def _identity_num_tokens(draft_config: Any, requested: int) -> int:
 def _normalize_block_draft(draft_config: Any) -> None:
     dflash_config = getattr(draft_config, "dflash_config", None) or {}
     if not dflash_config:
+        target_layer_ids = getattr(draft_config, "target_layer_ids", None)
+        if target_layer_ids is None:
+            aux_layer_ids = getattr(draft_config, "aux_hidden_state_layer_ids", None)
+            if aux_layer_ids:
+                # speculators 格式：aux_hidden_state_layer_ids 是 vLLM/eagle 口径的
+                # 捕获层号；DFlash 主体的 target_layer_ids 比它小一（对齐 vLLM 对
+                # speculators 的转换），本仓按 Qwen3 做 +1 换算后正好还原捕获层号。
+                target_layer_ids = [int(i) - 1 for i in aux_layer_ids]
         dflash_config = {
-            "block_size": getattr(draft_config, "block_size"),
-            "mask_token_id": getattr(draft_config, "mask_token_id"),
-            "target_layer_ids": getattr(draft_config, "target_layer_ids"),
+            "block_size": getattr(draft_config, "block_size", None),
+            "mask_token_id": getattr(draft_config, "mask_token_id", None),
+            "target_layer_ids": target_layer_ids,
         }
         draft_config.dflash_config = dflash_config
+    if dflash_config.get("target_layer_ids") is None:
+        raise ValueError(
+            "Block-draft config must provide target_layer_ids or "
+            "aux_hidden_state_layer_ids."
+        )
 
 
 def _normalize_dspark(draft_config: Any) -> None:
@@ -34,6 +47,43 @@ def _normalize_dspark(draft_config: Any) -> None:
         raise NotImplementedError(
             "DSpark reduced-vocabulary checkpoints are not supported."
         )
+
+
+def load_draft_config(path: str) -> Any:
+    """加载草稿模型配置：标准 HF 自动解析优先，回退 speculators 平铺格式。
+
+    vllm-project/speculators 导出的 DFlash 草稿没有 ``model_type``，
+    ``AutoConfig`` 无法识别；这里按官方转换口径（vLLM 对 speculators 的处理）
+    从 ``transformer_layer_config`` 重建配置，并透传顶层字段供归一化使用。
+    """
+    import json
+    import os
+
+    from transformers import AutoConfig, PretrainedConfig
+
+    try:
+        return AutoConfig.from_pretrained(path)
+    except Exception:
+        config_path = os.path.join(path, "config.json")
+        if not os.path.exists(config_path):
+            raise
+        with open(config_path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        layer_config = data.get("transformer_layer_config")
+        if not layer_config or not (
+            data.get("speculators_model_type")
+            or data.get("aux_hidden_state_layer_ids")
+        ):
+            raise
+        config = PretrainedConfig(**layer_config)
+        config.architectures = list(
+            data.get("architectures") or ["DFlashDraftModel"])
+        config.block_size = data.get("block_size")
+        config.mask_token_id = data.get("mask_token_id")
+        config.draft_vocab_size = data.get("draft_vocab_size")
+        config.aux_hidden_state_layer_ids = data.get("aux_hidden_state_layer_ids")
+        config.speculators_model_type = data.get("speculators_model_type")
+        return config
 
 
 def _block_num_tokens(draft_config: Any, requested: int) -> int:

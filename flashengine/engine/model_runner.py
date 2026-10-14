@@ -1444,6 +1444,8 @@ class ModelRunner:
                 values, temps, topps, topks, use_cuda_graph
             ),
         )
+        if self.draft_model.reduced_vocab:
+            ids = self.draft_model.map_to_target_ids(ids)
         g['drafted_ids'][:k, :bs] = ids.t()
 
     def _df_round_body(self, bs: int, use_cuda_graph: bool = True):

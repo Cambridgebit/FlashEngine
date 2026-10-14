@@ -166,6 +166,14 @@ class DFlashDraftModel(nn.Module):
         self.sample_from_anchor = False
         self.embed_tokens = target_embed_tokens
         self.lm_head_weight = target_lm_head_weight
+        # 缩减词表（speculators 格式）：draft 词表小于目标词表，d2t 为增量映射表
+        # （target_id = draft_id + d2t[draft_id]，与 EAGLE3 同口径）；全词表时
+        # 增量恒为 0，映射退化为恒等。
+        draft_vocab = int(getattr(config, "draft_vocab_size", None) or config.vocab_size)
+        self.draft_vocab_size = draft_vocab
+        self.reduced_vocab = draft_vocab != int(config.vocab_size)
+        self.register_buffer("d2t", torch.zeros(draft_vocab, dtype=torch.int64))
+        self.register_buffer("t2d", torch.zeros(int(config.vocab_size), dtype=torch.bool))
         self.fc = ReplicatedLinear(len(self.target_layer_ids) * hidden_size, hidden_size, bias=False)
         self.hidden_norm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
         rp = getattr(config, "rope_parameters", None) or {}
@@ -213,6 +221,10 @@ class DFlashDraftModel(nn.Module):
             top_ks.repeat_interleave(num_tokens),
         )
         return ids.view(anchor_ids.numel(), num_tokens)
+
+    def map_to_target_ids(self, draft_ids: torch.Tensor) -> torch.Tensor:
+        # d2t 为增量映射表：target = draft + d2t[draft]（全词表时增量为 0）。
+        return draft_ids + self.d2t[draft_ids]
 
     def project_context_kv(self, aux: torch.Tensor, positions: torch.Tensor,
                            slots: torch.Tensor) -> None:
@@ -308,6 +320,11 @@ def load_dflash_draft(model: DFlashDraftModel, path: str) -> None:
     total_bytes = safetensors_total_bytes(path)
     for name, tensor in iter_with_progress(items(), "Draft model loading (DFlash)",
                                            total_bytes):
+        bare = name.removeprefix("model.")
+        if bare in ("d2t", "t2d"):
+            buf = getattr(model, bare)
+            buf.data.copy_(tensor.to(buf.device))
+            continue
         if name == "embed_tokens.weight":
             if model.embed_tokens.weight.shape != tensor.shape:
                 raise ValueError("DFlash embedding size differs from the target vocabulary")
@@ -321,7 +338,10 @@ def load_dflash_draft(model: DFlashDraftModel, path: str) -> None:
             model.embed_tokens = _emb
         if name == "lm_head.weight":
             if model.lm_head_weight.shape != tensor.shape:
-                raise ValueError("DFlash LM-head size differs from the target vocabulary")
+                if not (model.reduced_vocab
+                        and tensor.shape[0] == model.draft_vocab_size):
+                    raise ValueError(
+                        "DFlash LM-head size differs from the target vocabulary")
             model.lm_head_weight = nn.Parameter(torch.empty(
                 tensor.shape, device=model.fc.weight.device,
                 dtype=model.fc.weight.dtype))
