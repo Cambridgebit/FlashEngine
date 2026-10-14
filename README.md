@@ -1,12 +1,15 @@
-# FlashEngine V2.0
+# FlashEngine V2.1
 
 ## Introduction
 
 本项目基于 [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm)，用于研究和学习大模型推理引擎。代码覆盖请求调度、模型执行、KV cache 管理和硬件后端，提供 Python API 与 OpenAI 兼容 HTTP 服务。
 
-当前目标模型为 Qwen3 与 Qwen3 MoE（Qwen3-30B-A3B），支持 EAGLE3、DFlash、DSpark 三种投机解码方法、W8A8 int8 量化推理，以及 NVIDIA CUDA、天数智芯 CoreX、华为 Ascend 310P 三种后端。完整的目标 × 后端 × 量化 × 投机支持矩阵见 [支持矩阵](docs/SUPPORT_MATRIX.md)（启动即校验，不支持的组合会明确报错）。Qwen3.5 不在此版本中。DSpark 的 310P 路径仍待实机验收。
+当前目标模型为 Qwen3、Qwen3 MoE 与 Qwen3.5 dense/MoE 文本模型，后端为 NVIDIA CUDA、天数智芯 CoreX、华为 Ascend 310P。Qwen3 支持 EAGLE3、DFlash、DSpark；Qwen3 MoE 与 Qwen3.5 系列支持 DFlash。Qwen3 的 W8A8 支持范围不变，Qwen3.5 当前为 fp16/bf16、TP=1，不加载视觉塔和 MTP。完整组合见 [支持矩阵](docs/SUPPORT_MATRIX.md)，Qwen3.5 的实现与验证边界见 [适配说明](docs/QWEN35.md)。CoreX/310P 的 Qwen3.5 路径尚无实机验收。
 
 ## Quickstart
+
+Qwen3.5 DFlash 的 CUDA 性能热点已融合，保守复验约 135 tok/s（修复前约 72），
+本机已测 k=15 最快。配置、数值边界与复现口径见 [DFlash 性能修复](docs/DFLASH_PERFORMANCE.md)。
 
 需要 Python 3.10–3.12、对应加速卡运行环境及本地模型目录。以下命令在 Linux 或 WSL 的仓库根目录运行，模型参数不能直接使用 HuggingFace hub ID。
 
@@ -52,7 +55,7 @@ python3 -m scripts.benchmark /path/to/Qwen3-1.7B \
     --max-model-len 2048 --max-num-seqs 4 --gpu-mem-util 0.85 --no-think
 ```
 
-`--spec-model` 开启投机基准，`--no-prefix-cache` 关闭前缀缓存。脚本以 `python3 -m scripts.<名称>` 运行。多方法、多 batch 的统一测量见 [压测说明](docs/BENCH_MATRIX.md)。
+`--spec-model` 开启投机基准，`--no-prefix-cache` 关闭前缀缓存。脚本以 `python3 -m scripts.<名称>` 运行。HTTP 并发压测使用 `scripts.bench_concurrent`，与进程内串行基准分别记录，不混用测量口径。
 
 ## 代码目录与项目架构
 
@@ -125,6 +128,11 @@ CUDA/CoreX 使用其兼容的图接口，310P 使用 NPUGraph/ACLGraph。捕获�
 算法说明：[EAGLE3](docs/EAGLE3.md)、[DFlash / DSpark](docs/DFlash.md)。
 
 ### 后端算子与 Ascend 310P 的 NZ 格式
+
+CUDA 可设置 `FLASHENGINE_CUDA_ATTENTION=flashinfer` 使用与 vLLM 相同的 FlashInfer
+公开算子库，默认仍为 `flash-attn`。普通 decode 支持 Graph、前缀缓存和分块 prefill；
+FlashInfer 整轮投机图当前关闭，投机走 eager。安装、WSL 命令与回归说明见
+[FlashInfer 适配](docs/FLASHINFER.md)。
 
 CUDA 使用 FlashAttention；CoreX 使用 IXFormer。310P 使用厂商 FlashAttention、PagedAttention 与 SplitFuse，并调用融合 RMSNorm、残差加归一化、SwiGLU 和 RoPE 算子，减少中间张量与独立 kernel 调用。
 

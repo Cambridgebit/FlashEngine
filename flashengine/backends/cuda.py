@@ -1,11 +1,8 @@
+import os
+
 import torch
 import triton
 import triton.language as tl
-
-from flash_attn import (
-    flash_attn_varlen_func,
-    flash_attn_with_kvcache,
-)
 
 from .base import BackendBase
 
@@ -44,11 +41,94 @@ class CUDABackend(BackendBase):
 
     name = "cuda"
     supports_spec_graph = True
+    supports_device_sampling_rng = True
+    supports_greedy_graph_variants = True
     supports_moe = True  # 专家前向用 BackendBase 的纯 torch 实现（可被 CUDA Graph 捕获）。
     supports_int8_dequant = True  # Quark int8 检查点加载期反量化（无 int8 算子）。
 
+    def __init__(self):
+        self.gdn_backend = os.getenv("FLASHENGINE_CUDA_GDN", "auto").lower()
+        if self.gdn_backend not in ("auto", "torch", "triton"):
+            raise ValueError("FLASHENGINE_CUDA_GDN 必须为 auto、torch 或 triton")
+        self.supports_fused_gdn = self.gdn_backend != "torch"
+        self.supports_fused_qwen35_norm = self.supports_fused_gdn
+        self.supports_device_state_commit = self.supports_fused_gdn
+        self.supports_fused_gdn_prefill = self.supports_fused_gdn and os.getenv("FLASHENGINE_CUDA_GDN_PREFILL", "1") != "0"
+        self.attention_backend = os.getenv("FLASHENGINE_CUDA_ATTENTION", "flash_attn").lower()
+        if self.attention_backend not in ("flash_attn", "flashinfer"):
+            raise ValueError("FLASHENGINE_CUDA_ATTENTION 必须为 flash_attn 或 flashinfer")
+        self.flashinfer = None
+        if self.attention_backend == "flashinfer":
+            from .flashinfer import FlashInferAttention
+
+            self.flashinfer = FlashInferAttention()
+            # 投机图在图内改变上下文；FlashInfer 的 CPU plan 尚未接入整轮图。
+            self.supports_spec_graph = False
+            # FlashInfer + 新 prefill 累加顺序的 BF16 位等尚未全过，auto 保留参考式。
+            if os.getenv("FLASHENGINE_CUDA_GDN_PREFILL") is None:
+                self.supports_fused_gdn_prefill = False
+        else:
+            from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+
+            self._varlen = flash_attn_varlen_func
+            self._with_kvcache = flash_attn_with_kvcache
+        draft_attn = os.getenv("FLASHENGINE_CUDA_DFLASH_ATTENTION", "auto")
+        if draft_attn not in ("auto", "sdpa", "flash_attn"):
+            raise ValueError("FLASHENGINE_CUDA_DFLASH_ATTENTION 必须为 auto、sdpa 或 flash_attn")
+        self.supports_dflash_dense_varlen = self.flashinfer is None and draft_attn != "sdpa"
+        if draft_attn == "flash_attn" and self.flashinfer is not None:
+            raise ValueError("FlashInfer 模式当前不能强制使用 FlashAttention 草稿内核")
+
+    def runtime_info(self):
+        info = super().runtime_info()
+        info["attention_backend"] = self.attention_backend
+        info["gdn_backend"] = "triton recurrent" if self.supports_fused_gdn else "torch reference"
+        info["gdn_prefill"] = "triton recurrent" if self.supports_fused_gdn_prefill else "torch chunk reference"
+        info["dflash_backend"] = "dense-KV/FlashAttention GQA" if self.supports_dflash_dense_varlen else "dense-KV/SDPA"
+        if self.flashinfer is not None:
+            info["attention_kernel"] = "FlashInfer fa2 (NHD, tensor cores)"
+            info["spec_graph"] = "disabled: eager spec with CPU plan"
+        return info
+
+    def gdn_recurrent(self, *args, **kwargs):
+        from .cuda_gdn import recurrent
+        return recurrent(*args, **kwargs)
+
+    def qwen35_norm(self, *args, **kwargs):
+        from .cuda_gdn import norm
+        return norm(*args, **kwargs)
+
+    def gdn_conv(self, *args, **kwargs):
+        from .cuda_gdn import conv
+        return conv(*args, **kwargs)
+
+    def gdn_commit(self, *args, **kwargs):
+        from .cuda_gdn import commit
+        return commit(*args, **kwargs)
+
+    def dflash_dense_attention(self, *args):
+        from .cuda_dflash import attention
+        return attention(self._varlen, *args)
+
+    def create_decode_graph_executor(self, plan):
+        if self.flashinfer is not None:
+            from .flashinfer import FlashInferDecodeGraphRunner
+
+            return FlashInferDecodeGraphRunner(plan, self.flashinfer)
+        return None
+
+    def shutdown(self):
+        if self.flashinfer is not None:
+            self.flashinfer.close()
+        super().shutdown()
+
     def validate_config(self, config) -> None:
-        if config.kvcache_block_size % 256:
+        if self.flashinfer is not None:
+            if config.tensor_parallel_size != 1:
+                raise NotImplementedError("FlashInfer 注意力适配当前要求 tensor_parallel_size=1")
+            if config.spec_model and not config.enforce_eager:
+                print("[FlashEngine] FlashInfer 投机解码使用 eager；整轮投机图尚未接入。", flush=True)
+        elif config.kvcache_block_size % 256:
             raise ValueError(
                 "CUDA flash-attn paged KV requires block_size to be a power "
                 "of two and a multiple of 256 (256, 512, 1024, ...)."
@@ -93,7 +173,9 @@ class CUDABackend(BackendBase):
         context,
         scale,
     ):
-        return flash_attn_varlen_func(
+        if self.flashinfer is not None:
+            return self.flashinfer.prefill(q, k, v, context, scale)
+        return self._varlen(
             q,
             k,
             v,
@@ -114,12 +196,14 @@ class CUDABackend(BackendBase):
         context,
         scale,
     ):
+        if self.flashinfer is not None:
+            return self.flashinfer.decode(q, k_cache, v_cache, context, scale)
         if context.use_cuda_graph:
             if context.cu_seqlens_q is None or context.cu_seqlens_k is None:
                 raise RuntimeError(
                     "CUDA Graph decode requires cumulative KV-length metadata"
                 )
-            return flash_attn_varlen_func(
+            return self._varlen(
                 q,
                 k_cache,
                 v_cache,
@@ -131,7 +215,7 @@ class CUDABackend(BackendBase):
                 causal=True,
                 block_table=context.block_tables,
             )
-        return flash_attn_with_kvcache(
+        return self._with_kvcache(
             q.unsqueeze(1),
             k_cache,
             v_cache,

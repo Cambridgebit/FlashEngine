@@ -5,7 +5,7 @@ import traceback
 import torch
 
 from flashengine.backends.graph import DecodeGraphExecutor, DecodeGraphPlan
-from flashengine.utils.context import set_context, reset_context
+from flashengine.utils.context import set_context, reset_context, get_context
 
 
 def npu_graph_api():
@@ -44,6 +44,7 @@ class NPUGraphDecodeRunner(DecodeGraphExecutor):
 
     def __init__(self, plan: DecodeGraphPlan):
         self.model = plan.model
+        self.state_runtime = plan.state_runtime
         self.config = plan.config
         self.device = plan.device
         self.block_size = plan.block_size
@@ -119,6 +120,8 @@ class NPUGraphDecodeRunner(DecodeGraphExecutor):
             use_cuda_graph=True,
             block_size=self.block_size,
         )
+        if self.state_runtime:
+            self.state_runtime.bind_decode(get_context(), entry.graph_bs)
 
     def _allocate_entry(self, graph_bs: int) -> DecodeGraphEntry:
         entry = DecodeGraphEntry(graph_bs=graph_bs)
@@ -204,6 +207,8 @@ class NPUGraphDecodeRunner(DecodeGraphExecutor):
         return self.model.compute_logits(hidden_states)
 
     def capture_all(self):
+        if self.state_runtime:
+            self.state_runtime.prepare_capture()
         for graph_bs in self.graph_capture_sizes:
             self.capture(graph_bs)
 
@@ -296,6 +301,8 @@ class NPUGraphDecodeRunner(DecodeGraphExecutor):
             return None
 
         self.build_metadata(entry, seqs)
+        if self.state_runtime:
+            self.state_runtime.prepare_decode(seqs)
         self._copy_into_static(entry)
         self._bind(entry)
         if entry.attn_captures:

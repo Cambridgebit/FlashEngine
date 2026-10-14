@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flashengine"
+version = "2.1.0"
+description = "用于研究和学习的多后端大模型推理引擎"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = {file = "LICENSE"}
+dependencies = ["torch", "transformers>=5.6,<6", "xxhash", "numpy", "safetensors", "tqdm"]
+
+[project.optional-dependencies]
+cuda = ["triton", "flash-attn"]
+flashinfer = ["flashinfer-python"]
+corex = ["ixformer"]
+ascend = ["torch-npu"]
+
+[tool.setuptools.packages.find]
+include = ["flashengine*", "scripts*"]
+
+[tool.setuptools.package-data]
+scripts = ["*.html"]

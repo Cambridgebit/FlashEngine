@@ -103,14 +103,27 @@ class Ascend310PBackend(BackendBase):
     graph_sample_default = False
     spec_graph_try_default = True
 
+    def gdn_causal_conv1d(self, inputs, weight):
+        # 310P 用静态短卷积展开，避免数千组 depthwise Conv1d 的算子约束。
+        kernel = weight.shape[-1]
+        length = inputs.shape[-1] - kernel + 1
+        out = inputs[:, :, :length].float() * weight[:, 0, 0].float()[None, :, None]
+        for offset in range(1, kernel):
+            out = out + inputs[:, :, offset:offset + length].float() * weight[:, 0, offset].float()[None, :, None]
+        return out.to(inputs.dtype)
+
     def normalize_config(self, config) -> None:
-        if config.kvcache_block_size not in (64, 128):
+        model = config.model_config
+        head_dim = getattr(model, "head_dim", model.hidden_size // model.num_attention_heads)
+        preferred = 64 if head_dim > 128 else 128
+        if (config.kvcache_block_size not in (64, 128)
+                or config.kvcache_block_size * head_dim > 16384):
             print(
                 "[FlashEngine] Ascend 310P KV-cache block size adjusted: "
-                f"{config.kvcache_block_size} -> 128; supported values are 64 and 128.",
+                f"{config.kvcache_block_size} -> {preferred}; head_dim={head_dim}.",
                 flush=True,
             )
-            config.kvcache_block_size = 128
+            config.kvcache_block_size = preferred
 
     def validate_config(self, config) -> None:
         if config.tensor_parallel_size != 1:

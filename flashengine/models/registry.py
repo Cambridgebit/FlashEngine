@@ -19,6 +19,16 @@ def _identity_model_config(hf_config: Any) -> Any:
     return hf_config
 
 
+def _text_model_config(hf_config: Any) -> Any:
+    return getattr(hf_config, "text_config", hf_config)
+
+
+def _layer_output_aux(method, draft_config, explicit_layers, model_config):
+    if explicit_layers:
+        return tuple(explicit_layers)
+    return tuple((getattr(draft_config, "dflash_config", None) or {})["target_layer_ids"])
+
+
 def _qwen3_aux_layers(
     method: str,
     draft_config: Any,
@@ -46,6 +56,7 @@ class TargetModelAdapter:
     aux_layer_resolver: Any
     # MoE（Qwen3-30B-A3B 系）标记：引擎据此走 MoE 元数据/门控与专家权重后处理。
     is_moe: bool = False
+    recurrent_state: bool = False
 
     def matches(self, hf_config: Any) -> bool:
         model_type = str(getattr(hf_config, "model_type", ""))
@@ -60,6 +71,12 @@ class TargetModelAdapter:
     def build(self, hf_config: Any):
         cls = getattr(import_module(self.module), self.class_name)
         return cls(hf_config)
+
+    def create_state_runtime(self, model, config):
+        if not self.recurrent_state:
+            return None
+        from flashengine.engine.recurrent_state import RecurrentStateRuntime
+        return RecurrentStateRuntime(model, config)
 
     def load_weights(self, model, model_path: str, dequant: bool = False,
                      dtype=None) -> None:
@@ -157,3 +174,17 @@ register_target_model(
         is_moe=True,
     )
 )
+
+for _name, _types, _architectures, _is_moe in (
+    ("qwen3_5", ("qwen3_5", "qwen3_5_text"),
+     ("Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM"), False),
+    ("qwen3_5_moe", ("qwen3_5_moe", "qwen3_5_moe_text"),
+     ("Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM"), True),
+):
+    register_target_model(TargetModelAdapter(
+        name=_name, model_types=_types, architectures=_architectures,
+        module="flashengine.models.qwen3_5", class_name="Qwen3_5ForCausalLM",
+        supported_spec_methods=supported_spec_methods(_name) - {"none"},
+        model_config_selector=_text_model_config, aux_layer_resolver=_layer_output_aux,
+        is_moe=_is_moe, recurrent_state=True,
+    ))

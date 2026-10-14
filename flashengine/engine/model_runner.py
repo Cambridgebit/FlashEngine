@@ -50,7 +50,8 @@ def _refill_ids(t2d, m_idx, rows: int, k: int, ar_f=None, shift_idx=None):
 
 class MetaBlob:
 
-    def __init__(self, i64_segments, f32_segments):
+    def __init__(self, i64_segments, f32_segments, device):
+        self.device = device
         self._i64_off, self._i64_size = {}, {}
         pos = 0
         for name, size in i64_segments:
@@ -95,7 +96,7 @@ class MetaBlob:
     def _device(self, plane):
         if self._dev.get(plane) is None:
             source = getattr(self, plane)
-            self._dev[plane] = torch.zeros(source.numel(), dtype=source.dtype)
+            self._dev[plane] = torch.zeros(source.numel(), dtype=source.dtype, device=self.device)
         return self._dev[plane]
 
     def device_i64(self):
@@ -169,6 +170,8 @@ class ModelRunner:
         )
         self._graph_bs_active = 0
         self.graphs = None
+        self.decode_greedy_graphs = {}
+        self._decode_batch_greedy = False
         self.graph_pool = None
         self.graph_runner = None
         self._max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
@@ -179,7 +182,7 @@ class ModelRunner:
         self._dblob = MetaBlob(
             [('ids', M), ('pos', M), ('slots', M), ('ctx', M),
              ('ctx_cu', M + 1), ('bt', M * W), ('topks', M)],
-            [('temperatures', M), ('top_ps', M)])
+            [('temperatures', M), ('top_ps', M)], device=self.device)
 
         dist.init_process_group(self.backend.dist_name, f"tcp://localhost:{config.hccl_port}", world_size=self.world_size, rank=rank)
         self.backend.set_device(rank)
@@ -199,6 +202,7 @@ class ModelRunner:
         self.target_adapter.load_weights(
             self.model, config.model,
             dequant=config.dequant_int8_weights, dtype=self.dtype)
+        self.state_runtime = self.target_adapter.create_state_runtime(self.model, config)
         if self.spec_enabled:
             self.model.model.aux_hidden_state_layers = tuple(config.spec_aux_layers)
             self.draft_config = config.draft_config
@@ -235,7 +239,7 @@ class ModelRunner:
                 )
         self.startup_stats["weight_layout_conversions"] = float(weight_nz_count)
         self.startup_stats["model_load_s"] = time.perf_counter() - model_load_t0
-        self.sampler = Sampler()
+        self.sampler = Sampler(device_rng=self.backend.supports_device_sampling_rng)
         warmup_t0 = time.perf_counter()
         self.warmup_model()
         self.startup_stats["model_warmup_s"] = time.perf_counter() - warmup_t0
@@ -256,11 +260,14 @@ class ModelRunner:
                  ('v_cu_k', M + 1), ('ctopks', M), ('v_topks', rows * M), ('btables', M * W),
                  ('v_ctx_lens', rows * M), ('v_btables_exp', rows * M * W)]
                 + df_segments,
-                [('ctemps', M), ('ctopps', M), ('v_temps', rows * M), ('v_topps', rows * M)])
+                [('ctemps', M), ('ctopps', M), ('v_temps', rows * M), ('v_topps', rows * M)], device=self.device)
             self._sg = self._alloc_spec_graph_vars(self._graph_max_bs, rows, k)
             if self.config.spec_is_block_draft:
                 self._sg.update(self._alloc_df_graph_vars(self._graph_max_bs, rows))
         self.spec_graphs = None
+        self.spec_greedy_graphs = {}
+        self._spec_capture_greedy = False
+        self._spec_batch_greedy = False
         self.spec_graph_pool = None
         self._spec_graph_active = 0
         self.spec_graph_stats = {
@@ -269,6 +276,9 @@ class ModelRunner:
             "replay": 0,
             "eager_rounds": 0,
             "sampling_fallbacks": 0,
+            "greedy_replays": 0,
+            "greedy_capture_success": 0,
+            "context_limited_rounds": 0,
             "bucket_hits": {},
         }
         self.spec_accept_stats = {
@@ -282,6 +292,7 @@ class ModelRunner:
             "capture_failure": 0,
             "replay": 0,
             "fallback": 0,
+            "greedy_replays": 0,
             "bucket_hits": {},
         }
         self.prefill_cache_stats = {
@@ -305,6 +316,7 @@ class ModelRunner:
                     max_batch_size=self._graph_max_bs,
                     max_block_columns=self._pin_W,
                     warmup_iters=self.backend.graph_warmup_iters(),
+                    state_runtime=self.state_runtime,
                 )
                 self.graph_runner = self.backend.create_decode_graph_executor(graph_plan)
                 if self.graph_runner is not None:
@@ -364,9 +376,9 @@ class ModelRunner:
         if self.graph_runner is not None:
             self.graph_runner.reset()
         for stats, keys in (
-            (self.decode_graph_stats, ("replay", "fallback", "bucket_hits")),
+            (self.decode_graph_stats, ("replay", "fallback", "bucket_hits", "greedy_replays")),
             (self.spec_graph_stats,
-             ("replay", "eager_rounds", "sampling_fallbacks", "bucket_hits")),
+             ("replay", "eager_rounds", "sampling_fallbacks", "bucket_hits", "context_limited_rounds", "greedy_replays")),
             (self.prefill_cache_stats, tuple(self.prefill_cache_stats)),
         ):
             for key in keys:
@@ -386,6 +398,7 @@ class ModelRunner:
         spec = dict(self.spec_accept_stats)
         spec["positions"] = list(spec["positions"])
         return {
+            "recurrent": self.state_runtime.snapshot() if self.state_runtime else None,
             "mode": self.graph_mode(),
             "graph": graph,
             "prefill": dict(self.prefill_cache_stats),
@@ -426,7 +439,10 @@ class ModelRunner:
         self.spec_runtime.after_prefill(seqs)
 
     def startup_details(self) -> list[tuple[str, str]]:
-        return self.spec_runtime.startup_details() if self.spec_runtime else []
+        details = self.spec_runtime.startup_details() if self.spec_runtime else []
+        if self.state_runtime:
+            details.append(("Recurrent state", f"{self.state_runtime.slot_count} slots / {self.state_runtime.bytes / 2**20:.1f} MiB"))
+        return details
 
     def exit(self):
         if getattr(self, "_closed", False):
@@ -511,6 +527,8 @@ class ModelRunner:
         else:
             self.run(seqs, True)
         self.backend.empty_cache()
+        if self.state_runtime:
+            self.state_runtime.clear()
         if self.config.spec_is_block_draft:
             # Reclaim draft context slots held by warmup-only sequences.
             self.spec_ctx_pending.clear()
@@ -521,7 +539,7 @@ class ModelRunner:
     def allocate_kv_cache(self):
         config = self.config
         tc = config.model_config
-        num_attn_layers = tc.num_hidden_layers
+        num_attn_layers = getattr(self.model.model, "num_attention_layers", tc.num_hidden_layers)
         num_kv_heads = tc.num_key_value_heads // self.world_size
         head_dim = getattr(tc, "head_dim", tc.hidden_size // tc.num_attention_heads)
         block_bytes = 2 * num_attn_layers * self.block_size * num_kv_heads * head_dim * self.dtype.itemsize
@@ -629,7 +647,13 @@ class ModelRunner:
             attn.v_cache = self.draft_kv_cache[1, 0]
 
     def drop_spec_state(self, seq_id: int):
-        self.spec_runtime.drop_state(seq_id)
+        self.drop_seq_state(seq_id)
+
+    def drop_seq_state(self, seq_id: int):
+        if self.state_runtime:
+            self.state_runtime.drop(seq_id)
+        if self.spec_runtime:
+            self.spec_runtime.drop_state(seq_id)
 
     def _graph_pad_block(self) -> int:
         return self.backend.graph_pad_block(self.config.num_kvcache_blocks)
@@ -730,7 +754,7 @@ class ModelRunner:
             pin_memory=True,
         ).to(self.device, non_blocking=True)
         host_seq_lens_q = torch.tensor(
-            [seq.num_scheduled_tokens for seq in seqs], dtype=torch.int32)
+            [seq.num_scheduled_tokens for seq in seqs], dtype=torch.int32, device="cpu")
         set_context(
             True,
             cu_seqlens_q=cu_seqlens_q,
@@ -748,6 +772,8 @@ class ModelRunner:
             prefix_reused_tokens=prefix_reused_tokens,
             prefix_recomputed=prefix_recomputed,
         )
+        if self.state_runtime:
+            self.state_runtime.bind_prefill(get_context(), seqs)
         return input_ids, positions
 
     def _record_prefill_cache_state(self, seqs: list[Sequence]):
@@ -780,6 +806,8 @@ class ModelRunner:
 
     def prepare_decode(self, seqs: list[Sequence]):
         n = len(seqs)
+        if self.state_runtime:
+            self.state_runtime.prepare_decode(seqs)
         block_size = self.block_size
         blob = self._dblob
         ids_v = blob.view_i64('ids')
@@ -824,6 +852,8 @@ class ModelRunner:
                                 max_context_len=self.config.max_model_len,
                                 use_cuda_graph=True,
                                 block_size=self.block_size)
+                    if self.state_runtime:
+                        self.state_runtime.bind_decode(get_context(), bucket)
                 return gv['input_ids'][:n], gv['positions'][:n]
         with torch.inference_mode():
             slot_dtype = self.backend.graph_slot_mapping_dtype()
@@ -842,6 +872,8 @@ class ModelRunner:
                     cu_seqlens_k=cu_seqlens_k,
                     max_context_len=self.config.max_model_len,
                     block_size=self.block_size)
+        if self.state_runtime:
+            self.state_runtime.bind_decode(get_context(), n)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence], is_prefill: bool = False):
@@ -891,7 +923,11 @@ class ModelRunner:
             return self.model.compute_logits(self.model(input_ids, positions)), False
 
         self._dblob.h2d()
-        self.graphs[graph_bs].replay()
+        greedy = self._decode_batch_greedy and graph_bs in self.decode_greedy_graphs
+        graphs = self.decode_greedy_graphs if greedy else self.graphs
+        graphs[graph_bs].replay()
+        if greedy:
+            self.decode_graph_stats["greedy_replays"] += 1
         self.decode_graph_stats["replay"] += 1
         bucket_hits = self.decode_graph_stats["bucket_hits"]
         bucket_hits[graph_bs] = bucket_hits.get(graph_bs, 0) + 1
@@ -900,6 +936,7 @@ class ModelRunner:
         return self.model.compute_logits(gv["outputs"][:bs]), False
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        self._decode_batch_greedy = all(seq.temperature <= 1e-10 for seq in seqs)
         if not is_prefill and self.graph_runner is not None:
             graph_result = self.graph_runner.try_run(seqs)
             if graph_result is not None:
@@ -909,7 +946,7 @@ class ModelRunner:
                         token_ids = result.tolist()
                     else:
                         sample = self.prepare_sample(seqs, False)
-                        token_ids = self.sampler(result, *sample).tolist()
+                        token_ids = self._sample(result, seqs, sample).tolist()
                 else:
                     token_ids = None
                 reset_context()
@@ -921,11 +958,19 @@ class ModelRunner:
             self._record_prefill_cache_state(seqs)
         if self.rank == 0:
             token_ids = (result.tolist() if sampled
-                         else self.sampler(result, *sample).tolist())
+                         else self._sample(result, seqs, sample).tolist())
         else:
             token_ids = None
         reset_context()
         return token_ids
+
+    def _sample(self, logits, seqs, prepared=None):
+        """由 host 请求参数决定纯 greedy；混合/随机请求保留完整采样语义。"""
+        if all(seq.temperature <= 1e-10 for seq in seqs):
+            return logits.argmax(dim=-1)
+        if prepared is None:
+            prepared = self.prepare_sample(seqs)
+        return self.sampler(logits, *prepared)
 
     @torch.inference_mode()
     def run_prefill_spec(self, seqs: list[Sequence]) -> list[int]:
@@ -938,7 +983,7 @@ class ModelRunner:
         hidden, aux = self.model(input_ids, positions)
         logits = self.model.compute_logits(hidden)
         sample = self.prepare_sample(seqs)
-        token_ids = self.sampler(logits, *sample).tolist()
+        token_ids = self._sample(logits, seqs, sample).tolist()
         offsets = list(accumulate([0] + [seq.num_scheduled_tokens for seq in seqs]))
         seed = self.draft_model.project_aux(aux)
         shifted = []
@@ -963,11 +1008,16 @@ class ModelRunner:
 
     @torch.inference_mode()
     def spec_round(self, seqs: list[Sequence]) -> list[list[int]]:
+        self._spec_batch_greedy = all(seq.temperature <= 1e-10 for seq in seqs)
         sampling_compatible = (
             self.graph_sample
-            or all(seq.temperature <= 1e-10 for seq in seqs)
+            or self._spec_batch_greedy
         )
         result = self.spec_runtime.round(seqs, sampling_compatible)
+        self._record_spec_acceptance(result)
+        return result
+
+    def _record_spec_acceptance(self, result):
         stats = self.spec_accept_stats
         for tokens in result:
             accepted = len(tokens) - 1
@@ -976,10 +1026,23 @@ class ModelRunner:
             stats["accepted"] += accepted
             for position in range(accepted):
                 stats["positions"][position] += 1
-        return result
 
     def _bucket_for_spec(self, batch_size):
         return _bucket(self.spec_graph_bs, batch_size)
+
+    @torch.inference_mode()
+    def context_limited_spec_round(self, seqs):
+        # 固定宽度 verify 不应越过窗口；剩余不足一整轮时只消费当前 anchor。
+        ids, positions = self.prepare_decode(seqs)
+        hidden, _ = self.model(ids, positions)
+        logits = self.model.compute_logits(hidden)
+        tokens = self._sample(logits, seqs).tolist()
+        result = [[token] for token in tokens]
+        self._record_spec_acceptance(result)
+        self.spec_graph_stats["eager_rounds"] += 1
+        self.spec_graph_stats["context_limited_rounds"] += 1
+        reset_context()
+        return result
 
     def _fill_spec_meta(self, seqs: list[Sequence]) -> int:
         k = self.config.spec_num_tokens
@@ -1208,7 +1271,7 @@ class ModelRunner:
         input_ids, positions = self.prepare_prefill(seqs)
         hidden, aux = self.model(input_ids, positions)
         logits = self.model.compute_logits(hidden)
-        token_ids = self.sampler(logits, *self.prepare_sample(seqs)).tolist()
+        token_ids = self._sample(logits, seqs).tolist()
         self._record_prefill_cache_state(seqs)
         reset_context()
         offsets = list(accumulate([0] + [seq.num_scheduled_tokens for seq in seqs]))
@@ -1258,6 +1321,8 @@ class ModelRunner:
             self.spec_ctx_pending[seq.seq_id] = self._sg['v_aux'][
                 i * rows:i * rows + count].clone()
             seq.num_scheduled_tokens = 0
+        if self.state_runtime and not self.state_runtime.device_commit:
+            self.state_runtime.commit_verify(seqs, [len(tokens) for tokens in results])
         return results
 
     @torch.inference_mode()
@@ -1289,6 +1354,8 @@ class ModelRunner:
         )
 
     def _fill_df_meta(self, seqs: list[Sequence]):
+        if self.state_runtime:
+            self.state_runtime.prepare_verify(seqs)
         blob = self._sblob
         l1 = blob.view_i64('df_l1')
         c = blob.view_i64('df_c')
@@ -1392,10 +1459,13 @@ class ModelRunner:
         v[:, 1:].copy_(g['drafted_ids'][:k, :bs].t())
         self._sg_verify(bs, use_cuda_graph)
         self._sg_acceptance(bs)
+        if self.state_runtime:
+            self.state_runtime.commit_verify_device(g['commit_buf'], bs)
 
     def _capture_spec_graphs(self, prepare, body, label):
         self.spec_graph_bs = _graph_buckets(self._graph_max_bs)
         self.spec_graphs = {}
+        self.spec_greedy_graphs = {}
         try:
             prepare()
             self._sblob.h2d()
@@ -1416,6 +1486,30 @@ class ModelRunner:
                 graph.replay()
                 self.backend.synchronize()
                 self.spec_graph_stats["capture_success"] += 1
+            # 保留原随机采样图；另捕获纯 argmax 图，不在 replay 中读取设备标量。
+            if (self.graph_sample and self.backend.supports_greedy_graph_variants
+                    and os.getenv("FLASHENGINE_SPEC_GREEDY_GRAPH", "1") != "0"):
+                for bs in reversed(self.spec_graph_bs):
+                    try:
+                        self._spec_capture_greedy = True
+                        for _ in range(self.backend.graph_warmup_iters()):
+                            body(bs)
+                            reset_context()
+                            self.backend.synchronize()
+                        graph = self.backend.new_graph()
+                        with self.backend.graph_ctx(graph, pool=self.spec_graph_pool):
+                            body(bs)
+                        reset_context()
+                        graph.replay()
+                        self.backend.synchronize()
+                        self.spec_greedy_graphs[bs] = graph
+                        self.spec_graph_stats["greedy_capture_success"] += 1
+                    except Exception as exc:
+                        print(f"[FlashEngine] Greedy spec graph bucket {bs} unavailable; "
+                              f"using sampling graph: {type(exc).__name__}: {exc}", flush=True)
+                        reset_context()
+                    finally:
+                        self._spec_capture_greedy = False
         except Exception as e:
             print(f"[FlashEngine] {label} graph capture failed; falling back to "
                   f"eager speculative rounds: {type(e).__name__}: {e}", flush=True)
@@ -1427,6 +1521,7 @@ class ModelRunner:
             except Exception:
                 pass
             self.spec_graphs = None
+            self.spec_greedy_graphs.clear()
             self.spec_graph_pool = None
             try:
                 self.backend.empty_cache()
@@ -1439,7 +1534,7 @@ class ModelRunner:
             M, W = self._pin_M, self._pin_W
             rows = self.config.spec_num_tokens + 1
             blob = self._sblob
-            pad_block = self._graph_pad_block()
+            pad_block = self.backend.graph_capture_block(self.config.num_kvcache_blocks)
             pad_base = pad_block * self.block_size
             pad_slots = torch.arange(
                 pad_base, pad_base + rows, dtype=torch.int64, device="cpu")
@@ -1452,7 +1547,10 @@ class ModelRunner:
             blob.view_i64('v_ctx_lens', (M, rows))[:] = pad_context_lens
             blob.view_i64('v_btables_exp', (M, rows, W)).fill_(pad_block)
             blob.view_i64('df_ctx_pos', (M, rows))[:] = pad_positions
-            blob.view_i64('df_ctx_phys_slots', (M, rows))[:] = pad_slots
+            if self.dflash_paged:
+                blob.view_i64('df_ctx_phys_slots', (M, rows))[:] = pad_slots
+            else:
+                blob.view_i64('df_ctx_phys_slots', (M, rows)).fill_(self._df_pad_ctx_slot)
             blob.view_i64('df_total_lens').fill_(self._df_query_rows())
         self._capture_spec_graphs(prepare, self._df_round_body,
                                   "Block-draft speculative")
@@ -1469,15 +1567,19 @@ class ModelRunner:
         slots = blob.view_i64('v_slots', (M, rows))
         contexts = blob.view_i64('v_ctx_lens', (M, rows))
         if block_draft:
-            pad_slots = torch.arange(pad_block * self.block_size,
-                                     pad_block * self.block_size + rows,
-                                     dtype=torch.int64, device="cpu")
+            pad_slots = (torch.arange(pad_block * self.block_size,
+                                      pad_block * self.block_size + rows,
+                                      dtype=torch.int64, device="cpu")
+                         if pad_block >= 0 else torch.full((rows,), -1, dtype=torch.int64, device="cpu"))
             positions = torch.arange(rows, dtype=torch.int64, device="cpu")
             slots[n:] = pad_slots
             contexts[n:] = positions + 1
             blob.view_i64('v_pos', (M, rows))[n:] = positions
             blob.view_i64('df_ctx_pos', (M, rows))[n:] = positions
-            blob.view_i64('df_ctx_phys_slots', (M, rows))[n:] = pad_slots
+            if self.dflash_paged:
+                blob.view_i64('df_ctx_phys_slots', (M, rows))[n:] = pad_slots
+            else:
+                blob.view_i64('df_ctx_phys_slots', (M, rows))[n:].fill_(self._df_pad_ctx_slot)
             blob.view_i64('df_l1')[n:].zero_()
             blob.view_i64('df_c')[n:].zero_()
             blob.view_i64('df_ctxslot')[n:].fill_(self._df_pad_ctx_slot)
@@ -1493,7 +1595,11 @@ class ModelRunner:
     def _replay_spec_graph(self, bucket: int):
         self._spec_graph_active = bucket
         self._push_spec_meta()
-        self.spec_graphs[bucket].replay()
+        greedy = self._spec_batch_greedy and bucket in self.spec_greedy_graphs
+        graphs = self.spec_greedy_graphs if greedy else self.spec_graphs
+        graphs[bucket].replay()
+        if greedy:
+            self.spec_graph_stats["greedy_replays"] += 1
         self.spec_graph_stats["replay"] += 1
         hits = self.spec_graph_stats["bucket_hits"]
         hits[bucket] = hits.get(bucket, 0) + 1
@@ -1552,7 +1658,8 @@ class ModelRunner:
         )
 
     def _sg_sample(self, logits, temps, topps, topks, use_cuda_graph: bool):
-        if use_cuda_graph and not self.graph_sample:
+        if ((use_cuda_graph and (self._spec_capture_greedy or not self.graph_sample))
+                or (not use_cuda_graph and self._spec_batch_greedy)):
             return logits.argmax(dim=-1)
         return self.sampler.forward_native(logits, temps, topps, topks)
 
@@ -1626,6 +1733,8 @@ class ModelRunner:
                     context_lens=g['v_ctx_lens'][:bs * rows],
                     block_tables=self._verify_block_tables(g, bs, rows),
                     block_size=self.block_size)
+        if self.state_runtime:
+            self.state_runtime.bind_verify(get_context(), bs)
         hidden, aux = self.model(g['v_input_ids'][:bs * rows], g['v_positions'][:bs * rows])
         logits = self.backend.linear(
             hidden, getattr(self.model.lm_head, "weight_nz", self.model.lm_head.weight))
@@ -1734,6 +1843,8 @@ class ModelRunner:
     @torch.inference_mode()
     def capture_cudagraph(self):
         try:
+            if self.state_runtime:
+                self.state_runtime.prepare_capture()
             config = self.config
             tc = config.model_config
             max_bs = self._graph_max_bs
@@ -1817,6 +1928,8 @@ class ModelRunner:
                     use_cuda_graph=True,
                     block_size=self.block_size,
                 )
+                if self.state_runtime:
+                    self.state_runtime.bind_decode(get_context(), bs)
                 scatter(bs)
                 for _ in range(self.backend.graph_warmup_iters()):
                     hidden = self.model(input_ids[:bs], positions[:bs])    # warmup
@@ -1830,9 +1943,24 @@ class ModelRunner:
                     if self.graph_sample:
                         token_ids[:bs] = self.sampler(
                             self.model.compute_logits(hidden), temperatures[:bs], top_ps[:bs], top_ks[:bs])
+                    else:
+                        outputs[:bs].copy_(hidden)
                 if self.graph_pool is None:
                     self.graph_pool = self.backend.graph_pool(graph)
                 self.graphs[bs] = graph
+                if (self.graph_sample and self.backend.supports_greedy_graph_variants
+                        and os.getenv("FLASHENGINE_DECODE_GREEDY_GRAPH", "1") != "0"):
+                    try:
+                        greedy_graph = self.backend.new_graph()
+                        with self.backend.graph_ctx(greedy_graph, pool=self.graph_pool):
+                            scatter(bs)
+                            greedy_hidden = self.model(input_ids[:bs], positions[:bs])
+                            token_ids[:bs].copy_(self.model.compute_logits(greedy_hidden).argmax(dim=-1))
+                        self.backend.synchronize()
+                        self.decode_greedy_graphs[bs] = greedy_graph
+                    except Exception as exc:
+                        print(f"[FlashEngine] Greedy decode graph bucket {bs} unavailable; "
+                              f"using sampling graph: {type(exc).__name__}: {exc}", flush=True)
                 self.backend.synchronize()
                 reset_context()
 
@@ -1860,5 +1988,6 @@ class ModelRunner:
             reset_context()
             self.backend.synchronize()
             self.graphs = None
+            self.decode_greedy_graphs.clear()
             self.graph_pool = None
             self.backend.empty_cache()

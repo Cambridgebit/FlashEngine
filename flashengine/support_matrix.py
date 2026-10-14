@@ -4,7 +4,7 @@
 - 运行时：`Config` 在解析完 target_adapter / backend / 量化 / spec_adapter 后调用
   `require_supported(...)`，不支持组合在此干净拒绝（NotImplementedError）。
 - 文档：`format_matrix()` 枚举全部组合，`docs/SUPPORT_MATRIX.md` 与本模块保持一致。
-- 测试：`tests/test_support_matrix.py` 交叉校验本表与已注册 adapter 的能力位。
+- 测试：交叉校验本表与已注册 adapter 能力位的套件未随 main 保留（原 `tests/test_support_matrix.py`）。
 
 注意：本表是「声明支持」；运行时能力（310P 缺 SplitFuse、图捕获失败、草稿缺 aux 层等）
 可能进一步收紧并优雅降级，见各 backend 的 normalize_config/validate_config 与捕获回退。
@@ -15,13 +15,14 @@
   Qwen3  MoE     cuda/corex/310P ❌ cuda/corex/310P ❌  仅 310P
   后端：cuda / corex / ascend310p（MoE = 三后端；W8A8 仅 ascend310p）
   另加 Quark W8A8 int8 检查点（cuda/corex：加载期权重反量化，见 quant=quark_w8a8）
+  Qwen3.5 dense/MoE 文本：三后端普通/DFlash，当前 fp16/bf16、TP=1。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-TARGETS = ("qwen3", "qwen3_moe")
+TARGETS = ("qwen3", "qwen3_moe", "qwen3_5", "qwen3_5_moe")
 BACKENDS = ("cuda", "corex", "ascend310p")
 QUANTIZATIONS = ("none", "w8a8", "quark_w8a8")
 SPEC_METHODS = ("none", "eagle3", "dflash", "dspark")
@@ -38,6 +39,8 @@ _QUARK_W8A8_BACKENDS = frozenset({"cuda", "corex"})
 _TARGET_SPEC_METHODS = {
     "qwen3": frozenset({"none", "eagle3", "dflash", "dspark"}),
     "qwen3_moe": frozenset({"none", "dflash"}),
+    "qwen3_5": frozenset({"none", "dflash"}),
+    "qwen3_5_moe": frozenset({"none", "dflash"}),
 }
 
 
@@ -80,10 +83,12 @@ def evaluate(
         backend in _QUARK_W8A8_BACKENDS
         if backend_supports_quark_w8a8 is None else backend_supports_quark_w8a8
     )
-    if target == "qwen3_moe" and not supports_moe:
+    if target in ("qwen3_moe", "qwen3_5_moe") and not supports_moe:
         return SupportDecision(
-            False, f"qwen3_moe 需要支持 MoE 的后端（当前 {backend}）"
+            False, f"{target} 需要支持 MoE 的后端（当前 {backend}）"
         )
+    if target in ("qwen3_5", "qwen3_5_moe") and quantization != "none":
+        return SupportDecision(False, "Qwen3.5 当前只支持 fp16/bf16，尚未接入量化检查点")
     if quantization == "w8a8" and not supports_w8a8:
         return SupportDecision(
             False,

@@ -64,6 +64,7 @@ class DFlashBlockAttention(nn.Module):
         block_tables: torch.Tensor | None = None,
         context_lens: torch.Tensor | None = None,
         max_seq_len: int | None = None,
+        dense_context_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
         q = qkv[..., :self.q_size].view(n, rows, self.num_heads, self.head_dim)
@@ -96,6 +97,13 @@ class DFlashBlockAttention(nn.Module):
                 max_seq_len,
             )
             return self.o_proj(o.reshape(n * rows, self.q_size))
+        if (getattr(self.backend, "supports_dflash_dense_varlen", False)
+                and dense_context_lens is not None):
+            o = self.backend.dflash_dense_attention(
+                q.view(n, rows, self.num_heads, self.head_dim),
+                k.view(n, rows, self.num_kv_heads, self.head_dim), v,
+                k_ctx, v_ctx, dense_context_lens, self.scaling)
+            return self.o_proj(o.reshape(n * rows, self.q_size))
         q = q.view(n, rows, self.num_heads, self.head_dim).transpose(1, 2)      # [n, H, rows, hd]
         k = k.view(n, rows, self.num_kv_heads, self.head_dim).transpose(1, 2)   # [n, kvh, rows, hd]
         v = v.transpose(1, 2)
@@ -122,7 +130,7 @@ class DFlashDecoderLayer(nn.Module):
 
     def forward(self, hidden_states, residual, positions, n, rows, k_ctx, v_ctx, mask,
                 query_slots=None, block_tables=None, context_lens=None,
-                max_seq_len=None):
+                max_seq_len=None, dense_context_lens=None):
         if residual is None:
             hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
         else:
@@ -133,6 +141,7 @@ class DFlashDecoderLayer(nn.Module):
             block_tables=block_tables,
             context_lens=context_lens,
             max_seq_len=max_seq_len,
+            dense_context_lens=dense_context_lens,
         )
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
@@ -269,7 +278,7 @@ class DFlashDraftModel(nn.Module):
                                      query_slots=query_slots,
                                      block_tables=block_tables,
                                      context_lens=total_lens,
-                                     max_seq_len=max_ctx)
+                                     max_seq_len=max_ctx, dense_context_lens=ctx_lens)
         hidden, _ = self.norm(hidden, residual)
         h = hidden.view(n, rows, -1)
         h = (h if sample_from_anchor else h[:, 1:]).reshape(-1, h.size(-1))

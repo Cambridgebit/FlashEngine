@@ -199,3 +199,7 @@ cython_debug/
 
 # Windows 交替数据流残留（WSL 下表现为普通文件）
 *:Zone.Identifier
+
+# FlashInfer 实机回归工件
+/bench_results/flashinfer-check/
+/bench_results/qwen35-check/

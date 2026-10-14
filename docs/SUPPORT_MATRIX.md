@@ -15,6 +15,7 @@
 |---|---|---|---|
 | **Qwen3 dense** | ✅ cuda / corex / ascend310p | ✅ EAGLE3 / DFlash / DSpark（三后端） | ✅ W8A8，仅 ascend310p |
 | **Qwen3 MoE**（Qwen3-30B-A3B） | ✅ cuda / corex / ascend310p | ✅ DFlash（三后端） | ✅ W8A8，仅 ascend310p |
+| **Qwen3.5 dense / MoE 文本** | ✅ cuda / corex / ascend310p | ✅ DFlash（三后端） | ❌（当前 fp16/bf16） |
 
 > Qwen3 MoE 在 cuda/corex 上走纯 torch 专家前向（`BackendBase.fused_moe`：index_select +
 > bmm，形状静态、可被 CUDA Graph 捕获）；310P 覆盖为 npu grouped matmul（含 W8A8_DYNAMIC）。
@@ -49,6 +50,14 @@
 | qwen3_moe | cuda / corex | quark_w8a8 | none / dflash |
 | qwen3_moe | ascend310p | quark_w8a8 | ❌（Quark 仅 cuda/corex） |
 | qwen3_moe | cuda / corex / ascend310p | 任意 | ❌ eagle3 / dspark（无 MoE 草稿） |
+| qwen3_5 / qwen3_5_moe | cuda / corex / ascend310p | none | none / dflash |
+| qwen3_5 / qwen3_5_moe | cuda / corex / ascend310p | w8a8 / quark_w8a8 | ❌ |
+| qwen3_5 / qwen3_5_moe | cuda / corex / ascend310p | 任意 | ❌ eagle3 / dspark |
+
+Qwen3.5 当前 TP=1、仅文本，关闭 prefix cache（没有 GDN 块级状态快照），
+支持保留 conv/SSM 历史的分块 prefill。CUDA 的 FlashAttention 支持普通与 DFlash 整轮图；
+FlashInfer 当前 DFlash 仍走 eager。CoreX/310P 是共享实现和后端契约适配，未实机验收；
+图捕获失败按既有机制回退。详细验证记录见 [Qwen3.5](QWEN35.md)。
 
 ## 3. 规则（`support_matrix.evaluate`）
 
