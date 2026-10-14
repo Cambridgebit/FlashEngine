@@ -213,7 +213,7 @@ python3 -m scripts.benchmark /data/Qwen3-0.6B \
 - 只为 full_attention 层分配 KV；prefix cache 暂时关闭（没有 GDN 块级状态快照），分块 prefill 保留 conv/SSM 初始状态。DFlash aux 直接使用 0-based 层输出 `target_layer_ids`，不做 Qwen3 的 +1。
 - CUDA FlashAttention 支持普通 decode 图与 DFlash 整轮图；FlashInfer 普通图支持状态元数据，投机仍 eager。CoreX 采用共享 CUDA 兼容 Graph/GDN 路径与设备 RNG；310P 采用静态短卷积展开、fp16/NZ full attention、NPUGraph 状态绑定，head_dim=256 自动选 KV block=64。**310P 已实机首验（2026-10-14，Qwen3.5-4B + DFlash）**：E=4.705、spec 图 44/44 回放 0 回退、decode 27 tok/s、引擎就绪 28s；踩掉一个 310P 旧驱动坑——GDN 的 `nn.Conv1d` 默认初始化（kaiming uniform → `StatelessRandomUniformV2`）在 AICPU 上报错并污染流（507018 → 首个权重拷贝失败），已改为 CPU 建模块再搬默认设备（同 dspark 草稿模式）。CoreX 尚未实机验收。
 - 捕获窗口必须使用有效物理页，-1 只用于跳写 padding。稠密草稿 padding 槽是 `max_num_seqs`，不能用负物理 KV 槽当草稿槽。MetaBlob 的设备孪生显式指定后端设备，不能依赖初始化结束后已改为 CPU 的默认设备。
-- 实机入口：`python3 -m scripts.check_qwen35 TARGET --draft DRAFT`。8GB 卡建议 `max_model_len=512 / max_num_seqs=1`；并发测试用 `--seqs 4`，DFlash 小显存 padding 测试可用 `--spec-num-tokens 2`。实际验收结果和基准口径见 `docs/QWEN35.md`。
+- 实机入口：`python3 -m scripts.check_qwen35 TARGET --draft DRAFT`（桌面 CUDA 默认；310P 板卡加 `--backend ascend310p` 并只跑 `base_*/spec_*` 用例、走 transformers 5.16 隔离 venv，见环境钉）。8GB 卡建议 `max_model_len=512 / max_num_seqs=1`；并发测试用 `--seqs 4`，DFlash 小显存 padding 测试可用 `--spec-num-tokens 2`。实际验收结果和基准口径见 `docs/QWEN35.md`。**310P 实机（2026-10-14）**：check_qwen35 四用例（base/spec × eager/graph）严格一致 5/5；服务端一键入口 `/data2/run_qwen35_server.sh`（venv/离线开关/GEMM=0/模型路径全内置），HTTP 问答正常。
 
 ## 支持矩阵与 Qwen3 MoE + W8A8（三后端）
 
