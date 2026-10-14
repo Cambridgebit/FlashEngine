@@ -72,7 +72,7 @@ def engine_worker(args):
     batch_rows = []
     spec = args.case.startswith("spec") or args.case == "fi_spec"
     eager = args.case.endswith("eager") or args.case == "fi_spec"
-    with LLM(args.model, backend="cuda", spec_model=args.draft if spec else "", enforce_eager=eager,
+    with LLM(args.model, backend=args.backend, spec_model=args.draft if spec else "", enforce_eager=eager,
              max_num_seqs=args.seqs, max_model_len=512, max_num_batched_tokens=128,
              num_kvcache_blocks=args.kv_blocks, gpu_memory_utilization=0.9,
              spec_num_tokens=args.spec_num_tokens) as llm:
@@ -115,6 +115,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model", help="Qwen3.5 本地模型目录")
     parser.add_argument("--draft", required=True, help="匹配的 DFlash 本地目录")
+    parser.add_argument("--backend", default="cuda",
+                        choices=["auto", "cuda", "corex", "ascend310p"],
+                        help="推理后端（板上传 ascend310p；fi_* 用例仅 CUDA 支持）")
     parser.add_argument("--output", default="bench_results/qwen35-check", help="测试工件目录")
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--cases", default="hf,base_eager,base_graph,spec_eager,spec_graph,fi_graph,fi_spec")
@@ -137,7 +140,7 @@ def main():
         env = {**os.environ, "FLASHENGINE_CUDA_ATTENTION": "flashinfer" if case.startswith("fi_") else "flash_attn"}
         command = [sys.executable, "-m", "scripts.check_qwen35", args.model, "--draft", args.draft,
                    "--worker", "--case", case, "--output", str(output), "--max-tokens", str(args.max_tokens),
-                   "--seqs", str(args.seqs)]
+                   "--seqs", str(args.seqs), "--backend", args.backend]
         command.extend(["--kv-blocks", str(args.kv_blocks), "--spec-num-tokens", str(args.spec_num_tokens)])
         if args.boundary:
             command.append("--boundary")
