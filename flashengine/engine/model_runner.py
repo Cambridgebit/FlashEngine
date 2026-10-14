@@ -388,6 +388,9 @@ class ModelRunner:
         self.spec_accept_stats["positions"] = [0] * self.config.spec_num_tokens
         for key in self.df_prefix_snapshot_stats:
             self.df_prefix_snapshot_stats[key] = 0
+        if self.state_runtime:
+            for key in self.state_runtime.prefix_stats:
+                self.state_runtime.prefix_stats[key] = 0
 
     def runtime_snapshot(self) -> dict:
         source = (self.spec_graph_stats if self.spec_enabled else
@@ -442,6 +445,8 @@ class ModelRunner:
         details = self.spec_runtime.startup_details() if self.spec_runtime else []
         if self.state_runtime:
             details.append(("Recurrent state", f"{self.state_runtime.slot_count} slots / {self.state_runtime.bytes / 2**20:.1f} MiB"))
+            if self.config.enable_prefix_cache:
+                details.append(("Recurrent prefix state", f"bounded CPU snapshots ({self.state_runtime.prefix_limit / 2**20:.0f} MiB)"))
         return details
 
     def exit(self):
@@ -955,6 +960,8 @@ class ModelRunner:
         sample = self.prepare_sample(seqs, is_prefill) if self.rank == 0 else None
         result, sampled = self.run_model(input_ids, positions, is_prefill)
         if is_prefill:
+            if self.state_runtime:
+                self.state_runtime.finish_prefill()
             self._record_prefill_cache_state(seqs)
         if self.rank == 0:
             token_ids = (result.tolist() if sampled
@@ -1220,12 +1227,13 @@ class ModelRunner:
         if self.dflash_paged or not self.config.enable_prefix_cache:
             return
         for seq in seqs:
-            if (not seq.block_table or seq.seq_id not in self.draft_ctx_slots
-                    or seq.num_cached_tokens + seq.num_scheduled_tokens != seq.num_tokens):
+            if not seq.block_table or seq.seq_id not in self.draft_ctx_slots:
                 continue
             slot = self.draft_ctx_slots[seq.seq_id]
             block_hash = -1
-            for i in range(seq.num_prompt_tokens // self.block_size):
+            # 分块 prefill 只保存已经投影的完整块，不能缓存尚未写入的草稿 KV。
+            computed = seq.num_cached_tokens + seq.num_scheduled_tokens
+            for i in range(computed // self.block_size):
                 block_hash = BlockManager.compute_hash(seq.block(i), block_hash)
                 block_id = seq.block_table[i]
                 if self.has_dflash_prefix_snapshot(block_id, block_hash):
@@ -1270,6 +1278,8 @@ class ModelRunner:
         assert self.rank == 0
         input_ids, positions = self.prepare_prefill(seqs)
         hidden, aux = self.model(input_ids, positions)
+        if self.state_runtime:
+            self.state_runtime.finish_prefill()
         logits = self.model.compute_logits(hidden)
         token_ids = self._sample(logits, seqs).tolist()
         self._record_prefill_cache_state(seqs)

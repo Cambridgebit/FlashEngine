@@ -289,6 +289,11 @@ def _metrics_values():
         }
         for key, value in runtime["prefill"].items():
             values[f"flashengine_prefill_{key}_total"] = value
+        if runtime.get("recurrent"):
+            state_prefix = runtime["recurrent"]["prefix_cache"]
+            for key in ("saved", "restored", "evicted"):
+                values[f"flashengine_recurrent_prefix_{key}_total"] = state_prefix[key]
+            values["flashengine_recurrent_prefix_snapshot_bytes"] = state_prefix["bytes"]
         draft_prefix = runtime["draft_prefix"]
         values["flashengine_draft_prefix_snapshots_saved_total"] = draft_prefix["saved"]
         values["flashengine_draft_prefix_snapshots_restored_total"] = draft_prefix["restored"]
@@ -1285,6 +1290,9 @@ def main():
     parser.add_argument("--disable-chunked-prefill", action="store_true")
     parser.add_argument("--max-num-partial-prefills", type=int, default=1)
     parser.add_argument("--block-size", type=int, default=None)
+    parser.add_argument("--no-prefix-cache", action="store_true", help="关闭前缀 KV 与状态复用")
+    parser.add_argument("--recurrent-prefix-cache-mb", type=int, default=256,
+                        help="recurrent 前缀状态的主机内存上限，默认 256 MiB；0 关闭")
     parser.add_argument("--spec-model", default="")
     parser.add_argument("--spec-num-tokens", type=int, default=3)
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -1332,6 +1340,8 @@ def main():
         spec_model=args.spec_model,
         spec_num_tokens=args.spec_num_tokens,
         gpu_memory_utilization=args.gpu_mem_util,
+        enable_prefix_cache=not args.no_prefix_cache,
+        recurrent_prefix_cache_bytes=args.recurrent_prefix_cache_mb * 1024 * 1024,
     )
     if args.max_num_seqs is not None:
         kwargs["max_num_seqs"] = args.max_num_seqs

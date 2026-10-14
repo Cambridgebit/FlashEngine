@@ -20,8 +20,9 @@
   完成、抢占、取消、预热收尾均释放槽映射。
 - DFlash aux 为 `target_layer_ids` 指定的 0-based 层输出，不采用 Qwen3 的 +1。
   MoE 添加门控共享专家，路由专家复用原三后端 `fused_moe`。
-- prefix cache 暂时关闭：分页 KV 哈希不能单独恢复 GDN 状态。
-  未实现 GDN 块级状态快照前，不能只复用 full_attention KV。
+- prefix cache 默认开启：完整块边界保存 conv/SSM 主机快照，命中后恢复末块状态。
+  DFlash 同时恢复草稿上下文 KV；任何必要状态缺失都会缩短命中或重算。
+  快照预算、生命周期、实机回归见 [Qwen3.5 前缀缓存](QWEN35_PREFIX_CACHE.md)。
 - 接近上下文上限、剩余空间不足一整轮时走单 token target fallback，
   避免固定宽度 verify 越界访问 KV。计数为 `context_limited_rounds`。
 

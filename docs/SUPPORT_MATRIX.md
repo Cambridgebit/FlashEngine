@@ -54,8 +54,9 @@
 | qwen3_5 / qwen3_5_moe | cuda / corex / ascend310p | w8a8 / quark_w8a8 | ❌ |
 | qwen3_5 / qwen3_5_moe | cuda / corex / ascend310p | 任意 | ❌ eagle3 / dspark |
 
-Qwen3.5 当前 TP=1、仅文本，关闭 prefix cache（没有 GDN 块级状态快照），
-支持保留 conv/SSM 历史的分块 prefill。CUDA 的 FlashAttention 支持普通与 DFlash 整轮图；
+Qwen3.5 当前 TP=1、仅文本，支持完整块 KV + conv/SSM 快照的 prefix cache，
+以及保留 conv/SSM 历史的分块 prefill；DFlash 另恢复草稿 KV。
+CUDA 的 FlashAttention 支持普通与 DFlash 整轮图；
 FlashInfer 当前 DFlash 仍走 eager。CoreX/310P 是共享实现和后端契约适配，未实机验收；
 图捕获失败按既有机制回退。详细验证记录见 [Qwen3.5](QWEN35.md)。
 

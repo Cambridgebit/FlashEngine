@@ -29,6 +29,7 @@ class Config:
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
     enable_prefix_cache: bool = True
+    recurrent_prefix_cache_bytes: int = 256 * 1024 * 1024
     spec_model: str = ""
     spec_num_tokens: int = 4
     spec_aux_layers: tuple[int, ...] = ()
@@ -72,6 +73,8 @@ class Config:
             raise ValueError("max_num_seqs must be positive")
         if self.max_num_partial_prefills < 1:
             raise ValueError("max_num_partial_prefills must be positive")
+        if self.recurrent_prefix_cache_bytes < 0:
+            raise ValueError("recurrent_prefix_cache_bytes must be non-negative")
         if not 1 <= self.tensor_parallel_size <= 8:
             raise ValueError("tensor_parallel_size must be in [1, 8]")
 
@@ -81,8 +84,8 @@ class Config:
         if self.target_adapter.recurrent_state:
             if self.tensor_parallel_size != 1:
                 raise NotImplementedError("带 recurrent 状态的目标模型当前要求 TP=1")
-            if self.enable_prefix_cache:
-                print("[FlashEngine] Recurrent 模型关闭 prefix cache：尚无块级状态快照。", flush=True)
+            if self.enable_prefix_cache and not self.recurrent_prefix_cache_bytes:
+                print("[FlashEngine] Recurrent 前缀快照预算为 0，关闭 prefix cache。", flush=True)
                 self.enable_prefix_cache = False
             self.max_num_batched_tokens = min(self.max_num_batched_tokens, self.max_model_len)
         self.max_model_len = min(

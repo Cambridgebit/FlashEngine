@@ -32,6 +32,8 @@ class BlockManager:
         # beyond. The final prompt block must never become a reusable prefix.
         self.keep_last_block_unhashed = keep_last_block_unhashed
         self.cache_hit_validator = None
+        # recurrent 只需恢复命中末块的状态；中间状态可被独立淘汰。
+        self.prefix_state_validator = None
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
@@ -73,6 +75,7 @@ class BlockManager:
         h = -1
         num_cached_blocks = 0
         num_new_blocks = seq.num_blocks
+        candidates = []
         for i in range(seq.num_blocks - 1):
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
@@ -82,8 +85,15 @@ class BlockManager:
             if self.cache_hit_validator is not None and not self.cache_hit_validator(block_id, h):
                 break
             num_cached_blocks += 1
+            candidates.append((block_id, h))
             if block_id in self.used_block_ids:
                 num_new_blocks -= 1
+        if self.prefix_state_validator is not None:
+            while candidates and not self.prefix_state_validator(*candidates[-1]):
+                block_id, _ = candidates.pop()
+                num_cached_blocks -= 1
+                if block_id in self.used_block_ids:
+                    num_new_blocks += 1
         if len(self.free_block_ids) < num_new_blocks:
             return -1
         return num_cached_blocks

@@ -43,6 +43,7 @@ class CUDABackend(BackendBase):
     supports_spec_graph = True
     supports_device_sampling_rng = True
     supports_greedy_graph_variants = True
+    supports_async_prefix_snapshots = True
     supports_moe = True  # 专家前向用 BackendBase 的纯 torch 实现（可被 CUDA Graph 捕获）。
     supports_int8_dequant = True  # Quark int8 检查点加载期反量化（无 int8 算子）。
 

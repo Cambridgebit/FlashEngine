@@ -52,6 +52,10 @@ class LLMEngine:
         self.scheduler.block_manager.cache_hit_validator = (
             self.model_runner.prefix_cache_validator()
         )
+        self.scheduler.block_manager.prefix_state_validator = (
+            self.model_runner.state_runtime.has_prefix
+            if self.model_runner.state_runtime else None
+        )
         self.scheduler.on_preempt = self._on_preempt_release
         runtime_warmup_t0 = perf_counter()
         self.generate(

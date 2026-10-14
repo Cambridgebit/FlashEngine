@@ -450,22 +450,37 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 k = k.repeat_interleave(self.gqa_ratio, dim=1)
 
             g, beta = _gdn_gating(a[s0:s1], b[s0:s1], self.A_log, self.dt_bias)
-            if getattr(self.backend, "supports_fused_gdn_prefill", False):
-                # 时间长度走运行时循环，避免每个 prompt 长度都编译一个递推内核。
+            fused = getattr(self.backend, "supports_fused_gdn_prefill", False)
+            if fused:
                 q = (_l2norm(q).float() * self.head_k_dim ** -0.5).contiguous()
                 k = _l2norm(k).float().contiguous()
-                core[s0:s1] = self.backend.gdn_recurrent(
-                    q, k, v.contiguous(), g, beta, self.ssm_cache, slots[i:i + 1],
-                    rows=seq_len, initial=has_initial[i:i + 1])
-                continue
-            init_state = self.ssm_cache[slot] if init_l[i] else None
-            o_i, final_state = chunk_gated_delta_rule(
-                q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0),
-                g.unsqueeze(0), beta.unsqueeze(0),
-                initial_state=init_state,
-            )
-            core[s0:s1] = o_i.to(core.dtype)
-            self.ssm_cache[slot] = final_state.to(self.ssm_cache.dtype)
+            checkpoints = (ctx.gdn_prefix_checkpoints[i]
+                           if ctx.gdn_prefix_checkpoints is not None else ())
+            # 只在完整块边界截取中间状态，不构造逐 token 的巨大状态轨迹。
+            ends = sorted(set((*checkpoints, seq_len)))
+            begin = 0
+            for end in ends:
+                initial = init_l[i] or begin > 0
+                if fused:
+                    flags = (has_initial[i:i + 1] if begin == 0
+                             else torch.ones_like(has_initial[i:i + 1]))
+                    o_i = self.backend.gdn_recurrent(
+                        q[begin:end], k[begin:end], v[begin:end].contiguous(),
+                        g[begin:end], beta[begin:end], self.ssm_cache, slots[i:i + 1],
+                        rows=end - begin, initial=flags)
+                else:
+                    o_i, final_state = chunk_gated_delta_rule(
+                        q[begin:end].unsqueeze(0), k[begin:end].unsqueeze(0),
+                        v[begin:end].unsqueeze(0), g[begin:end].unsqueeze(0),
+                        beta[begin:end].unsqueeze(0),
+                        initial_state=self.ssm_cache[slot] if initial else None)
+                    self.ssm_cache[slot] = final_state.to(self.ssm_cache.dtype)
+                core[s0 + begin:s0 + end] = o_i.to(core.dtype)
+                if end in checkpoints:
+                    ctx.gdn_prefix_capture(
+                        self.prefix_layer_index, i, end,
+                        x_ext[0, :, end:end + state_len], self.ssm_cache[slot])
+                begin = end
         return core
 
     def _forward_decode(

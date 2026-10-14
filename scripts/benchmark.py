@@ -60,6 +60,8 @@ def main():
     parser.add_argument("--num-prompts", type=int, default=10)
     parser.add_argument("--num-repeats", type=int, default=1)
     parser.add_argument("--no-prefix-cache", action="store_true")
+    parser.add_argument("--recurrent-prefix-cache-mb", type=int, default=256,
+                        help="recurrent 前缀状态的主机内存上限，默认 256 MiB；0 关闭")
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=TEMPERATURE)
     parser.add_argument("--top-p", type=float, default=1.0)
@@ -97,7 +99,8 @@ def main():
                   max_num_partial_prefills=args.max_num_partial_prefills,
                   kvcache_block_size=args.block_size,
                   gpu_memory_utilization=args.gpu_mem_util,
-                  enable_prefix_cache=not args.no_prefix_cache)
+                  enable_prefix_cache=not args.no_prefix_cache,
+                  recurrent_prefix_cache_bytes=args.recurrent_prefix_cache_mb * 1024 * 1024)
     if args.spec_model:
         kwargs.update(spec_model=args.spec_model, spec_num_tokens=args.spec_num_tokens)
     llm = LLM(args.model, **kwargs)
@@ -168,6 +171,8 @@ def main():
             runtime["draft_prefix"] if cfg.spec_is_block_draft else None
         )
         pstats = runtime["cache"]
+        recurrent_prefix_stats = (runtime["recurrent"]["prefix_cache"]
+                                  if runtime.get("recurrent") else None)
     finally:
         llm.close()
 
@@ -245,6 +250,12 @@ def main():
               f"restored={draft_prefix_stats['restored']}, "
               f"evicted={draft_prefix_stats['evicted']}, "
               f"host_memory={draft_prefix_stats['bytes'] / (1 << 20):.1f} MiB")
+    if recurrent_prefix_stats is not None:
+        print("Recurrent prefix snapshots = "
+              f"saved={recurrent_prefix_stats['saved']}, "
+              f"restored={recurrent_prefix_stats['restored']}, "
+              f"evicted={recurrent_prefix_stats['evicted']}, "
+              f"host_memory={recurrent_prefix_stats['bytes'] / (1 << 20):.1f} MiB")
     if spec_stats is not None and spec_stats["rounds"]:
         rounds = spec_stats["rounds"]
         accepted = spec_stats["committed"] - rounds   # Σ 每轮接受 draft 数（提交数 - bonus）

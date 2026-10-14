@@ -39,6 +39,7 @@ class BackendBase(ABC):
     supports_device_state_commit = False
     supports_greedy_graph_variants = False
     supports_dflash_dense_varlen = False
+    supports_async_prefix_snapshots = False
     spec_graph_try_default = True
 
     def normalize_config(self, config) -> None:

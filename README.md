@@ -101,6 +101,8 @@ KV cache 按固定大小的块分配，请求通过 block table 查找物理块�
 
 CUDA 默认每块 256 token，共享前缀至少覆盖一个完整块才会命中。Qwen3 + DFlash/DSpark 还需恢复草稿上下文：CUDA/CoreX 使用有界 CPU 快照；310P 使用与目标共索引的分页草稿 KV，并排除可能被草稿查询覆盖的末块。310P 的前缀复用依赖 SplitFuse 算子，缺失时自动关闭。用 `--num-repeats 2` 与 `--no-prefix-cache` 可做缓存对照。
 
+Qwen3.5 普通推理与 DFlash 默认支持前缀缓存，命中时还恢复完整块边界的 GDN conv/SSM 快照。主机快照默认预算 256 MiB，可用 `--recurrent-prefix-cache-mb` 调整；0 或 `--no-prefix-cache` 关闭。快照被淘汰时自动重算。实现与验证见 [Qwen3.5 前缀缓存](docs/QWEN35_PREFIX_CACHE.md)。
+
 ### Continuous batching 与 Chunked prefill
 
 连续批处理在每个调度步接纳新请求、移除已完成请求。分块预填充将长 prompt 拆成多个 token 预算内的计算块，避免一次长 prefill 持续占用执行器。调度器在有工作时交替选择 prefill 与 decode；每次模型执行仍为同类批次。

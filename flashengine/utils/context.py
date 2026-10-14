@@ -35,6 +35,8 @@ class Context:
     gdn_row_seg: int = 0
     gdn_host_slots: tuple[int, ...] | None = None
     gdn_host_initial: tuple[bool, ...] | None = None
+    gdn_prefix_checkpoints: tuple[tuple[int, ...], ...] | None = None
+    gdn_prefix_capture: object | None = None
 
 _CONTEXT = Context()
 
