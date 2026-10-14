@@ -306,13 +306,19 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
         # 深度可分离因果卷积：weight [conv_dim, 1, K]（本地分片），模块 forward 不用，
         # 前向经 F.conv1d(·, weight, groups=conv_dim)（与 transformers nn.Conv1d 同构）。
-        self.conv1d = nn.Conv1d(
-            self.conv_dim,
-            self.conv_dim,
-            kernel_size=self.conv_kernel_size,
-            groups=self.conv_dim,
-            bias=False,
-        )
+        # 310P 注意：nn.Conv1d 默认 reset_parameters（kaiming uniform）会以
+        # StatelessRandomUniformV2 走 AICPU，在 310P 旧驱动上直接报错（aicpu exception
+        # → 流污染 507018）；故先在 CPU 上建模块再搬到默认设备，权重随后由 checkpoint
+        # 覆盖（同 dspark 草稿的 CPU 建空权重模式）。
+        with torch.device("cpu"):
+            self.conv1d = nn.Conv1d(
+                self.conv_dim,
+                self.conv_dim,
+                kernel_size=self.conv_kernel_size,
+                groups=self.conv_dim,
+                bias=False,
+            )
+        self.conv1d = self.conv1d.to(torch.get_default_device())
         self.conv1d.weight.weight_loader = self._conv_weight_loader
 
         # 离散化参数（fp32，见类注释）；检查点 [total_v_heads]，TP 按头 narrow

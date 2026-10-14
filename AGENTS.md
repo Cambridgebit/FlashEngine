@@ -189,7 +189,7 @@ python3 -m scripts.benchmark /data/Qwen3-0.6B \
   `--eager` 为 eager decode；默认 enforce_eager=False 走 NPUGraph（对应旧仓 --mode aclgraph）。
   EAGLE3：`--spec-model DRAFT --no-think`。块草稿（DFlash/DSpark）：paged target verify + paged draft SplitFuse，整轮 NPUGraph 捕获失败自动降级 eager spec，分页形态靠 `keep_last_block_unhashed` 与前缀缓存共存（`FLASHENGINE_310P_DFLASH_PAGED=0` 可强制回稠密缓冲）。310P 分页 DFlash 路径已实机跑通（问题与修复清单见 `docs/ASCEND310P_GRAPH_SPEC.md` 第 11 节），DSpark 尚未在 310P 验收。**310P 首条 TPS/E 锚点（2026-10-14，Qwen3-30B-A3B + speculator.dflash，bench 串行 3 题 / mml1024 / ms1 / k=7 / no-think）**：E=3.164、稳态 decode 4.1 tok/s（未调优——运行时 GEMM=torch-fallback、flash=legacy，优化空间大）；其余口径对表仍按该文档 10.4 的 A/B 自测并补数。
 - **启动固定开销实测定位于优化（2026-10，板卡；排查口径见仓库历史会话）**：① 容器内缺 `/etc/hdcBasic.cfg` 时 `libascend_hal.so` 构造会以 1s×~117 轮询"设备上线"后超时放行 → **每个进程白等 ~100s**（`import torch` 118s→18s）。修复 = 容器内提供该文件（内容同宿主机：`TRANS_TYPE=0` SOCKET）；板卡容器已固化：容器 `restart=unless-stopped` + 宿主机 systemd 单元 `ascend-hdcbasic-fix.service` 开机幂等注入，重建容器建议 `-v /etc/hdcBasic.cfg:/etc/hdcBasic.cfg:ro` 或手动 `docker cp`。② DSpark/DFlash 草稿 `embed_tokens` 原走 `nn.Embedding` 默认随机初始化（ARM CPU 上 ~44s 且随后即被 checkpoint 覆盖）→ 已改为在目标设备建空权重（草稿加载 53s→4s）。③ vllm/vllm_ascend 的 GEMM 注册导入（~6s）移入后台线程（`FLASHENGINE_VLLM_GEMM=0` 可跳过）。④ 遗留：KV 池整池 `zero_()` 的首调用在部分运行环境有 13~29s"首次算子"开销（与张量大小无关、跨进程不复用，10-10 日志中仅 0.18s），未处理，需作者决定是否去零。
-- 环境钉：torch-npu==2.10.0.post4 / CANN 9.1.0 / 310p 专用镜像。
+- 环境钉：torch-npu==2.10.0.post4 / CANN 9.1.0 / 310p 专用镜像。**Qwen3.5 需 transformers≥5.16**（容器镜像自带 4.57.6 不认 `qwen3_5`）：板上做法 = 隔离 venv `/data2/fe-t5-venv`（`--system-site-packages` + `/data/offline/wheelhouse-aarch64-py310` 离线轮子——transformers 5.16.1 / tokenizers 0.23.1 / safetensors 0.8.0 / hub 1.29.0 / hf-xet / typer，纯 py 与 abi3 包对 py311 直接可用），不动容器共享环境；容器无外网，运行前必须设 `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1`（否则 hub 调用长时间阻塞），并设 `FLASHENGINE_VLLM_GEMM=0`（其后台导入线程曾在此容器触发全线程 futex 死锁；该容器 GEMM 本就回落 torch）。
 
 ## Qwen3.5 系列（已并入 main）
 
@@ -209,7 +209,7 @@ python3 -m scripts.benchmark /data/Qwen3-0.6B \
 - 门控全注意力采用 partial NeoX RoPE（2B 为 64/256）、Gemma RMSNorm（weight+1）和逐头输出门控；decode 输出先归形再乘 gate。MoE 复用三后端路由/专家前向并加入门控共享专家。
 - `engine/recurrent_state.py` 管理每请求主槽、每批 verify 行槽与专用 dummy 槽。验证后把行 `count-1` 的 conv/SSM 状态复制回请求主槽；bonus 尚未消费，留给下一轮。完成/抢占/取消均释放槽，预热假请求清空槽映射。
 - 只为 full_attention 层分配 KV；prefix cache 暂时关闭（没有 GDN 块级状态快照），分块 prefill 保留 conv/SSM 初始状态。DFlash aux 直接使用 0-based 层输出 `target_layer_ids`，不做 Qwen3 的 +1。
-- CUDA FlashAttention 支持普通 decode 图与 DFlash 整轮图；FlashInfer 普通图支持状态元数据，投机仍 eager。CoreX 采用共享 CUDA 兼容 Graph/GDN 路径与设备 RNG；310P 采用静态短卷积展开、fp16/NZ full attention、NPUGraph 状态绑定，head_dim=256 自动选 KV block=64。CoreX/310P 尚未实机验收。
+- CUDA FlashAttention 支持普通 decode 图与 DFlash 整轮图；FlashInfer 普通图支持状态元数据，投机仍 eager。CoreX 采用共享 CUDA 兼容 Graph/GDN 路径与设备 RNG；310P 采用静态短卷积展开、fp16/NZ full attention、NPUGraph 状态绑定，head_dim=256 自动选 KV block=64。**310P 已实机首验（2026-10-14，Qwen3.5-4B + DFlash）**：E=4.705、spec 图 44/44 回放 0 回退、decode 27 tok/s、引擎就绪 28s；踩掉一个 310P 旧驱动坑——GDN 的 `nn.Conv1d` 默认初始化（kaiming uniform → `StatelessRandomUniformV2`）在 AICPU 上报错并污染流（507018 → 首个权重拷贝失败），已改为 CPU 建模块再搬默认设备（同 dspark 草稿模式）。CoreX 尚未实机验收。
 - 捕获窗口必须使用有效物理页，-1 只用于跳写 padding。稠密草稿 padding 槽是 `max_num_seqs`，不能用负物理 KV 槽当草稿槽。MetaBlob 的设备孪生显式指定后端设备，不能依赖初始化结束后已改为 CPU 的默认设备。
 - 实机入口：`python3 -m scripts.check_qwen35 TARGET --draft DRAFT`。8GB 卡建议 `max_model_len=512 / max_num_seqs=1`；并发测试用 `--seqs 4`，DFlash 小显存 padding 测试可用 `--spec-num-tokens 2`。实际验收结果和基准口径见 `docs/QWEN35.md`。
 
