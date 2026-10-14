@@ -26,6 +26,9 @@ _ui_enabled = True
 _ui_html_path = None
 _ui_html_cache = None
 _ui_html_failed = False
+_raw_log_path = None                 # --raw-log：模型原始输出 JSONL 落盘路径
+_raw_log_fh = None
+_raw_log_lock = threading.Lock()
 
 
 def _webui_html():
@@ -60,6 +63,84 @@ def _log(tag, msg):
         if color:
             label = f"{color}{label}{_RESET}"
     print(f"{_ts()} {label} {msg}", flush=True)
+
+
+def _open_raw_log(path):
+    """打开模型原始输出日志（JSONL 追加写）。失败只告警，不影响服务。"""
+    global _raw_log_path, _raw_log_fh
+    if not path:
+        return
+    try:
+        fh = open(path, "a", encoding="utf-8", buffering=1)
+    except OSError as exc:
+        _log("WARN", f"raw output 日志不可用（{path}: {exc}），本次运行不记录原始输出")
+        return
+    _raw_log_path = path
+    _raw_log_fh = fh
+    _log("INFO", f"Raw output 日志: {path}（每请求一行 JSONL）")
+
+
+def _log_raw(st, output, ct, reason):
+    """把单次请求的模型原始输出与元信息追加到 --raw-log 指定的文件。"""
+    global _raw_log_fh
+    fh = _raw_log_fh
+    if fh is None:
+        return
+    now = st.t_done if st.t_done is not None else time.perf_counter()
+    prefill_ms = (st.t_first - st.t_started) * 1000 if (st.t_first and st.t_started) else 0.0
+    queue_ms = (st.t_started - st.t_add) * 1000 if st.t_started else 0.0
+    model_wall = now - st.t_started if st.t_started else now - st.t_add
+    e2e_ms = (now - st.t_http) * 1000
+    tpot_ms = ((now - st.t_first) / (ct - 1) * 1000
+               if st.t_first is not None and ct > 1 else 0.0)
+    record = {
+        "t": time.time(),
+        "ts": _ts(),
+        "rid": st.rid,
+        "endpoint": st.endpoint,
+        "model": _model_name,
+        "client": st.client,
+        "stream": bool(st.stream),
+        "temperature": st.temperature,
+        "top_p": st.top_p,
+        "top_k": st.top_k,
+        "thinking": st.thinking,
+        "prompt_tokens": st.prompt_tokens,
+        "completion_tokens": ct,
+        "finish": reason,
+        "execution_path": st.execution_path,
+        "e": round(st.spec_committed / st.spec_rounds, 3) if st.spec_rounds else None,
+        "ttft_ms": round(prefill_ms, 1),
+        "tpot_ms": round(tpot_ms, 2),
+        "tps": round(ct / model_wall, 2) if model_wall > 0 else 0.0,
+        "queue_ms": round(queue_ms, 1),
+        "e2e_ms": round(e2e_ms, 1),
+        "ctx_tokens": st.seq.num_tokens,
+        "max_model_len": _max_model_len,
+        "prefix_hit_blocks": st.seq.prefix_cache_hit_blocks,
+        # 模型完整生成文本（含思考段；仅剔除 eos 与已命中的 stop 串）
+        "output": output,
+    }
+    try:
+        line = json.dumps(record, ensure_ascii=False) + "\n"
+        with _raw_log_lock:
+            fh.write(line)
+    except (OSError, ValueError) as exc:
+        _raw_log_fh = None
+        _log("WARN", f"raw output 写失败（{_raw_log_path}: {exc}），后续不再记录")
+
+
+def _close_raw_log():
+    global _raw_log_fh
+    if _raw_log_fh is None:
+        return
+    with _raw_log_lock:
+        try:
+            _raw_log_fh.flush()
+            _raw_log_fh.close()
+        except OSError:
+            pass
+        _raw_log_fh = None
 
 
 class _CountingWriter:
@@ -381,7 +462,7 @@ def _log_request(st):
                 f"queue={wait_ms:.0f}ms | {st.preview}")
 
 
-def _log_done(st, ct, reason):
+def _log_done(st, ct, reason, output=""):
     now = st.t_done if st.t_done is not None else time.perf_counter()
     st.t_done = now
     prefill_ms = (st.t_first - st.t_started) * 1000 if (st.t_first and st.t_started) else 0.0
@@ -446,6 +527,7 @@ def _log_done(st, ct, reason):
                  f"prefix_recompute={'yes' if recomputed else 'no'} "
                  f"path={st.execution_path} finish={reason}"
                  + (f" preempt={preempts}" if preempts else ""))
+    _log_raw(st, output, ct, reason)
     if used_pct >= 95 or preempts:
         _log("WARN", f"{st.rid} 逼近上下文上限：ctx={used}/{_max_model_len}"
                      f"({used_pct:.0f}%) preempt={preempts} finish={reason}——"
@@ -1110,7 +1192,7 @@ class Handler(BaseHTTPRequestHandler):
             if not stream:
                 text, reason, ct = _run_llm(st, stop, None)
                 usage.update(completion_tokens=ct, total_tokens=st.prompt_tokens + ct)
-                _log_done(st, ct, reason)
+                _log_done(st, ct, reason, text)
                 self._json(_openai_body(req_id, model, mode, text, reason, usage))
                 return
 
@@ -1128,7 +1210,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.flush()
 
             text, reason, ct = _run_llm(st, stop, emit)
-            _log_done(st, ct, reason)
+            _log_done(st, ct, reason, text)
 
             done = json.dumps(_chunk(req_id, model, mode, "", reason),
                               ensure_ascii=False).encode("utf-8")
@@ -1212,6 +1294,10 @@ def main():
     parser.add_argument("--stats-interval", type=float, default=10.0)
     parser.add_argument("--no-ui", action="store_true")
     parser.add_argument(
+        "--raw-log", default=None, metavar="PATH",
+        help="把每次请求的模型原始输出（完整生成文本 + 元信息）以 JSONL 追加写入该文件；"
+             "默认关闭")
+    parser.add_argument(
         "--webui", default=None, metavar="HTML",
         help="Web 控制台 HTML 文件路径（默认 scripts/webui.html；"
              "内置可选 scripts/webui-aero.html）")
@@ -1232,6 +1318,7 @@ def main():
     TPS_INTERVAL = max(0.0, args.stats_interval)
     _ui_enabled = not args.no_ui
     _ui_html_path = args.webui or None
+    _open_raw_log(args.raw_log)
 
     kwargs = dict(
         model=args.model,
@@ -1309,6 +1396,7 @@ def main():
         engine_thread.join()
         if stats_thread is not None:
             stats_thread.join()
+        _close_raw_log()
         if engine is not None:
             engine.close()
             engine = None
