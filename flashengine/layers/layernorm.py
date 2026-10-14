@@ -49,6 +49,7 @@ class GemmaRMSNorm(nn.Module):
         # 零基初始化：checkpoint 保存的是 (weight) 增量，运行时 +1（transformers
         # Qwen3_5RMSNorm weight= zeros 同款）。
         self.weight = nn.Parameter(torch.zeros(hidden_size))
+        self.backend = get_backend()
 
     def _gemma_norm(self, x: torch.Tensor) -> torch.Tensor:
         # 逐行对表 transformers Qwen3_5RMSNorm.forward：
@@ -65,6 +66,8 @@ class GemmaRMSNorm(nn.Module):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if x.is_cuda and getattr(self.backend, "supports_fused_qwen35_norm", False):
+            return self.backend.qwen35_norm(x, self.weight, self.eps, residual=residual)
         if residual is None:
             return self._gemma_norm(x)
         # 融合加残差（模型 dtype 相加，见类注释）；返回 (norm 后, 新残差)。
@@ -96,8 +99,11 @@ class RMSNormGated(nn.Module):
         assert activation in ("silu", "swish", "sigmoid"), f"不支持的 gate 激活 {activation}"
         self.activation = activation
         self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.backend = get_backend()
 
     def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        if x.is_cuda and getattr(self.backend, "supports_fused_qwen35_norm", False):
+            return self.backend.qwen35_norm(x, self.weight, self.eps, gate=gate, activation=self.activation)
         # x/gate: [..., hidden_size]（调用方保证已按 head 展平）
         orig_dtype = x.dtype
         x = x.to(torch.float32)

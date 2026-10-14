@@ -31,8 +31,10 @@ FlashInfer 的 `plan` 包含主机操作，必须在 Graph 外运行。普通 de
 
 **当前边界**：FlashInfer 的整轮投机图尚未接入，`supports_spec_graph=False`，
 投机请求走 eager spec。`FLASHENGINE_SPEC_GRAPH=1` 不能绕过这个能力门。
-DFlash/DSpark 稠密草稿内部的非因果 attention 仍使用既有 PyTorch SDPA；
+DFlash/DSpark 在 FlashInfer 模式下的稠密草稿非因果 attention 仍使用 PyTorch SDPA；
+FlashAttention 模式现可用非因果 varlen GQA，详见 [DFlash 性能修复](DFLASH_PERFORMANCE.md)。
 这里替换的是目标模型/分页 Attention 及 EAGLE3 Attention，不包含 MLP、Norm、RoPE 等算子。
+Qwen3.5 的 GDN/Norm 融合是独立功能；FI 的 auto 保留参考 prefill，避免强制组合的 BF16 回归。
 
 128 MiB workspace 在模型预热时分配，计入后续 KV 池预算。首次运行可能 JIT 编译，
 需要 CUDA toolkit、C++ 编译器和虚拟环境中的 ninja；首次编译时间不应计入稳态吞吐。

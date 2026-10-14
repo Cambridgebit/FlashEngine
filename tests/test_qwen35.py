@@ -13,6 +13,17 @@ from flashengine.models.registry import resolve_target_model
 
 
 class Qwen35Contracts(unittest.TestCase):
+    def test_host_greedy_bypasses_sort_and_random_sampling(self):
+        from flashengine.engine.model_runner import ModelRunner
+        sampler = unittest.mock.Mock(return_value=torch.tensor([0, 1]))
+        runner = SimpleNamespace(sampler=sampler, prepare_sample=lambda seqs: (1, 2, 3))
+        logits = torch.tensor([[0., 2.], [3., 1.]])
+        seqs = [SimpleNamespace(temperature=0.), SimpleNamespace(temperature=0.)]
+        self.assertEqual(ModelRunner._sample(runner, logits, seqs).tolist(), [1, 0])
+        sampler.assert_not_called()
+        seqs[1].temperature = 0.7
+        self.assertEqual(ModelRunner._sample(runner, logits, seqs).tolist(), [0, 1])
+        sampler.assert_called_once()
     def test_dense_draft_padding_never_uses_negative_physical_slots(self):
         from flashengine.engine.model_runner import ModelRunner
         sizes = {"v_slots": 12, "v_ctx_lens": 12, "v_pos": 12, "df_ctx_pos": 12,

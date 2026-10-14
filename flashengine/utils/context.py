@@ -33,6 +33,8 @@ class Context:
     gdn_carry_slots: torch.Tensor | None = None
     gdn_row_bases: tuple[int, ...] | None = None
     gdn_row_seg: int = 0
+    gdn_host_slots: tuple[int, ...] | None = None
+    gdn_host_initial: tuple[bool, ...] | None = None
 
 _CONTEXT = Context()
 

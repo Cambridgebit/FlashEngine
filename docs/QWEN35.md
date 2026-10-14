@@ -12,9 +12,11 @@
 - 门控全注意力使用 partial NeoX RoPE（2B 为 64/256）、Gemma RMSNorm（weight+1）
   和逐头输出门控；decode 的 attention 输出先归形，避免广播膨胀。
 - GDN 采用经过 Transformers 参考公式验证的 chunk/recurrent 实现。
+  CUDA 默认融合递推、短卷积、Gemma/GDN Norm 与设备状态提交；
+  FlashAttention 使用融合 prefill，FlashInfer auto 保留参考 prefill。
   conv/SSM 状态与请求生命周期绑定，分块 prefill 复用此前的状态。
 - `RecurrentStateRuntime` 分配请求主槽、verify 行槽和 dummy 槽。
-  DFlash 验证后把 `count-1` 行终态拷回主槽；bonus 留给下一轮消费。
+  DFlash 验证后把 `count-1` 行终态拷回主槽（CUDA 在图内提交，其他后端在读回后提交）；bonus 留给下一轮消费。
   完成、抢占、取消、预热收尾均释放槽映射。
 - DFlash aux 为 `target_layer_ids` 指定的 0-based 层输出，不采用 Qwen3 的 +1。
   MoE 添加门控共享专家，路由专家复用原三后端 `fused_moe`。
@@ -56,6 +58,9 @@ python3 -m scripts.openai_server /home/yjq040828/vllm-lab/models/Qwen3.5-2B \
 8GB 卡先使用 seqs=1；GDN 状态池随并发及 verify 宽度增长，不能直接使用默认大容量。
 
 ## 本轮验证
+
+本节为初始适配记录；后续优化的 56/56 回归、长输出对照与已知精度边界见
+[DFlash 性能修复](DFLASH_PERFORMANCE.md)，不能把初始的 66-token 冒烟当稳定性能结论。
 
 本地环境：Ubuntu-22.04 / RTX 4070 Laptop 8GB，torch 2.11.0、transformers 5.15，
 真实模型目录 Qwen3.5-2B 与 Qwen3.5-2B-Dflash，bf16。

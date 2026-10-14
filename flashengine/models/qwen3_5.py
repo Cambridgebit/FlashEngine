@@ -397,12 +397,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         has_initial,
         ctx,
     ) -> torch.Tensor:
-        """prefill：逐序列整段前向（本引擎 hybrid 无 chunked prefill / prefix cache，
-        每序列一次算完），末态写回状态槽。"""
-        # host 侧循环边界（每 prefill 步每层一次同步，量级可接受）
-        cu = ctx.cu_seqlens_q.tolist()
-        slots_l = slots.tolist() if torch.is_tensor(slots) else list(slots)
-        init_l = has_initial.tolist() if torch.is_tensor(has_initial) else list(has_initial)
+        """prefill：按调度 chunk 推进各序列，保存末态供后续 chunk/decode 复用。"""
+        # 复用引擎 host 元数据，不让 18 层分别将设备长度/槽号读回。
+        if ctx.host_seq_lens_q is not None:
+            cu = [0]
+            for length in ctx.host_seq_lens_q.tolist():
+                cu.append(cu[-1] + length)
+        else:
+            cu = ctx.cu_seqlens_q.tolist()
+        slots_l = ctx.gdn_host_slots if ctx.gdn_host_slots is not None else slots.tolist()
+        init_l = ctx.gdn_host_initial if ctx.gdn_host_initial is not None else has_initial.tolist()
         n_seqs = len(cu) - 1
         core = torch.empty(
             mixed_qkv.size(0), self.num_v_heads, self.head_v_dim,
@@ -440,6 +444,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 k = k.repeat_interleave(self.gqa_ratio, dim=1)
 
             g, beta = _gdn_gating(a[s0:s1], b[s0:s1], self.A_log, self.dt_bias)
+            if getattr(self.backend, "supports_fused_gdn_prefill", False):
+                # 时间长度走运行时循环，避免每个 prompt 长度都编译一个递推内核。
+                q = (_l2norm(q).float() * self.head_k_dim ** -0.5).contiguous()
+                k = _l2norm(k).float().contiguous()
+                core[s0:s1] = self.backend.gdn_recurrent(
+                    q, k, v.contiguous(), g, beta, self.ssm_cache, slots[i:i + 1],
+                    rows=seq_len, initial=has_initial[i:i + 1])
+                continue
             init_state = self.ssm_cache[slot] if init_l[i] else None
             o_i, final_state = chunk_gated_delta_rule(
                 q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0),
@@ -464,13 +476,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         conv_w = self.conv1d.weight
         # ---- conv 单步：窗口 = [槽内 raw 末 K-1 输入, 新输入]，valid 卷积取末位
         #（= transformers causal_conv1d_update 的 seq_len=1 分支）----
-        conv_state = self.conv_cache[idx]  # [n, conv_dim, K-1]
-        conv_state = torch.where(has_initial[:, None, None], conv_state, torch.zeros_like(conv_state))
-        window = torch.cat([conv_state, mixed_qkv.unsqueeze(-1)], dim=-1)  # [n, conv_dim, K]
-        conv_out = self.backend.gdn_causal_conv1d(window, conv_w)[:, :, 0]
-        conv_out = self._act(conv_out)
-        # conv 末态写回：旧状态右移一位 + 新输入（raw 窗口）
-        self.conv_cache[idx] = window[:, :, 1:]
+        if getattr(self.backend, "supports_fused_gdn", False):
+            conv_out = self.backend.gdn_conv(mixed_qkv, conv_w, self.conv_cache,
+                                             slots, initial=has_initial)
+        else:
+            conv_state = self.conv_cache[idx]  # [n, conv_dim, K-1]
+            conv_state = torch.where(has_initial[:, None, None], conv_state, torch.zeros_like(conv_state))
+            window = torch.cat([conv_state, mixed_qkv.unsqueeze(-1)], dim=-1)  # [n, conv_dim, K]
+            conv_out = self._act(self.backend.gdn_causal_conv1d(window, conv_w)[:, :, 0])
+            self.conv_cache[idx] = window[:, :, 1:]
 
         q, k, v = conv_out.split([self.key_dim, self.key_dim, self.value_dim], dim=-1)
         q = q.view(n, self.num_k_heads, self.head_k_dim)
@@ -485,6 +499,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         #（transformers torch_recurrent_gated_delta_rule L343-353 同序）
         q = _l2norm(q).float() * self.head_k_dim ** -0.5
         k = _l2norm(k).float()
+        if getattr(self.backend, "supports_fused_gdn", False):
+            return self.backend.gdn_recurrent(q, k, v, g, beta, self.ssm_cache,
+                                              slots, initial=has_initial)
         v = v.float()
         # 状态读入 + 无初始态行清零（torch.where 无 host 同步，图安全）
         state = self.ssm_cache[idx]  # [n, H, K, V] fp32
@@ -517,6 +534,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         段界与基址是 host 常量，Graph 内不调用 tolist；carry 槽号通过固定地址
         的设备缓冲传入。eager 与 Graph 使用相同的行递推实现。
         """
+        if (getattr(self.backend, "supports_fused_gdn", False)
+                and ctx.gdn_row_bases is not None):
+            return self._forward_rows_fused(mixed_qkv, b, a, ctx)
         if ctx.gdn_row_bases is not None:
             seg = ctx.gdn_row_seg
             base_l = ctx.gdn_row_bases
@@ -574,6 +594,27 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self.ssm_cache[base_l[i]:base_l[i] + seg] = torch.stack(states)
             core[s0:s1] = torch.stack(outs).to(core.dtype)
         return core
+
+    def _forward_rows_fused(self, mixed_qkv, b, a, ctx):
+        """静态等长验证段：批量短卷积，递推融合且逐行落槽，无 host 同步。"""
+        rows = ctx.gdn_row_seg
+        batch = len(ctx.gdn_row_bases)
+        base = ctx.gdn_row_bases[0]
+        assert ctx.gdn_row_bases == tuple(base + i * rows for i in range(batch))
+        conv_out = self.backend.gdn_conv(mixed_qkv, self.conv1d.weight, self.conv_cache,
+                                         ctx.gdn_carry_slots, rows=rows, base=base)
+        q, k, v = conv_out.split([self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        q = q.reshape(-1, self.num_k_heads, self.head_k_dim)
+        k = k.reshape(-1, self.num_k_heads, self.head_k_dim)
+        v = v.reshape(-1, self.num_v_heads, self.head_v_dim)
+        if self.gqa_ratio > 1:
+            q = q.repeat_interleave(self.gqa_ratio, dim=1)
+            k = k.repeat_interleave(self.gqa_ratio, dim=1)
+        g, beta = _gdn_gating(a, b, self.A_log, self.dt_bias)
+        q = _l2norm(q).float() * self.head_k_dim ** -0.5
+        k = _l2norm(k).float()
+        return self.backend.gdn_recurrent(q, k, v, g, beta, self.ssm_cache,
+                                          ctx.gdn_carry_slots, rows=rows, base=base)
 
 
 class Qwen3_5SparseMoeBlock(Qwen3MoeSparseMoeBlock):

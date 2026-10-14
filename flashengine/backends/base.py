@@ -33,6 +33,12 @@ class BackendBase(ABC):
     default_dtype = None
     graph_sample_default = True
     supports_device_sampling_rng = False
+    supports_fused_gdn = False
+    supports_fused_gdn_prefill = False
+    supports_fused_qwen35_norm = False
+    supports_device_state_commit = False
+    supports_greedy_graph_variants = False
+    supports_dflash_dense_varlen = False
     spec_graph_try_default = True
 
     def normalize_config(self, config) -> None:

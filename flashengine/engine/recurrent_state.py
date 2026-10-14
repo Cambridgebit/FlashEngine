@@ -8,6 +8,8 @@ class RecurrentStateRuntime:
         self.model = model
         self.config = config
         self.device = config.backend_impl.device_name
+        self.backend = config.backend_impl
+        self.device_commit = getattr(self.backend, "supports_device_state_commit", False)
         self.capacity = config.max_num_seqs
         self.rows = config.spec_num_tokens + 1 if config.spec_model else 0
         self.slot_count = self.capacity * (1 + self.rows) + 1
@@ -41,8 +43,10 @@ class RecurrentStateRuntime:
         return torch.tensor(values, dtype=dtype, device="cpu").to(self.device)
 
     def bind_prefill(self, context, seqs):
-        context.gdn_state_slots = self._tensor([self.get_slot(seq) for seq in seqs])
-        context.gdn_has_initial = self._tensor([seq.num_cached_tokens > 0 for seq in seqs], torch.bool)
+        context.gdn_host_slots = tuple(self.get_slot(seq) for seq in seqs)
+        context.gdn_host_initial = tuple(seq.num_cached_tokens > 0 for seq in seqs)
+        context.gdn_state_slots = self._tensor(context.gdn_host_slots)
+        context.gdn_has_initial = self._tensor(context.gdn_host_initial, torch.bool)
 
     def prepare_decode(self, seqs):
         padding = self.capacity - len(seqs)
@@ -75,6 +79,13 @@ class RecurrentStateRuntime:
         target = self._tensor([self.get_slot(seq) for seq in seqs], torch.int64)
         for cache in (self.conv_pool, self.ssm_pool):
             cache.index_copy_(1, target, cache.index_select(1, source))
+
+    def commit_verify_device(self, commit_buf, batch_size):
+        """静态图尾部状态回写；接受数留在设备，padding 不写 dummy 主槽。"""
+        if self.device_commit:
+            for cache in (self.conv_pool, self.ssm_pool):
+                self.backend.gdn_commit(cache, commit_buf[:batch_size],
+                                        self.verify_carry[:batch_size], self.rows, self.capacity)
 
     def drop(self, seq_id):
         slot = self.slots.pop(seq_id, None)

@@ -8,6 +8,9 @@
 
 ## Quickstart
 
+Qwen3.5 DFlash 的 CUDA 性能热点已融合，保守复验约 135 tok/s（修复前约 72），
+本机已测 k=15 最快。配置、数值边界与复现口径见 [DFlash 性能修复](docs/DFLASH_PERFORMANCE.md)。
+
 需要 Python 3.10–3.12、对应加速卡运行环境及本地模型目录。以下命令在 Linux 或 WSL 的仓库根目录运行，模型参数不能直接使用 HuggingFace hub ID。
 
 先安装与硬件匹配的 PyTorch，再安装项目依赖（核心依赖含 `tqdm`、`numpy`、`safetensors`，已声明于 `pyproject.toml`）：

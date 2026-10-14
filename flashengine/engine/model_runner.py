@@ -170,6 +170,8 @@ class ModelRunner:
         )
         self._graph_bs_active = 0
         self.graphs = None
+        self.decode_greedy_graphs = {}
+        self._decode_batch_greedy = False
         self.graph_pool = None
         self.graph_runner = None
         self._max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
@@ -263,6 +265,9 @@ class ModelRunner:
             if self.config.spec_is_block_draft:
                 self._sg.update(self._alloc_df_graph_vars(self._graph_max_bs, rows))
         self.spec_graphs = None
+        self.spec_greedy_graphs = {}
+        self._spec_capture_greedy = False
+        self._spec_batch_greedy = False
         self.spec_graph_pool = None
         self._spec_graph_active = 0
         self.spec_graph_stats = {
@@ -271,6 +276,8 @@ class ModelRunner:
             "replay": 0,
             "eager_rounds": 0,
             "sampling_fallbacks": 0,
+            "greedy_replays": 0,
+            "greedy_capture_success": 0,
             "context_limited_rounds": 0,
             "bucket_hits": {},
         }
@@ -285,6 +292,7 @@ class ModelRunner:
             "capture_failure": 0,
             "replay": 0,
             "fallback": 0,
+            "greedy_replays": 0,
             "bucket_hits": {},
         }
         self.prefill_cache_stats = {
@@ -368,9 +376,9 @@ class ModelRunner:
         if self.graph_runner is not None:
             self.graph_runner.reset()
         for stats, keys in (
-            (self.decode_graph_stats, ("replay", "fallback", "bucket_hits")),
+            (self.decode_graph_stats, ("replay", "fallback", "bucket_hits", "greedy_replays")),
             (self.spec_graph_stats,
-             ("replay", "eager_rounds", "sampling_fallbacks", "bucket_hits", "context_limited_rounds")),
+             ("replay", "eager_rounds", "sampling_fallbacks", "bucket_hits", "context_limited_rounds", "greedy_replays")),
             (self.prefill_cache_stats, tuple(self.prefill_cache_stats)),
         ):
             for key in keys:
@@ -746,7 +754,7 @@ class ModelRunner:
             pin_memory=True,
         ).to(self.device, non_blocking=True)
         host_seq_lens_q = torch.tensor(
-            [seq.num_scheduled_tokens for seq in seqs], dtype=torch.int32)
+            [seq.num_scheduled_tokens for seq in seqs], dtype=torch.int32, device="cpu")
         set_context(
             True,
             cu_seqlens_q=cu_seqlens_q,
@@ -915,7 +923,11 @@ class ModelRunner:
             return self.model.compute_logits(self.model(input_ids, positions)), False
 
         self._dblob.h2d()
-        self.graphs[graph_bs].replay()
+        greedy = self._decode_batch_greedy and graph_bs in self.decode_greedy_graphs
+        graphs = self.decode_greedy_graphs if greedy else self.graphs
+        graphs[graph_bs].replay()
+        if greedy:
+            self.decode_graph_stats["greedy_replays"] += 1
         self.decode_graph_stats["replay"] += 1
         bucket_hits = self.decode_graph_stats["bucket_hits"]
         bucket_hits[graph_bs] = bucket_hits.get(graph_bs, 0) + 1
@@ -924,6 +936,7 @@ class ModelRunner:
         return self.model.compute_logits(gv["outputs"][:bs]), False
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        self._decode_batch_greedy = all(seq.temperature <= 1e-10 for seq in seqs)
         if not is_prefill and self.graph_runner is not None:
             graph_result = self.graph_runner.try_run(seqs)
             if graph_result is not None:
@@ -933,7 +946,7 @@ class ModelRunner:
                         token_ids = result.tolist()
                     else:
                         sample = self.prepare_sample(seqs, False)
-                        token_ids = self.sampler(result, *sample).tolist()
+                        token_ids = self._sample(result, seqs, sample).tolist()
                 else:
                     token_ids = None
                 reset_context()
@@ -945,11 +958,19 @@ class ModelRunner:
             self._record_prefill_cache_state(seqs)
         if self.rank == 0:
             token_ids = (result.tolist() if sampled
-                         else self.sampler(result, *sample).tolist())
+                         else self._sample(result, seqs, sample).tolist())
         else:
             token_ids = None
         reset_context()
         return token_ids
+
+    def _sample(self, logits, seqs, prepared=None):
+        """由 host 请求参数决定纯 greedy；混合/随机请求保留完整采样语义。"""
+        if all(seq.temperature <= 1e-10 for seq in seqs):
+            return logits.argmax(dim=-1)
+        if prepared is None:
+            prepared = self.prepare_sample(seqs)
+        return self.sampler(logits, *prepared)
 
     @torch.inference_mode()
     def run_prefill_spec(self, seqs: list[Sequence]) -> list[int]:
@@ -962,7 +983,7 @@ class ModelRunner:
         hidden, aux = self.model(input_ids, positions)
         logits = self.model.compute_logits(hidden)
         sample = self.prepare_sample(seqs)
-        token_ids = self.sampler(logits, *sample).tolist()
+        token_ids = self._sample(logits, seqs, sample).tolist()
         offsets = list(accumulate([0] + [seq.num_scheduled_tokens for seq in seqs]))
         seed = self.draft_model.project_aux(aux)
         shifted = []
@@ -987,9 +1008,10 @@ class ModelRunner:
 
     @torch.inference_mode()
     def spec_round(self, seqs: list[Sequence]) -> list[list[int]]:
+        self._spec_batch_greedy = all(seq.temperature <= 1e-10 for seq in seqs)
         sampling_compatible = (
             self.graph_sample
-            or all(seq.temperature <= 1e-10 for seq in seqs)
+            or self._spec_batch_greedy
         )
         result = self.spec_runtime.round(seqs, sampling_compatible)
         self._record_spec_acceptance(result)
@@ -1014,7 +1036,7 @@ class ModelRunner:
         ids, positions = self.prepare_decode(seqs)
         hidden, _ = self.model(ids, positions)
         logits = self.model.compute_logits(hidden)
-        tokens = self.sampler(logits, *self.prepare_sample(seqs)).tolist()
+        tokens = self._sample(logits, seqs).tolist()
         result = [[token] for token in tokens]
         self._record_spec_acceptance(result)
         self.spec_graph_stats["eager_rounds"] += 1
@@ -1249,7 +1271,7 @@ class ModelRunner:
         input_ids, positions = self.prepare_prefill(seqs)
         hidden, aux = self.model(input_ids, positions)
         logits = self.model.compute_logits(hidden)
-        token_ids = self.sampler(logits, *self.prepare_sample(seqs)).tolist()
+        token_ids = self._sample(logits, seqs).tolist()
         self._record_prefill_cache_state(seqs)
         reset_context()
         offsets = list(accumulate([0] + [seq.num_scheduled_tokens for seq in seqs]))
@@ -1299,7 +1321,7 @@ class ModelRunner:
             self.spec_ctx_pending[seq.seq_id] = self._sg['v_aux'][
                 i * rows:i * rows + count].clone()
             seq.num_scheduled_tokens = 0
-        if self.state_runtime:
+        if self.state_runtime and not self.state_runtime.device_commit:
             self.state_runtime.commit_verify(seqs, [len(tokens) for tokens in results])
         return results
 
@@ -1437,10 +1459,13 @@ class ModelRunner:
         v[:, 1:].copy_(g['drafted_ids'][:k, :bs].t())
         self._sg_verify(bs, use_cuda_graph)
         self._sg_acceptance(bs)
+        if self.state_runtime:
+            self.state_runtime.commit_verify_device(g['commit_buf'], bs)
 
     def _capture_spec_graphs(self, prepare, body, label):
         self.spec_graph_bs = _graph_buckets(self._graph_max_bs)
         self.spec_graphs = {}
+        self.spec_greedy_graphs = {}
         try:
             prepare()
             self._sblob.h2d()
@@ -1461,6 +1486,30 @@ class ModelRunner:
                 graph.replay()
                 self.backend.synchronize()
                 self.spec_graph_stats["capture_success"] += 1
+            # 保留原随机采样图；另捕获纯 argmax 图，不在 replay 中读取设备标量。
+            if (self.graph_sample and self.backend.supports_greedy_graph_variants
+                    and os.getenv("FLASHENGINE_SPEC_GREEDY_GRAPH", "1") != "0"):
+                for bs in reversed(self.spec_graph_bs):
+                    try:
+                        self._spec_capture_greedy = True
+                        for _ in range(self.backend.graph_warmup_iters()):
+                            body(bs)
+                            reset_context()
+                            self.backend.synchronize()
+                        graph = self.backend.new_graph()
+                        with self.backend.graph_ctx(graph, pool=self.spec_graph_pool):
+                            body(bs)
+                        reset_context()
+                        graph.replay()
+                        self.backend.synchronize()
+                        self.spec_greedy_graphs[bs] = graph
+                        self.spec_graph_stats["greedy_capture_success"] += 1
+                    except Exception as exc:
+                        print(f"[FlashEngine] Greedy spec graph bucket {bs} unavailable; "
+                              f"using sampling graph: {type(exc).__name__}: {exc}", flush=True)
+                        reset_context()
+                    finally:
+                        self._spec_capture_greedy = False
         except Exception as e:
             print(f"[FlashEngine] {label} graph capture failed; falling back to "
                   f"eager speculative rounds: {type(e).__name__}: {e}", flush=True)
@@ -1472,6 +1521,7 @@ class ModelRunner:
             except Exception:
                 pass
             self.spec_graphs = None
+            self.spec_greedy_graphs.clear()
             self.spec_graph_pool = None
             try:
                 self.backend.empty_cache()
@@ -1545,7 +1595,11 @@ class ModelRunner:
     def _replay_spec_graph(self, bucket: int):
         self._spec_graph_active = bucket
         self._push_spec_meta()
-        self.spec_graphs[bucket].replay()
+        greedy = self._spec_batch_greedy and bucket in self.spec_greedy_graphs
+        graphs = self.spec_greedy_graphs if greedy else self.spec_graphs
+        graphs[bucket].replay()
+        if greedy:
+            self.spec_graph_stats["greedy_replays"] += 1
         self.spec_graph_stats["replay"] += 1
         hits = self.spec_graph_stats["bucket_hits"]
         hits[bucket] = hits.get(bucket, 0) + 1
@@ -1604,7 +1658,8 @@ class ModelRunner:
         )
 
     def _sg_sample(self, logits, temps, topps, topks, use_cuda_graph: bool):
-        if use_cuda_graph and not self.graph_sample:
+        if ((use_cuda_graph and (self._spec_capture_greedy or not self.graph_sample))
+                or (not use_cuda_graph and self._spec_batch_greedy)):
             return logits.argmax(dim=-1)
         return self.sampler.forward_native(logits, temps, topps, topks)
 
@@ -1893,6 +1948,19 @@ class ModelRunner:
                 if self.graph_pool is None:
                     self.graph_pool = self.backend.graph_pool(graph)
                 self.graphs[bs] = graph
+                if (self.graph_sample and self.backend.supports_greedy_graph_variants
+                        and os.getenv("FLASHENGINE_DECODE_GREEDY_GRAPH", "1") != "0"):
+                    try:
+                        greedy_graph = self.backend.new_graph()
+                        with self.backend.graph_ctx(greedy_graph, pool=self.graph_pool):
+                            scatter(bs)
+                            greedy_hidden = self.model(input_ids[:bs], positions[:bs])
+                            token_ids[:bs].copy_(self.model.compute_logits(greedy_hidden).argmax(dim=-1))
+                        self.backend.synchronize()
+                        self.decode_greedy_graphs[bs] = greedy_graph
+                    except Exception as exc:
+                        print(f"[FlashEngine] Greedy decode graph bucket {bs} unavailable; "
+                              f"using sampling graph: {type(exc).__name__}: {exc}", flush=True)
                 self.backend.synchronize()
                 reset_context()
 
@@ -1920,5 +1988,6 @@ class ModelRunner:
             reset_context()
             self.backend.synchronize()
             self.graphs = None
+            self.decode_greedy_graphs.clear()
             self.graph_pool = None
             self.backend.empty_cache()

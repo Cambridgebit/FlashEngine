@@ -191,6 +191,17 @@ python3 -m scripts.benchmark /data/Qwen3-0.6B \
 
 ## Qwen3.5 系列（已并入 main）
 
+- **CUDA DFlash 性能修复（2026-10-14）**：融合 GDN 递推/短卷积/Gemma 与 gated Norm，
+  CUDA FlashAttention prefill 使用多步递推，图内按接受数回写主状态；另有 greedy 专用图，
+  随机/混合请求仍用原采样图。草稿支持非因果 varlen GQA，CoreX/310P 保留参考路径。
+  新能力位 `supports_fused_gdn` / `supports_fused_gdn_prefill` / `supports_fused_qwen35_norm` /
+  `supports_device_state_commit` / `supports_greedy_graph_variants` / `supports_dflash_dense_varlen`。
+  host 长度/状态槽/初始态复用，prefill 不再每层分别 D2H。
+  8 题×128-token 长输出保守复验 DFlash 71.7→134.6 tok/s，较优化普通 Graph 57.0 为 2.36×；
+  五档扫描 k=15 最快，不是所有负载的全局最优。56/56 回归通过。
+  FlashInfer auto 保留参考 prefill（强制新 prefill 有一条 BF16 分歧），投机仍 eager。
+  精度与硬件验收边界、开关、工件和命令见 `docs/DFLASH_PERFORMANCE.md`。
+
 - 注册目标 `qwen3_5` / `qwen3_5_moe`，读取多模态壳的 `text_config` 或纯文本配置；只加载文本权重，视觉塔/MTP 不加载。普通推理与 DFlash 三后端放行，EAGLE3/DSpark/量化/TP>1 明确拒绝。
 - `models/qwen3_5.py` 的 GDN 数学参考历史 `origin/qwen35-dflash:nanovllm/models/qwen3_5.py` 与 Transformers；按当前 adapter 和后端接口重接，而不是整支合并旧包。
 - 门控全注意力采用 partial NeoX RoPE（2B 为 64/256）、Gemma RMSNorm（weight+1）和逐头输出门控；decode 输出先归形再乘 gate。MoE 复用三后端路由/专家前向并加入门控共享专家。
