@@ -501,11 +501,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             conv_out = self.backend.gdn_conv(mixed_qkv, conv_w, self.conv_cache,
                                              slots, initial=has_initial)
         else:
-            conv_state = self.conv_cache[idx]  # [n, conv_dim, K-1]
+            # 310P: 张量下标读/写（cache[idx]）在 aclnn 上走慢路径（实测写 2MB 约 605us
+            # vs index_copy_ 51us；48KB conv 槽写 277us vs 切片写 15us），统一换
+            # index_select / index_copy_。
+            conv_state = torch.index_select(self.conv_cache, 0, idx)  # [n, conv_dim, K-1]
             conv_state = torch.where(has_initial[:, None, None], conv_state, torch.zeros_like(conv_state))
             window = torch.cat([conv_state, mixed_qkv.unsqueeze(-1)], dim=-1)  # [n, conv_dim, K]
             conv_out = self._act(self.backend.gdn_causal_conv1d(window, conv_w)[:, :, 0])
-            self.conv_cache[idx] = window[:, :, 1:]
+            self.conv_cache.index_copy_(0, idx, window[:, :, 1:].contiguous())
 
         q, k, v = conv_out.split([self.key_dim, self.key_dim, self.value_dim], dim=-1)
         q = q.view(n, self.num_k_heads, self.head_k_dim)
@@ -525,7 +528,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                                               slots, initial=has_initial)
         v = v.float()
         # 状态读入 + 无初始态行清零（torch.where 无 host 同步，图安全）
-        state = self.ssm_cache[idx]  # [n, H, K, V] fp32
+        state = torch.index_select(self.ssm_cache, 0, idx)  # [n, H, K, V] fp32
         state = torch.where(has_initial.view(-1, 1, 1, 1), state, torch.zeros_like(state))
         # 单步递归（transformers torch_recurrent_gated_delta_rule 循环体 L364-375 逐行移植，
         # 全批向量化；q 已含 1/sqrt(K) 缩放）：
@@ -535,7 +538,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         delta = (v - kv_mem) * beta.unsqueeze(-1)
         state = state + k.unsqueeze(-1) * delta.unsqueeze(-2)
         out = (state * q.unsqueeze(-1)).sum(dim=-2)  # [n, H, V]
-        self.ssm_cache[idx] = state
+        self.ssm_cache.index_copy_(0, idx, state)
         return out.to(mixed_qkv.dtype)
 
     def _forward_rows(
@@ -575,8 +578,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         state_len = self.conv_kernel_size - 1
         # ---- 全批 carry 先 gather（关键次序①：写槽前完成全部读）----
         carry_idx = ctx.gdn_carry_slots.to(torch.long)  # int32 契约 → long 高级索引
-        ssm_carry = self.ssm_cache[carry_idx]    # [n, H, K, V] fp32
-        conv_carry = self.conv_cache[carry_idx]  # [n, conv_dim, K-1]
+        ssm_carry = torch.index_select(self.ssm_cache, 0, carry_idx)    # [n, H, K, V] fp32
+        conv_carry = torch.index_select(self.conv_cache, 0, carry_idx)  # [n, conv_dim, K-1]
         for i in range(n_seqs):
             s0, s1 = cu[i], cu[i + 1]
             seg = s1 - s0
@@ -603,16 +606,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             k = _l2norm(k).float()
             v = v.float()
             state = ssm_carry[i]  # [H, K, V] fp32（读槽①已 gather）
-            states, outs = [], []
+            outs = []
             for j in range(seg):
                 state = state * g[j].exp().unsqueeze(-1).unsqueeze(-1)
                 kv_mem = (state * k[j].unsqueeze(-1)).sum(dim=-2)
                 delta = (v[j] - kv_mem) * beta[j].unsqueeze(-1)
                 state = state + k[j].unsqueeze(-1) * delta.unsqueeze(-2)
+                # 逐行直写验证槽：省掉 stack(seg×2MB) 与整段切片写的二次搬运
+                self.ssm_cache[base_l[i] + j] = state
                 outs.append((state * q[j].unsqueeze(-1)).sum(dim=-2))
-                states.append(state)
-            # 行终态批量落槽（base_i..base_i+seg-1 连续 → 一次切片写）
-            self.ssm_cache[base_l[i]:base_l[i] + seg] = torch.stack(states)
             core[s0:s1] = torch.stack(outs).to(core.dtype)
         return core
 
