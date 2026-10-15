@@ -11,6 +11,7 @@ from flashengine.layers.layernorm import RMSNorm
 from flashengine.layers.linear import ReplicatedLinear, QKVParallelLinear, RowParallelLinear
 from flashengine.layers.rotary_embedding import get_rope
 from flashengine.models.qwen3 import PACKED_MODULES_MAPPING, Qwen3MLP
+from flashengine.speculative.registry import block_draft_attention
 from flashengine.utils.loader import (
     default_weight_loader,
     iter_with_progress,
@@ -18,10 +19,30 @@ from flashengine.utils.loader import (
 )
 
 
+def block_attention_mask(ctx_lens, max_ctx, rows, causal=False, window=None):
+    """按每条序列的逻辑位置构造掩码，不能把稠密缓存的 padding 算进窗口。"""
+    device = ctx_lens.device
+    ctx_pos = torch.arange(max_ctx, device=device)[None, :].expand(ctx_lens.numel(), -1)
+    query_pos = ctx_lens[:, None] + torch.arange(rows, device=device)[None, :]
+    key_pos = torch.cat((ctx_pos, query_pos), dim=-1)
+    valid = torch.cat((ctx_pos < ctx_lens[:, None],
+                       torch.ones_like(query_pos, dtype=torch.bool)), dim=-1)
+    delta = query_pos[:, :, None] - key_pos[:, None, :]
+    mask = valid[:, None, :].expand(-1, rows, -1)
+    if causal:
+        mask = mask & (delta >= 0)
+    if window is not None:
+        mask = mask & (delta < window)
+        if not causal:
+            mask = mask & (-delta < window)
+    return mask[:, None]
+
+
 class DFlashBlockAttention(nn.Module):
 
-    def __init__(self, config, rotary_emb) -> None:
+    def __init__(self, config, rotary_emb, layer_idx=0) -> None:
         super().__init__()
+        self.is_causal, self.sliding_window = block_draft_attention(config)[layer_idx]
         tp_size = dist.get_world_size()
         self.total_num_heads = config.num_attention_heads
         self.total_num_kv_heads = config.num_key_value_heads
@@ -77,7 +98,7 @@ class DFlashBlockAttention(nn.Module):
             q.reshape(n * rows, self.num_heads, self.head_dim),
             k.reshape(n * rows, self.num_kv_heads, self.head_dim),
         )
-        if (query_slots is not None
+        if (query_slots is not None and not self.is_causal and self.sliding_window is None
                 and getattr(self.backend, "supports_dflash_paged", False)
                 and self.k_cache.numel() and self.v_cache.numel()):
             q_flat = q.reshape(n * rows, self.num_heads, self.head_dim)
@@ -102,8 +123,14 @@ class DFlashBlockAttention(nn.Module):
             o = self.backend.dflash_dense_attention(
                 q.view(n, rows, self.num_heads, self.head_dim),
                 k.view(n, rows, self.num_kv_heads, self.head_dim), v,
-                k_ctx, v_ctx, dense_context_lens, self.scaling)
+                k_ctx, v_ctx, dense_context_lens, self.scaling,
+                causal=self.is_causal, window=self.sliding_window)
             return self.o_proj(o.reshape(n * rows, self.q_size))
+        if self.is_causal or self.sliding_window is not None:
+            if dense_context_lens is None:
+                raise ValueError("DFlash 窗口注意力缺少上下文长度")
+            mask = block_attention_mask(dense_context_lens, k_ctx.shape[1], rows,
+                                        self.is_causal, self.sliding_window)
         q = q.view(n, rows, self.num_heads, self.head_dim).transpose(1, 2)      # [n, H, rows, hd]
         k = k.view(n, rows, self.num_kv_heads, self.head_dim).transpose(1, 2)   # [n, kvh, rows, hd]
         v = v.transpose(1, 2)
@@ -121,9 +148,9 @@ class DFlashBlockAttention(nn.Module):
 
 class DFlashDecoderLayer(nn.Module):
 
-    def __init__(self, config, rotary_emb) -> None:
+    def __init__(self, config, rotary_emb, layer_idx=0) -> None:
         super().__init__()
-        self.self_attn = DFlashBlockAttention(config, rotary_emb)
+        self.self_attn = DFlashBlockAttention(config, rotary_emb, layer_idx)
         self.mlp = Qwen3MLP(config.hidden_size, config.intermediate_size, config.hidden_act)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -183,11 +210,14 @@ class DFlashDraftModel(nn.Module):
             max_position = config.max_position_embeddings
         self.rotary_emb = get_rope(head_dim, head_dim, max_position, theta)
         self.layers = nn.ModuleList(
-            [DFlashDecoderLayer(config, self.rotary_emb) for _ in range(config.num_hidden_layers)]
+            [DFlashDecoderLayer(config, self.rotary_emb, i) for i in range(config.num_hidden_layers)]
         )
         self.norm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
         self.backend = get_backend()
-        self.use_paged_kv = bool(getattr(self.backend, "supports_dflash_paged", False))
+        self.use_paged_kv = bool(
+            getattr(self.backend, "supports_dflash_paged", False)
+            and not any(causal or window is not None
+                        for causal, window in block_draft_attention(config)))
         self.ctx_k_cache = torch.tensor([])
         self.ctx_v_cache = torch.tensor([])
 

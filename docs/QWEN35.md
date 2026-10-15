@@ -5,6 +5,9 @@
 不支持图像/视频输入。普通推理和匹配的 DFlash 草稿适配 CUDA、CoreX、Ascend 310P。
 当前 TP=1、fp16/bf16；EAGLE3、DSpark 和量化检查点明确拒绝。
 
+MoE 的路由/专家装载与 64.6MB 公开小模型实机记录见
+[Qwen3.5 MoE](QWEN35_MOE.md)；包括 CUDA Graph、前缀缓存与三后端验收边界。
+
 ## 实现
 
 - 全注意力复用三后端 Attention/KV 接口，只为 full_attention 层分配 KV。
@@ -20,6 +23,8 @@
   完成、抢占、取消、预热收尾均释放槽映射。
 - DFlash aux 为 `target_layer_ids` 指定的 0-based 层输出，不采用 Qwen3 的 +1。
   MoE 添加门控共享专家，路由专家复用原三后端 `fused_moe`。
+  新版 MoE 草稿的逐层滑窗/因果掩码、CUDA 整轮图及小模型状态验收见
+  [MoE DFlash](QWEN35_MOE.md#dflash-检查点与窗口注意力)。
 - prefix cache 默认开启：完整块边界保存 conv/SSM 主机快照，命中后恢复末块状态。
   DFlash 同时恢复草稿上下文 KV；任何必要状态缺失都会缩短命中或重算。
   快照预算、生命周期、实机回归见 [Qwen3.5 前缀缓存](QWEN35_PREFIX_CACHE.md)。

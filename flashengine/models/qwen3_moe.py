@@ -247,6 +247,8 @@ class Qwen3MoeForCausalLM(nn.Module):
             dst = target(proj).data
             if field != "weight":
                 tensor = tensor.reshape(dst.shape)
+            if tensor.shape != dst.shape:
+                raise ValueError(f"MoE 权重形状不匹配: {name}: {tuple(tensor.shape)} != {tuple(dst.shape)}")
             dst.copy_(tensor)
             return
         if proj == "gate_proj":
@@ -258,14 +260,16 @@ class Qwen3MoeForCausalLM(nn.Module):
         else:
             raise ValueError(f"Unexpected MoE expert weight name: {name}")
         ei = int(parts[parts.index("experts") + 1])
+        if not 0 <= ei < experts.num_experts:
+            raise ValueError(f"MoE 专家编号越界: {name}")
         dst = target(proj).data
         if field != "weight":
             # 尺度/偏移检查点可能存 [N] 或 [N,1]，统一 reshape 到目标片形状。
             tensor = tensor.reshape(dst[ei].shape if lo is None else dst[ei, lo:hi].shape)
-        if lo is None:
-            dst[ei].copy_(tensor)
-        else:
-            dst[ei, lo:hi].copy_(tensor)
+        shard = dst[ei] if lo is None else dst[ei, lo:hi]
+        if tensor.shape != shard.shape:
+            raise ValueError(f"MoE 权重形状不匹配: {name}: {tuple(tensor.shape)} != {tuple(shard.shape)}")
+        shard.copy_(tensor)
 
     def load_weights(self, weights) -> None:
         packed = self.packed_modules_mapping

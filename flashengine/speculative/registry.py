@@ -14,6 +14,23 @@ def _identity_num_tokens(draft_config: Any, requested: int) -> int:
     return requested
 
 
+def block_draft_attention(config: Any) -> tuple[tuple[bool, int | None], ...]:
+    """逐层解析官方 DFlash 因果/窗口语义；窗口包含当前位置。"""
+    count = int(config.num_hidden_layers)
+    kinds = getattr(config, "layer_types", None) or ["full_attention"] * count
+    if len(kinds) != count or set(kinds) - {"full_attention", "sliding_attention"}:
+        raise ValueError("DFlash layer_types 必须逐层指定 full_attention/sliding_attention")
+    override = getattr(config, "is_causal", None)
+    result = []
+    for kind in kinds:
+        sliding = kind == "sliding_attention"
+        window = getattr(config, "sliding_window", None) if sliding else None
+        if sliding and (not isinstance(window, int) or isinstance(window, bool) or window < 1):
+            raise ValueError("DFlash sliding_attention 需要正整数 sliding_window")
+        result.append((sliding if override is None else bool(override), window))
+    return tuple(result)
+
+
 def _normalize_block_draft(draft_config: Any) -> None:
     dflash_config = getattr(draft_config, "dflash_config", None) or {}
     if not dflash_config:
@@ -36,6 +53,9 @@ def _normalize_block_draft(draft_config: Any) -> None:
             "Block-draft config must provide target_layer_ids or "
             "aux_hidden_state_layer_ids."
         )
+    draft_config.block_draft_requires_mask = any(
+        causal or window is not None for causal, window in block_draft_attention(draft_config)
+    )
 
 
 def _normalize_dspark(draft_config: Any) -> None:

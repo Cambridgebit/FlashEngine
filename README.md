@@ -4,7 +4,7 @@
 
 本项目基于 [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm)，用于研究和学习大模型推理引擎。代码覆盖请求调度、模型执行、KV cache 管理和硬件后端，提供 Python API 与 OpenAI 兼容 HTTP 服务。
 
-当前目标模型为 Qwen3、Qwen3 MoE 与 Qwen3.5 dense/MoE 文本模型，后端为 NVIDIA CUDA、天数智芯 CoreX、华为 Ascend 310P。Qwen3 支持 EAGLE3、DFlash、DSpark；Qwen3 MoE 与 Qwen3.5 系列支持 DFlash。Qwen3 的 W8A8 支持范围不变，Qwen3.5 当前为 fp16/bf16、TP=1，不加载视觉塔和 MTP。完整组合见 [支持矩阵](docs/SUPPORT_MATRIX.md)，Qwen3.5 的实现与验证边界见 [适配说明](docs/QWEN35.md)。CoreX/310P 的 Qwen3.5 路径尚无实机验收。
+当前目标模型为 Qwen3、Qwen3 MoE 与 Qwen3.5 dense/MoE 文本模型，后端为 NVIDIA CUDA、天数智芯 CoreX、华为 Ascend 310P。Qwen3 支持 EAGLE3、DFlash、DSpark；Qwen3 MoE 与 Qwen3.5 系列支持 DFlash（含新版草稿的滑窗/因果注意力）。Qwen3 的 W8A8 支持范围不变，Qwen3.5 当前为 fp16/bf16、TP=1，不加载视觉塔和 MTP。完整组合见 [支持矩阵](docs/SUPPORT_MATRIX.md)，Qwen3.5 的实现与验证边界见 [适配说明](docs/QWEN35.md)。CUDA 已验收 dense 与 tiny MoE 的普通/DFlash 图及缓存，310P 已验收 dense 4B；CoreX 及 310P MoE 待实机验收。4GB 内的小型 MoE 检查点、测试命令和数值边界见 [MoE 验收](docs/QWEN35_MOE.md)。
 
 ## Quickstart
 

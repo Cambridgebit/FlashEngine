@@ -655,6 +655,8 @@ class Qwen3_5SparseMoeBlock(Qwen3MoeSparseMoeBlock):
 
     def __init__(self, config, layer_idx):
         super().__init__(config, layer_idx)
+        # Qwen3.5 的 top-k 路由始终归一化，不继承 Qwen3 可关闭的配置语义。
+        self.renormalize = True
         self.shared_expert = Qwen3MLP(config.hidden_size, config.shared_expert_intermediate_size, config.hidden_act)
         self.shared_expert_gate = ReplicatedLinear(config.hidden_size, 1, bias=False)
 
@@ -803,13 +805,36 @@ class Qwen3_5ForCausalLM(nn.Module):
     ) -> torch.Tensor:
         return self.lm_head(hidden_states)
 
+    def _weight_shards(self):
+        """列出必须装载的参数分片，防止缺失专家或 packed 分片留下未初始化内存。"""
+        expected = {name: {None} for name, _ in self.named_parameters()}
+        if self.config.tie_word_embeddings:
+            expected.pop("lm_head.weight", None)
+        for name, module in self.named_modules():
+            if isinstance(module, QKVParallelLinear):
+                shards = {"q", "k", "v"}
+            elif isinstance(module, MergedColumnParallelLinear):
+                shards = set(range(len(module.output_sizes)))
+            else:
+                shards = None
+            if shards is not None:
+                for field in ("weight", "bias"):
+                    key = name + "." + field
+                    if key in expected:
+                        expected[key] = shards.copy()
+            if getattr(module, "is_moe_experts", False):
+                expected[name + ".w13_weight"] = {
+                    (i, proj) for i in range(module.num_experts) for proj in ("gate_proj", "up_proj")}
+                expected[name + ".w2_weight"] = {(i, "down_proj") for i in range(module.num_experts)}
+        return expected
+
     def load_weights(self, weights) -> None:
         """vllm 式权重装载（阶段 1b 由引擎对本类调用，替代 utils.loader.load_model，
         原因见模块 docstring）。weights: Iterable[(name, tensor)]。
 
         映射逻辑（对齐 vllm Qwen3_5Model.hf_to_vllm_mapper + Qwen3_5ForCausalLMBase
         .packed_modules_mapping 的最小子集）：
-        - 跳过 mtp.* / model.visual.* / lm_head.*；
+        - 跳过 mtp.* / model.visual.*；仅绑词嵌入时跳过独立 lm_head；
         - 剥离 model.language_model. 前缀 → 本模型 model.* 参数路径；
         - q/k/v → qkv_proj 分片、gate/up → gate_up_proj 分片、in_proj_z → in_proj_qkvz
           第 4 分片、in_proj_b/a → in_proj_ba 第 1/2 分片；
@@ -820,6 +845,11 @@ class Qwen3_5ForCausalLM(nn.Module):
         key_dim = self.config.linear_num_key_heads * self.config.linear_key_head_dim
         value_dim = self.config.linear_num_value_heads * self.config.linear_value_head_dim
         tp_rank = self.model.embed_tokens.tp_rank
+        missing = self._weight_shards()
+
+        def record(key, shard=None):
+            if key in missing:
+                missing[key].discard(shard)
 
         for name, loaded_weight in weights:
             if name.startswith(_SKIP_PREFIXES):
@@ -833,11 +863,21 @@ class Qwen3_5ForCausalLM(nn.Module):
             if name.startswith("lm_head."):
                 if not self.config.tie_word_embeddings:
                     default_weight_loader(self.get_parameter(name), loaded_weight)
+                    record(name)
                 continue
             if ".mlp.experts." in name:
                 if not name.endswith((".weight", ".weight_scale", ".weight_offset")):
                     name += ".weight"
                 Qwen3MoeForCausalLM._load_expert_weight(self, "model." + name, loaded_weight)
+                prefix, suffix = name.split(".experts.", 1)
+                parts = suffix.split(".")
+                proj = parts[-2]
+                key = "model." + prefix + ".experts." + (
+                    "w2_weight" if proj == "down_proj" else "w13_weight")
+                if parts[0].isdigit():
+                    record(key, (int(parts[0]), proj))
+                else:
+                    missing[key].clear()
                 continue
             # ---- GDN 特例（packed_modules_mapping 一格一 shard 表达不了的三类）----
             if name.endswith("linear_attn.in_proj_qkv.weight"):
@@ -846,24 +886,32 @@ class Qwen3_5ForCausalLM(nn.Module):
                 offset = 0
                 for shard_id, size in enumerate((key_dim, key_dim, value_dim)):
                     param.weight_loader(param, loaded_weight[offset:offset + size], shard_id)
+                    record("model." + name.replace("in_proj_qkv", "in_proj_qkvz"), shard_id)
                     offset += size
                 continue
             if name.endswith("linear_attn.conv1d.weight"):
                 param = self.get_parameter("model." + name)
                 param.weight_loader(param, loaded_weight)
+                record("model." + name)
                 continue
             if name.endswith("linear_attn.A_log") or name.endswith("linear_attn.dt_bias"):
                 param = self.get_parameter("model." + name)
                 shard = param.data.size(0)
                 param.data.copy_(loaded_weight.narrow(0, tp_rank * shard, shard))
+                record("model." + name)
                 continue
             # ---- 常规：packed 映射或默认装载（与 utils.loader.load_model 同构）----
             for ckpt_sub, (param_sub, shard_id) in PACKED_MODULES_MAPPING.items():
                 if ckpt_sub in name:
                     param = self.get_parameter("model." + name.replace(ckpt_sub, param_sub))
                     param.weight_loader(param, loaded_weight, shard_id)
+                    record("model." + name.replace(ckpt_sub, param_sub), shard_id)
                     break
             else:
                 param = self.get_parameter("model." + name)
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+                record("model." + name)
+        absent = {name: len(shards) for name, shards in missing.items() if shards}
+        if absent:
+            raise ValueError(f"Qwen3.5 检查点缺少参数/分片（每项为缺失数）: {absent}")

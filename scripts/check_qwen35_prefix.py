@@ -77,8 +77,8 @@ def host_check():
     print("主机契约通过：末块门控、状态复制、哈希失效、预算与淘汰", flush=True)
 
 
-def input_prompts(tokenizer, block_size=256):
-    fixed = "Reference facts: alpha=1, beta=2. Answer concisely. " * 40
+def input_prompts(tokenizer, block_size=256, repeats=40):
+    fixed = "Reference facts: alpha=1, beta=2. Answer concisely. " * repeats
     def render(role, question):
         messages = ([{"role": "system", "content": fixed},
                      {"role": "user", "content": question}]
@@ -123,17 +123,17 @@ def worker(args):
     with LLM(args.model, backend=args.backend, spec_model=args.draft if speculative else "",
              spec_num_tokens=args.spec_num_tokens,
              enforce_eager=args.case.endswith("eager") or args.case == "fi_spec",
-             enable_prefix_cache=args.cache == "on", max_model_len=1024,
+             enable_prefix_cache=args.cache == "on", max_model_len=args.max_model_len,
              max_num_batched_tokens=args.chunk_size, max_num_seqs=args.seqs,
              kvcache_block_size=args.block_size,
              num_kvcache_blocks=args.kv_blocks, gpu_memory_utilization=0.9) as llm:
         assert llm.config.enable_prefix_cache == (args.cache == "on")
-        prompts = input_prompts(llm.tokenizer, llm.config.kvcache_block_size)
-        assert max(map(len, prompts)) + args.max_tokens <= 1024
+        prompts = input_prompts(llm.tokenizer, llm.config.kvcache_block_size, args.prefix_repeats)
+        assert max(map(len, prompts)) + args.max_tokens <= llm.config.max_model_len
         rows = [run_requests(llm, [prompt], args.max_tokens)[0] for prompt in prompts]
         if args.cache == "on":
-            assert rows[1]["hit_blocks"] >= 2 and rows[2]["hit_blocks"] >= 2, rows
-            assert rows[4]["hit_blocks"] >= 2 and rows[5]["hit_blocks"] >= 2, rows
+            assert rows[1]["hit_blocks"] >= args.min_hit_blocks and rows[2]["hit_blocks"] >= args.min_hit_blocks, rows
+            assert rows[4]["hit_blocks"] >= args.min_hit_blocks and rows[5]["hit_blocks"] >= args.min_hit_blocks, rows
             assert all(not row["hit_blocks"] for row in rows[6:]), rows
             assert llm.runtime_snapshot()["recurrent"]["prefix_cache"]["restored"] >= 4
             if speculative and not llm.config.use_paged_draft:
@@ -152,7 +152,7 @@ def worker(args):
             extra.append(run_requests(llm, [prompts[0]], args.max_tokens)[0])
             assert extra[-1]["hit_blocks"] == 0
             extra.append(run_requests(llm, [prompts[0]], args.max_tokens)[0])
-            assert extra[-1]["hit_blocks"] >= 2
+            assert extra[-1]["hit_blocks"] >= args.min_hit_blocks
             assert all(row["tokens"] == rows[0]["tokens"] for row in extra)
             assert runtime.prefix_bytes <= runtime.prefix_entry_bytes
             # 整段 prefill 只暂存预算内的末块；用另一条前缀触发真实 LRU 淘汰。
@@ -165,7 +165,7 @@ def worker(args):
                 from flashengine.engine.sequence import Sequence
                 from flashengine import SamplingParams
                 probe = Sequence(prompts[0], SamplingParams(temperature=0))
-                assert llm.scheduler.block_manager.can_allocate(probe) >= 2
+                assert llm.scheduler.block_manager.can_allocate(probe) >= args.min_hit_blocks
                 runner._df_prefix_snapshots.clear()
                 runner._df_prefix_snapshot_bytes = 0
                 missing = run_requests(llm, [prompts[0]], args.max_tokens)[0]
@@ -186,7 +186,10 @@ def worker(args):
             assert metrics["flashengine_recurrent_prefix_snapshot_bytes"] == runtime.prefix_bytes
             if args.preempt:
                 from flashengine.engine.block_manager import BlockManager
-                bm = BlockManager(4, llm.config.kvcache_block_size)
+                # 仅比单请求占块多一块，短窗口模型也能实际触发抢占。
+                block_size = llm.config.kvcache_block_size
+                single_blocks = (len(prompts[0]) + 8 + block_size - 1) // block_size
+                bm = BlockManager(single_blocks + 1, block_size)
                 bm.cache_hit_validator = llm.model_runner.prefix_cache_validator()
                 bm.prefix_state_validator = runtime.has_prefix
                 llm.scheduler.block_manager = bm
@@ -298,6 +301,9 @@ def main():
     parser.add_argument("--chunk-size", type=int, default=192)
     parser.add_argument("--spec-num-tokens", type=int, default=2)
     parser.add_argument("--max-tokens", type=int, default=16)
+    parser.add_argument("--max-model-len", type=int, default=1024, help="测试上下文上限；tiny 检查点可用 512")
+    parser.add_argument("--prefix-repeats", type=int, default=40, help="共享前缀重复次数；短窗口检查点可用 20")
+    parser.add_argument("--min-hit-blocks", type=int, default=2, help="热请求必须命中的最少块数")
     parser.add_argument("--host-only", action="store_true", help="只执行小状态主机契约")
     parser.add_argument("--preempt", action="store_true", help="额外用 4 块 KV 触发双请求真实抢占")
     parser.add_argument("--reuse-off", action="store_true", help="复用已有关闭缓存的基线，只重跑开启用例")
@@ -331,7 +337,10 @@ def main():
                        "--seqs", str(args.seqs), "--kv-blocks", str(args.kv_blocks),
                        "--block-size", str(args.block_size),
                        "--chunk-size", str(args.chunk_size), "--max-tokens", str(args.max_tokens),
-                       "--spec-num-tokens", str(args.spec_num_tokens)]
+                       "--spec-num-tokens", str(args.spec_num_tokens),
+                       "--max-model-len", str(args.max_model_len),
+                       "--prefix-repeats", str(args.prefix_repeats),
+                       "--min-hit-blocks", str(args.min_hit_blocks)]
             if args.preempt:
                 command.append("--preempt")
             env = {**os.environ, "FLASHENGINE_CUDA_ATTENTION":

@@ -101,6 +101,13 @@ class Config:
             self.norm_topk_prob = bool(getattr(mc, "norm_topk_prob", True))
             self.decoder_sparse_step = int(getattr(mc, "decoder_sparse_step", 1) or 1)
             self.moe_mlp_only_layers = tuple(getattr(mc, "mlp_only_layers", None) or ())
+            if not 1 <= self.num_experts_per_tok <= self.num_experts:
+                raise ValueError(
+                    "MoE requires 1 <= num_experts_per_tok <= num_experts; "
+                    f"got {self.num_experts_per_tok} / {self.num_experts}."
+                )
+            if self.moe_intermediate_size < 1:
+                raise ValueError("MoE moe_intermediate_size must be positive.")
         if (
             not self.enable_chunked_prefill
             and self.max_num_batched_tokens < self.max_model_len
@@ -130,6 +137,8 @@ class Config:
             self.use_paged_draft = bool(
                 self.spec_is_block_draft
                 and self.backend_impl.supports_dflash_paged
+                # 当前分页草稿内核只支持全局非因果注意力；窗口草稿走稠密掩码。
+                and not getattr(self.draft_config, "block_draft_requires_mask", False)
             )
             self.keep_last_block_unhashed = self.use_paged_draft
             self.target_adapter.validate_spec_method(self.spec_method)
@@ -143,6 +152,9 @@ class Config:
                 self.model_config,
             )
             if self.spec_adapter.block_draft:
+                if (self.draft_config.hidden_size != self.model_config.hidden_size
+                        or self.draft_config.vocab_size != self.model_config.vocab_size):
+                    raise ValueError("块草稿的 hidden_size/vocab_size 必须与目标模型匹配")
                 target_layers = tuple(
                     (getattr(self.draft_config, "dflash_config", None) or {})[
                         "target_layer_ids"

@@ -57,8 +57,12 @@
 Qwen3.5 当前 TP=1、仅文本，支持完整块 KV + conv/SSM 快照的 prefix cache，
 以及保留 conv/SSM 历史的分块 prefill；DFlash 另恢复草稿 KV。
 CUDA 的 FlashAttention 支持普通与 DFlash 整轮图；
-FlashInfer 当前 DFlash 仍走 eager。CoreX/310P 是共享实现和后端契约适配，未实机验收；
-图捕获失败按既有机制回退。详细验证记录见 [Qwen3.5](QWEN35.md)。
+FlashInfer 当前 DFlash 仍走 eager。Qwen3.5 dense 的 CUDA 与 310P 4B 已实机验收；
+MoE 本轮使用 64.6MB 公开 tiny 检查点在 CUDA/FlashAttention 验收普通/DFlash 图和前缀缓存，
+CoreX/310P MoE 仍待板卡验收。图捕获失败按既有机制回退。
+新版 DFlash 的逐层滑窗/因果语义已适配；310P 的窗口草稿走稠密掩码，
+旧式全局非因果草稿仍用分页 SplitFuse。tiny 草稿未训练，功能通过不代表已验证加速比。
+详细记录见 [Qwen3.5](QWEN35.md) 与 [Qwen3.5 MoE](QWEN35_MOE.md)。
 
 ## 3. 规则（`support_matrix.evaluate`）
 

@@ -107,9 +107,9 @@ class CUDABackend(BackendBase):
         from .cuda_gdn import commit
         return commit(*args, **kwargs)
 
-    def dflash_dense_attention(self, *args):
+    def dflash_dense_attention(self, *args, **kwargs):
         from .cuda_dflash import attention
-        return attention(self._varlen, *args)
+        return attention(self._varlen, *args, **kwargs)
 
     def create_decode_graph_executor(self, plan):
         if self.flashinfer is not None:

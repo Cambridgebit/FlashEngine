@@ -1,4 +1,4 @@
-"""DFlash 稠密上下文打包：去掉固定窗口空洞，交给非因果 FlashAttention GQA。"""
+"""DFlash 稠密上下文打包：去掉空洞，交给全局/窗口 FlashAttention GQA。"""
 
 import torch
 import triton
@@ -32,7 +32,8 @@ def _pack_kernel(KC, VC, K, V, Lengths, Cu, KO, VO,
     tl.store(VO + destination, tl.where(prefix, vc, vb), mask=prefix | query)
 
 
-def attention(varlen, query, key, value, ctx_key, ctx_value, lengths, scale):
+def attention(varlen, query, key, value, ctx_key, ctx_value, lengths, scale,
+              causal=False, window=None):
     """只打包有效前缀与本轮 query KV；不复制/展开 GQA 的重复 heads。"""
     batch, rows, heads, dim = query.shape
     kv_heads = key.shape[-2]
@@ -53,4 +54,6 @@ def attention(varlen, query, key, value, ctx_key, ctx_value, lengths, scale):
     return varlen(query.reshape(batch * rows, heads, dim), packed_k, packed_v,
                   cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
                   max_seqlen_q=rows, max_seqlen_k=max_ctx + rows,
-                  softmax_scale=scale, causal=False)
+                  softmax_scale=scale, causal=causal,
+                  window_size=(-1, -1) if window is None else
+                              (window - 1, 0 if causal else window - 1))
