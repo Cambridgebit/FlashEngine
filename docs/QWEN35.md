@@ -33,12 +33,60 @@
 | CUDA / FlashAttention | 普通 decode Graph、DFlash 整轮 Graph | 本地真实权重已验收 |
 | CUDA / FlashInfer | 普通 decode Graph、DFlash eager | 本地真实权重已验收 |
 | CoreX | IXFormer 全注意力、共享 GDN、CUDA 兼容 Graph、设备 RNG | 无实机，待厂商环境验收 |
-| Ascend 310P | fp16/NZ 全注意力、静态短卷积展开、共享 GDN、NPUGraph 状态绑定 | 无实机；算子/状态契约通过 |
+| Ascend 310P | fp16/NZ 全注意力、静态短卷积展开、共享 GDN、NPUGraph 状态绑定 | Qwen3.5-4B + DFlash 实机已验收（2026-10-14/15）；其余组合待测 |
 
 310P 的 head_dim=256 自动选 KV block=64，以满足 block_size×head_dim≤16384。
 短卷积不用数千组 depthwise Conv1d，改为固定 kernel 长度的 fp32 乘加展开。
 GDN 采用独立 ND 状态，full_attention KV 仍由后端分配 FRACTAL_NZ。
 所有图捕获仍按既有机制降级；代码放行不等于三种硬件均已实机验收。
+
+## 310P 实机性能：4B DFlash k 甜点与 8B/4B 加速对比（2026-10-15）
+
+口径（8B 与 4B 同命令、同板同日同会话）：
+
+```bash
+python3 -m scripts.benchmark <目标> --backend ascend310p --no-think --gpu-mem-util 0.5 \
+  --max-model-len 2048 --max-num-seqs 1 --warmup 1 --num-prompts 3 --max-tokens 64 \
+  --questions bench_data/question.jsonl --no-prefix-cache \
+  [--spec-model <DFlash 草稿>] [--spec-num-tokens K]
+```
+
+指标 = Steady-state decode throughput（排除 TTFT/prefill，vLLM bench 同口径）；
+batch=1、温度 0、spec 图 100% 回放（0 回退）。“轮时” = E / 吞吐。
+
+| 配置 | tok/s | E | 加速比 | 轮时 | 备注 |
+|---|---:|---:|---:|---:|---|
+| Qwen3-8B 无投机 | 10.9 | — | 1× | 91.7ms | 16.4GB 权重流 @ ~179GB/s |
+| Qwen3-8B + DFlash k15 | **38.0** | 4.878 | **3.49×** | 128.4ms | |
+| Qwen3-8B + DFlash k2 | 21.4 | 2.494 | 1.96× | 116.5ms | |
+| Qwen3.5-4B 无投机 | 15.7 | — | 1× | 63.7ms | |
+| Qwen3.5-4B + DFlash k2 | 27.4 | 2.595 | 1.75× | 94.6ms | |
+| Qwen3.5-4B + DFlash k7 | **36.6** | 4.304 | **2.33×** | 117.6ms | **甜点** |
+| Qwen3.5-4B + DFlash k10 | 33.0 | 4.370 | 2.10× | 132.4ms | |
+| Qwen3.5-4B + DFlash k15 | 30.2 | 4.705 | 1.92× | 155.8ms | 默认值，非最优 |
+
+k 曲线（4B）：每行验证成本线性 ≈ **4.7ms/行**；E 在 k≈7 后饱和（k7→k15 多验 8 行只多 0.4 接受）。
+**4B 建议显式 `--spec-num-tokens 7`（比默认 k=15 快 21%）**。
+注意 CLI 的 k=3/4 视为未显式指定，本次扫描的 k=4 实际执行了默认 k=15（E 与 TPS 同 k15 逐位一致）。
+2026-10-14 的“k=2 与 k=15 打平”结论在 GDN 下标修复后不再成立——修复主要提速 rows 路径，长 k 受益更多。
+
+为什么 8B 加速 3.5× 而 4B 只有 2×：加速比 = E × T_单步 / T_轮；两边 E 相当（4.7~4.9），
+差距全在每轮成本（轮/单步比：8B 1.40×、4B 2.45×）：
+
+- 8B（纯注意力）验证 16 行 ≈ 同一份权重流一次（单步 91.7ms 已是带宽地板），额外行几乎免费（0.9ms/行）。
+- 4B 的 24 层 GDN 状态递推逐行串行：310P 走参考路径（无 `supports_fused_gdn`），
+  每层每行 ~6 个 2MB fp32 小算子；图内标定 rows 层 seg=8 = 1588us vs decode 层 927us
+  （+94us/行/层 → 整模 +2.3ms/行，约占行边际一半）。CUDA 的 triton 融合核
+  （状态驻留寄存器、row 循环在 kernel 内、每层一次启动）在 310P 不存在——
+  CUDA DFlash 71.7→134.6 tok/s 的优化吃的正是这个杠杆。
+- 另有固定开销：k2 轮 94.6ms vs 单步 63.7ms（+31ms = 草稿 1.18GiB 前向 + context 投影/分页写 +
+  采样/接受/提交/读回），对小模型占比更大。
+
+空间估算：GDN 行融合把行边际 4.7→~2.4ms，k7 轮时 117.6→~107ms ≈ **40 tok/s（2.6×）**；
+4×（需轮≈单步）不可达。
+
+板卡工件：`/data2/fe_q35_repeat.sh`（A/B）、`/data2/q35_repeat_final.log`、`/data2/q35_kscan.log`（k 扫描）、
+`/data2/fe_8b_df_cmp.sh`（8B 对照）、`/data2/fe_gdn_calib*.py`（行成本标定）。
 
 ## WSL 启动
 
