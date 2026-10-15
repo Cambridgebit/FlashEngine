@@ -1,6 +1,7 @@
 
 import os
 import threading
+from collections import OrderedDict
 from contextlib import contextmanager
 
 import torch
@@ -15,6 +16,50 @@ _COMPRESSED_MASK_SEQ_LEN = 2048
 _MASK_TYPE_NORM_COMPRESS_SELF_ATTENTION = 3
 _MASK_TYPE_NORM_COMPRESS_PAGED_ATTENTION = 5
 _PAGED_ATTENTION_COMPRESSED_MASK_VALUE = -10000.0
+
+# ---- 按长度缓存的掩码/缓冲上限（防止长测中随“见过的序列长度”无限累积） ----
+# 310P 上每个新长度都会生成一份 O(L²) 因果掩码（L=20k、fp16 单份约 762MiB），
+# 旧实现只增不减：长测里出现几十~几百个不同长度后可累积到数十 GB，把统存
+# 池推到 90%+（停止/重启才归还）。策略：
+#   1) 掩码长度按 _MASK_LEN_BUCKET 向上取整做键——因果掩码的左上角子矩阵性质
+#      保证“更大的掩码”对更短序列完全等价（批量内多序列本就共用按最大长度
+#      构造的掩码），取整只提高同桶复用、不改变数值；
+#   2) 每个缓存池按字节做 LRU 上限，仅当超预算时淘汰最久未用项。
+# 稳态命中率不受影响（同一批内 36 层复用同一份掩码），内存封顶为常量级。
+_MASK_LEN_BUCKET = 1024
+_MASK_CACHE_BYTES = 2 << 30            # _nd_mask / _nz_mask 每池上限 2 GiB
+_DFLASH_MASK_CACHE_BYTES = 64 << 20    # 草稿 non-causal 掩码池上限
+_ROPE_BUFFER_CACHE_BYTES = 64 << 20    # RoPE cos/sin 复用缓冲池上限
+
+
+def _bucket_mask_len(max_seq_len: int) -> int:
+    step = _MASK_LEN_BUCKET
+    return max(step, ((max_seq_len + step - 1) // step) * step)
+
+
+def _tensor_bytes(value) -> int:
+    if isinstance(value, tuple):
+        return sum(_tensor_bytes(item) for item in value)
+    numel = getattr(value, "numel", None)
+    if numel is None:
+        return 0
+    return value.numel() * value.element_size()
+
+
+def _lru_get(cache: "OrderedDict", key):
+    value = cache.get(key)
+    if value is not None:
+        cache.move_to_end(key)
+    return value
+
+
+def _lru_put(cache: "OrderedDict", key, value, max_bytes: int) -> None:
+    cache[key] = value
+    cache.move_to_end(key)
+    total = sum(_tensor_bytes(item) for item in cache.values())
+    while total > max_bytes and len(cache) > 1:
+        _, dropped = cache.popitem(last=False)
+        total -= _tensor_bytes(dropped)
 
 _REQUIRED_OPS = (
     "_npu_reshape_and_cache",
@@ -151,12 +196,13 @@ class Ascend310PBackend(BackendBase):
     def __init__(self):
         tn = _torch_npu()
         self._setup_runtime()
-        self._nz_mask = {}
-        self._nd_mask = {}
+        self._nz_mask = OrderedDict()
+        self._nd_mask = OrderedDict()
+        self._dflash_mask = OrderedDict()
         self._splitfuse_mask = {}
         self._decode_out = {}
         self._rope_cache = {}
-        self._rope_apply_cache = {}
+        self._rope_apply_cache = OrderedDict()
         # vllm_ascend 的 unquantized_gemm 在后台线程导入（见 _start_vllm_gemm_import），
         # 这里只登记未解析状态，首次 linear()/runtime_info() 时再惰性取算子。
         self._unquantized_gemm = None
@@ -223,6 +269,12 @@ class Ascend310PBackend(BackendBase):
         gemm = ("vllm.unquantized_gemm" if self._gemm_op() is not None
                 else "torch-fallback")
         info["fused_ops"] = info["fused_ops"].format(gemm=gemm)
+        nd_bytes = sum(_tensor_bytes(v) for v in self._nd_mask.values())
+        nz_bytes = sum(_tensor_bytes(v) for v in self._nz_mask.values())
+        info["mask_cache"] = (
+            f"nd={len(self._nd_mask)}({nd_bytes >> 20}MiB), "
+            f"nz={len(self._nz_mask)}({nz_bytes >> 20}MiB)"
+        )
         return info
 
     def _gemm_op(self):
@@ -487,12 +539,9 @@ class Ascend310PBackend(BackendBase):
         return out
 
     def _dflash_noncausal_mask(self, query_tokens: int, max_seq_len: int, device):
-        cache = getattr(self, "_dflash_mask", None)
-        if cache is None:
-            self._dflash_mask = {}
-            cache = self._dflash_mask
+        cache = self._dflash_mask
         key = (query_tokens, max_seq_len, str(device), self._splitfuse_v2 is not None)
-        mask = cache.get(key)
+        mask = _lru_get(cache, key)
         if mask is not None:
             return mask
         if self._splitfuse_v2 is not None:
@@ -506,7 +555,7 @@ class Ascend310PBackend(BackendBase):
                 (query_tokens, max_seq_len), dtype=torch.float16, device=device
             )
             mask = self._nd_to_nz_spec(mask_nd)
-        cache[key] = mask
+        _lru_put(cache, key, mask, _DFLASH_MASK_CACHE_BYTES)
         return mask
 
     def dflash_paged_attention(
@@ -948,33 +997,35 @@ class Ascend310PBackend(BackendBase):
         return buf
 
     def _causal_mask_nz(self, max_seq_len, device):
-        cached = self._nz_mask.get(max_seq_len)
+        seq_len = _bucket_mask_len(max_seq_len)
+        cached = _lru_get(self._nz_mask, seq_len)
         if cached is not None:
             return cached
         tn = _torch_npu()
-        aligned = (max_seq_len + 15) // 16 * 16
+        aligned = (seq_len + 15) // 16 * 16
         mask_nd = torch.zeros((aligned, aligned), dtype=torch.float16, device=device)
         upper = torch.triu(
-            torch.ones((max_seq_len, max_seq_len), dtype=torch.bool, device=device),
+            torch.ones((seq_len, seq_len), dtype=torch.bool, device=device),
             diagonal=1,
         )
-        mask_nd[:max_seq_len, :max_seq_len].masked_fill_(upper, float("-inf"))
+        mask_nd[:seq_len, :seq_len].masked_fill_(upper, float("-inf"))
         mask = mask_nd.reshape(1, aligned, aligned // 16, 16).permute(0, 2, 1, 3).contiguous()
         mask = tn.npu_format_cast(mask, _acl_format_nz())
-        self._nz_mask[max_seq_len] = mask
+        _lru_put(self._nz_mask, seq_len, mask, _MASK_CACHE_BYTES)
         return mask
 
     def _causal_mask_nd(self, max_seq_len, device):
-        cached = self._nd_mask.get(max_seq_len)
+        seq_len = _bucket_mask_len(max_seq_len)
+        cached = _lru_get(self._nd_mask, seq_len)
         if cached is not None:
             return cached
-        mask = torch.zeros((max_seq_len, max_seq_len), dtype=torch.float16, device=device)
+        mask = torch.zeros((seq_len, seq_len), dtype=torch.float16, device=device)
         upper = torch.triu(
-            torch.ones((max_seq_len, max_seq_len), dtype=torch.bool, device=device),
+            torch.ones((seq_len, seq_len), dtype=torch.bool, device=device),
             diagonal=1,
         )
         mask.masked_fill_(upper, float("-inf"))
-        self._nd_mask[max_seq_len] = mask
+        _lru_put(self._nd_mask, seq_len, mask, _MASK_CACHE_BYTES)
         return mask
 
     def _compressed_splitfuse_mask(self, device):
@@ -1120,7 +1171,7 @@ class Ascend310PBackend(BackendBase):
                     cache.data_ptr(), num_tokens, rotary_dim,
                     str(q.device), q.dtype,
                 )
-                buffers = self._rope_apply_cache.get(buffer_key)
+                buffers = _lru_get(self._rope_apply_cache, buffer_key)
                 if buffers is None:
                     buffers = (
                         torch.empty(
@@ -1132,7 +1183,8 @@ class Ascend310PBackend(BackendBase):
                             dtype=q.dtype, device=q.device,
                         ),
                     )
-                    self._rope_apply_cache[buffer_key] = buffers
+                    _lru_put(self._rope_apply_cache, buffer_key, buffers,
+                             _ROPE_BUFFER_CACHE_BYTES)
                 context.rope_cos, context.rope_sin = buffers
                 context.rope_cos.copy_(cos.contiguous().view_as(context.rope_cos))
                 context.rope_sin.copy_(sin.contiguous().view_as(context.rope_sin))
