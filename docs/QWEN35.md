@@ -85,6 +85,31 @@ k 曲线（4B）：每行验证成本线性 ≈ **4.7ms/行**；E 在 k≈7 后�
 空间估算：GDN 行融合把行边际 4.7→~2.4ms，k7 轮时 117.6→~107ms ≈ **40 tok/s（2.6×）**；
 4×（需轮≈单步）不可达。
 
+### GDN 位等微优化与算子地板（2026-10-15）
+
+已落地全位等微优化（`g_exp` 整段一次、rank-1 就地 `add_`、`has_initial` 零张量复用、
+conv1d 输入/权重各一次 fp32 转换）：层内 rows seg=8 1574→1565us、decode 911→896us；
+端到端无投机 15.7→15.8、k7 36.6→36.8（E=4.304 逐位不变）；三处位等校验（conv1d 三形状、
+rows/decode 输出 + ssm/conv 双状态池）与 check_qwen35 四用例 5/5 全过。
+
+图内逐算子目录（NPUGraph、链式、310P）：
+
+| 算子 | 成本 |
+|---|---:|
+| 2MB fp32 elementwise（mul/add 链式） | ≈6.1us/op |
+| 2MB `(x * k).sum(-2)` 组合 | ≈21.6us |
+| 2MB `index_select` / `index_copy_` / 切片 int 写 | 9.1 / 44–49 / 8.6us |
+| 2MB `index_put_` / `scatter_(expand)` / `torch.gather(expand)` | 578 / ~8550 / ~7970us |
+| tiny 依赖链 | ≈1.1–2us/op |
+| 40KB 级单发算子（cast/silu/where/cat/contiguous） | 6.4–11.9us |
+
+分段（rows 层 seg=8 = 1589us）：投影+尾 534（权重主导）+ conv 段 198 + 拆头/l2norm/gating 73.5 +
+行递推 783（97.9us/行）。行循环在环消融（713us / 8 行）：kv 收缩 19.8/行 + out 收缩 17.8 +
+池写 16.8 + gexp 乘 10.8 + outer/add ≈24。
+判决：行递推 ≈10 个算子 × ~9us/行，已贴 torch 算子地板；否决清单（addcmul/unfold/GQA 视图/
+融合池写两式/index_put_/scatter 系/…）与仅剩的两条大杠杆（融合自定义算子、放宽位等契约）见 AGENTS.md。
+标定与工件：板卡 `/data2/fe_gdn_calib5-10.py` + `q35_gdn_calib*.log`、A/B `fe_q35_ab_patch.sh`。
+
 板卡工件：`/data2/fe_q35_repeat.sh`（A/B）、`/data2/q35_repeat_final.log`、`/data2/q35_kscan.log`（k 扫描）、
 `/data2/fe_8b_df_cmp.sh`（8B 对照）、`/data2/fe_gdn_calib*.py`（行成本标定）。
 

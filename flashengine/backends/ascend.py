@@ -150,11 +150,15 @@ class Ascend310PBackend(BackendBase):
 
     def gdn_causal_conv1d(self, inputs, weight):
         # 310P 用静态短卷积展开，避免数千组 depthwise Conv1d 的算子约束。
+        # fp16→fp32 转换一次做整张（逐抽头 cast 位等，省 kernel-1 次小算子）；
+        # 权重同样一次转 fp32 再逐抽头取列。
         kernel = weight.shape[-1]
         length = inputs.shape[-1] - kernel + 1
-        out = inputs[:, :, :length].float() * weight[:, 0, 0].float()[None, :, None]
+        x = inputs.float()
+        w = weight[:, 0, :].float()  # [C, K]
+        out = x[:, :, :length] * w[:, 0][None, :, None]
         for offset in range(1, kernel):
-            out = out + inputs[:, :, offset:offset + length].float() * weight[:, 0, offset].float()[None, :, None]
+            out = out + x[:, :, offset:offset + length] * w[:, offset][None, :, None]
         return out.to(inputs.dtype)
 
     def normalize_config(self, config) -> None:

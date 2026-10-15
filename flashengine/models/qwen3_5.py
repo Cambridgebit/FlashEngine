@@ -527,16 +527,23 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             return self.backend.gdn_recurrent(q, k, v, g, beta, self.ssm_cache,
                                               slots, initial=has_initial)
         v = v.float()
-        # 状态读入 + 无初始态行清零（torch.where 无 host 同步，图安全）
+        # 状态读入 + 无初始态行清零（torch.where 无 host 同步，图安全；零张量
+        # 预分配复用，省掉每层 zeros_like 的 2MB 物化写，位等）
         state = torch.index_select(self.ssm_cache, 0, idx)  # [n, H, K, V] fp32
-        state = torch.where(has_initial.view(-1, 1, 1, 1), state, torch.zeros_like(state))
+        zero = getattr(self, "_gdn_zero_state", None)
+        if zero is None or zero.device != state.device:
+            zero = torch.zeros(1, self.num_v_heads, self.head_k_dim, self.head_v_dim,
+                               dtype=torch.float32, device=state.device)
+            self._gdn_zero_state = zero
+        state = torch.where(has_initial.view(-1, 1, 1, 1), state, zero)
         # 单步递归（transformers torch_recurrent_gated_delta_rule 循环体 L364-375 逐行移植，
         # 全批向量化；q 已含 1/sqrt(K) 缩放）：
         #   S̃ = exp(g)·S；kv_mem = kᵀS̃；S = S̃ + k⊗(beta·(v − kv_mem))；o = Sᵀq
         state = state * g.exp().unsqueeze(-1).unsqueeze(-1)
         kv_mem = (state * k.unsqueeze(-1)).sum(dim=-2)
         delta = (v - kv_mem) * beta.unsqueeze(-1)
-        state = state + k.unsqueeze(-1) * delta.unsqueeze(-2)
+        # 就地 rank-1 更新（state 为本层新张量；与 out-of-place 位等，省一次分配）
+        state = state.add_(k.unsqueeze(-1) * delta.unsqueeze(-2))
         out = (state * q.unsqueeze(-1)).sum(dim=-2)  # [n, H, V]
         self.ssm_cache.index_copy_(0, idx, state)
         return out.to(mixed_qkv.dtype)
@@ -605,13 +612,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             q = _l2norm(q).float() * self.head_k_dim ** -0.5  # [seg, H, K]
             k = _l2norm(k).float()
             v = v.float()
+            # g 的 exp 整段一次（逐行 g[j].exp() 与 g.exp()[j] 位等，省 seg-1 次小算子）
+            g_exp = g.exp()
             state = ssm_carry[i]  # [H, K, V] fp32（读槽①已 gather）
             outs = []
             for j in range(seg):
-                state = state * g[j].exp().unsqueeze(-1).unsqueeze(-1)
-                kv_mem = (state * k[j].unsqueeze(-1)).sum(dim=-2)
+                sg = state * g_exp[j].unsqueeze(-1).unsqueeze(-1)
+                kv_mem = (sg * k[j].unsqueeze(-1)).sum(dim=-2)
                 delta = (v[j] - kv_mem) * beta[j].unsqueeze(-1)
-                state = state + k[j].unsqueeze(-1) * delta.unsqueeze(-2)
+                # 就地 rank-1 更新（sg 为本行新张量；与 out-of-place 位等，省一次分配）
+                state = sg.add_(k[j].unsqueeze(-1) * delta.unsqueeze(-2))
                 # 逐行直写验证槽：省掉 stack(seg×2MB) 与整段切片写的二次搬运
                 self.ssm_cache[base_l[i] + j] = state
                 outs.append((state * q[j].unsqueeze(-1)).sum(dim=-2))
