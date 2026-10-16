@@ -113,10 +113,9 @@ rows/decode 输出 + ssm/conv 双状态池）与 check_qwen35 四用例 5/5 全�
 池写 16.8 + gexp 乘 10.8 + outer/add ≈24。
 判决：行递推 ≈10 个算子 × ~9us/行，已贴 torch 算子地板；否决清单（addcmul/unfold/GQA 视图/
 融合池写两式/index_put_/scatter 系/…）与仅剩的两条大杠杆（融合自定义算子、放宽位等契约）见 AGENTS.md。
-标定与工件：板卡 `/data2/fe_gdn_calib5-10.py` + `q35_gdn_calib*.log`、A/B `fe_q35_ab_patch.sh`。
-
-板卡工件：`/data2/fe_q35_repeat.sh`（A/B）、`/data2/q35_repeat_final.log`、`/data2/q35_kscan.log`（k 扫描）、
-`/data2/fe_8b_df_cmp.sh`（8B 对照）、`/data2/fe_gdn_calib*.py`（行成本标定）。
+标定与工件：标定/测试脚本已于 2026-10-16 清理；日志保留板卡（`q35_gdn_calib*.log`、
+`q35_repeat_final.log`、`q35_kscan*.log`、`all_models_perf.log`），复现配置见
+[`docs/ASCEND310P_BENCH.md`](ASCEND310P_BENCH.md)。
 
 ## WSL 启动
 
