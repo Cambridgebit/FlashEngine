@@ -63,10 +63,13 @@ class Qwen3MoeExperts(nn.Module):
         self.quantized = quantized
         if quantized:
             # W8A8_DYNAMIC：int8 权重 + [E, N, 1] 逐通道尺度/偏移（{w13,w2}）。
+            # int8 不可求导，Parameter 显式 requires_grad=False。
             self.w13_weight = nn.Parameter(
-                torch.empty(num_experts, 2 * intermediate_size, hidden_size, dtype=torch.int8))
+                torch.empty(num_experts, 2 * intermediate_size, hidden_size, dtype=torch.int8),
+                requires_grad=False)
             self.w2_weight = nn.Parameter(
-                torch.empty(num_experts, hidden_size, intermediate_size, dtype=torch.int8))
+                torch.empty(num_experts, hidden_size, intermediate_size, dtype=torch.int8),
+                requires_grad=False)
             self.w13_weight_scale = nn.Parameter(
                 torch.empty(num_experts, 2 * intermediate_size, 1, dtype=torch.float32))
             self.w13_weight_offset = nn.Parameter(

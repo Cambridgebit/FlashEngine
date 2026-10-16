@@ -132,6 +132,16 @@ def _acl_format_nz():
     return acl_format
 
 
+def _acl_format_nd():
+    tn = _torch_npu()
+    acl_format = getattr(tn, "ACL_FORMAT_ND", 2)
+    try:
+        from torch_npu.utils import ACL_FORMAT_ND as acl_format
+    except Exception:
+        pass
+    return acl_format
+
+
 class Ascend310PBackend(BackendBase):
 
     name = "ascend310p"
@@ -455,11 +465,16 @@ class Ascend310PBackend(BackendBase):
             quant_mode=-1,
             row_idx_type=0,
         )
+        # init_routing / swiglu 可能输出 FRACTAL_NZ 内部格式；分组量化矩阵乘
+        # （内部 lower 到 QuantBatchMatmulV3）要求激活为 ND——否则 token 数 >1
+        # 时 tiling 直接 aicore 异常（507015）。已是 ND 时为元数据操作。
+        sorted_hs = tn.npu_format_cast(sorted_hs, _acl_format_nd())
         group_list = expert_tokens.to(torch.int64)
         gate_up = tn.npu_quant_grouped_matmul_dequant(
             x=sorted_hs, quantized_weight=w13_weight, weight_scale=w13_scale,
             group_list=group_list, quant_mode="pertoken")
         gate_up = tn.npu_swiglu(gate_up)
+        gate_up = tn.npu_format_cast(gate_up, _acl_format_nd())
         projected = tn.npu_quant_grouped_matmul_dequant(
             x=gate_up, quantized_weight=w2_weight, weight_scale=w2_scale,
             group_list=group_list, quant_mode="pertoken")
@@ -520,16 +535,27 @@ class Ascend310PBackend(BackendBase):
                             input_scale, input_scale_reciprocal, input_offset,
                             out_dtype, bias):
         tn = _torch_npu()
+        # 前置融合算子（rms_norm/add_rms_norm 等）可能输出 FRACTAL_NZ 内部格式，
+        # 而 npu_quant_matmul 的 x1 必须是 ND——否则图捕获/多批解码时
+        # QuantBatchMatmulV3 tiling 直接 aicore 异常（507015，异步不可恢复）。
+        # 已是 ND 时 npu_format_cast 为元数据操作。
+        x = tn.npu_format_cast(x, _acl_format_nd())
         if x.dtype != torch.int8:
             x = tn.npu_quantize(
                 x.contiguous(), input_scale_reciprocal, input_offset,
                 torch.qint8, -1, False)
+            # npu_quantize 的输出格式在图捕获期可能被判为 NZ 内部格式，而
+            # npu_quant_matmul 的 x1 必须 ND（QuantBatchMatmulV3 tiling 拒绝）。
+            x = tn.npu_format_cast(x, _acl_format_nd())
         return tn.npu_quant_matmul(
             x, weight, deq_scale, bias=quant_bias, output_dtype=out_dtype)
 
     def quant_linear_dynamic(self, x, weight, weight_scale, out_dtype, bias):
         tn = _torch_npu()
+        # 同上：动态量化路径的激活同样须为 ND。
+        x = tn.npu_format_cast(x, _acl_format_nd())
         quantized_x, pertoken_scale = tn.npu_dynamic_quant(x.contiguous())
+        quantized_x = tn.npu_format_cast(quantized_x, _acl_format_nd())
         squeeze = False
         if pertoken_scale.dim() == 2:
             squeeze = True
@@ -637,7 +663,11 @@ class Ascend310PBackend(BackendBase):
         npu_config = getattr(torch.npu, "config", None)
         if npu_config is not None and hasattr(npu_config, "allow_internal_format"):
             try:
-                npu_config.allow_internal_format = True
+                # FLASHENGINE_310P_INTERNAL_FORMAT=0 关闭内部格式传播（默认开）。
+                # w8a8 MoE 在 310P 上曾因算子内部选 NZ 输入触发 QuantBatchMatmulV3
+                # tiling 的 aicore 异常；该开关用于验证/规避。
+                enabled = os.getenv("FLASHENGINE_310P_INTERNAL_FORMAT", "1") != "0"
+                npu_config.allow_internal_format = enabled
             except Exception as exc:
                 print(f"[FlashEngine] 310P: allow_internal_format failed: {exc}", flush=True)
         set_compile_mode = getattr(torch.npu, "set_compile_mode", None)

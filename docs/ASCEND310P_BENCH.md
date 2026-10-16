@@ -69,6 +69,25 @@ bash /data2/fe_py.sh -m scripts.benchmark /data/Qwen3-30B-A3B $BASE30B \
 判读：**出现 ~2× 离群先复测再记录**（游离慢态，同命令同代码可复现正常值；
 E 逐位不变可作对照）；持续慢态建议重启板卡后再测。
 
+### W8A8 量化模型（msmodelslim 导出，2026-10-16 首测）
+
+```bash
+# 串行（同 BASE30B 口径，系统 python）
+bash /data2/fe_py.sh -m scripts.benchmark /data/Qwen3-8B-W8A8 $BASE30B
+bash /data2/fe_py.sh -m scripts.benchmark /data/Qwen3-Coder-30B-A3B-Instruct-w8a8 $BASE30B
+# 批量聚合（含 prefill；工具脚本 /data2/fe_batch_bench.py 已保留）
+bash /data2/fe_py.sh /data2/fe_batch_bench.py --model /data/Qwen3-8B-W8A8 \
+  --gpu-mem-util 0.5 --max-model-len 2048
+```
+
+实测：**Qwen3-8B-W8A8 串行 15.5**（fp16 10.7 → **1.45×**）、批量 bs1/4/8 = 14.8/58.6/**100.7** agg；
+**Coder-30B-w8a8 串行 30.3**（fp16 19.0 → **1.59×**）。
+
+⚠️ **已知问题（未修）**：W8A8 **MoE** 在 token 数大时崩——`op[QuantBatchMatmulV3], Input x1
+format should be ND, actual format is FRACTAL_NZ` → aicore 507015（异步不可恢复）；
+引擎预热的多序列 prefill（如 8×1024）必触发，`max_num_seqs=1` 串行可用——
+Coder 的批量档因此缺失。排查与尝试过的规避见 AGENTS.md「310P W8A8 实机首测」。
+
 ## 正确性验收（check_qwen35 四用例，严格逐 token 一致）
 
 ```bash
@@ -83,7 +102,8 @@ bash /data2/fe_py_t5.sh -m scripts.check_qwen35 /data/Qwen3.5-4B \
 ## 常量备忘
 
 - 草稿默认 k（配置派生）：8B=15、4B=15（block16）、30B=7（block8，speculators `speculative_tokens=7`）。
-- 模型目录：`/data/Qwen3-8B(-Dflash)`、`/data/Qwen3.5-4B(-Dflash)`、`/data/Qwen3-30B-A3B(-Dflash)`。
+- 模型目录：`/data/Qwen3-8B(-Dflash)`、`/data/Qwen3.5-4B(-Dflash)`、`/data/Qwen3-30B-A3B(-Dflash)`；
+  W8A8：`/data/Qwen3-8B-W8A8`、`/data/Qwen3-Coder-30B-A3B-Instruct(-w8a8)`、`/data/Qwen3-Coder-30B-A3B-DFlash`。
 - 服务端一键入口：`bash /data2/run_qwen35_server.sh`（Qwen3.5-4B+DFlash，`:8000`；
   `FE_PORT/FE_MAX_SEQS/FE_MML` 可覆盖）。
-- 板卡保留脚本：`run_qwen35_server.sh`、`fe_py.sh`、`fe_py_t5.sh`、`fe_install_t5.sh`（其余测试脚本已清理）。
+- 板卡保留脚本：`run_qwen35_server.sh`、`fe_py.sh`、`fe_py_t5.sh`、`fe_install_t5.sh`、`fe_batch_bench.py`（批量聚合对照工具）。

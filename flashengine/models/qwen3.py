@@ -24,10 +24,14 @@ def resolve_quant_scheme(config, prefix: str) -> str:
 
     config 为 HF 配置（quant_scheme 由 Config 从 quant_model_description.json 解析后
     透传到 hf_config）；prefix 为检查点权重前缀（如 model.layers.0.self_attn.q_proj）。
+    "FLOAT" 是 msmodelslim 的显式未量化标记（如部分导出只量化 gate/up、down 保持
+    fp16）——按未量化处理，不能透传给 quantized_class 否则报「Unsupported scheme」。
     """
     table = getattr(config, "quant_scheme", None) or {}
     value = table.get(prefix + ".weight", "")
-    return value if isinstance(value, str) else ""
+    if not isinstance(value, str) or value == "FLOAT":
+        return ""
+    return value
 
 
 class Qwen3Attention(nn.Module):

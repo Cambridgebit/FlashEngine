@@ -43,7 +43,9 @@ def _setup_quant_params(module, scheme: str) -> None:
     out_size, in_size = weight.shape
     out_dtype = weight.dtype
     weight_loader = getattr(weight, "weight_loader", None)
-    module.weight = nn.Parameter(torch.empty(out_size, in_size, dtype=torch.int8))
+    # 非浮点 dtype 的 Parameter 必须显式 requires_grad=False（int8/int32/int64 不可求导）。
+    module.weight = nn.Parameter(torch.empty(out_size, in_size, dtype=torch.int8),
+                                 requires_grad=False)
     if weight_loader is not None:
         _attach(module.weight, weight_loader)
     module.quant_scheme_name = scheme
@@ -51,11 +53,14 @@ def _setup_quant_params(module, scheme: str) -> None:
     if scheme == W8A8_STATIC:
         module.weight_scale = nn.Parameter(torch.empty(out_size, 1, dtype=out_dtype))
         module.weight_offset = nn.Parameter(torch.empty(out_size, 1, dtype=out_dtype))
-        module.quant_bias = nn.Parameter(torch.empty(out_size, dtype=torch.int32))
-        module.deq_scale = nn.Parameter(torch.empty(out_size, dtype=torch.int64))
+        module.quant_bias = nn.Parameter(torch.empty(out_size, dtype=torch.int32),
+                                         requires_grad=False)
+        module.deq_scale = nn.Parameter(torch.empty(out_size, dtype=torch.int64),
+                                        requires_grad=False)
         # per-tensor 激活参数（整表，不分片）。
         module.input_scale = nn.Parameter(torch.empty(1, dtype=out_dtype))
-        module.input_offset = nn.Parameter(torch.empty(1, dtype=torch.int8))
+        module.input_offset = nn.Parameter(torch.empty(1, dtype=torch.int8),
+                                           requires_grad=False)
         for name in ("weight_scale", "weight_offset", "quant_bias", "deq_scale"):
             if weight_loader is not None:
                 _attach(getattr(module, name), weight_loader)
