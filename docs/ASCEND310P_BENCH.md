@@ -3,6 +3,7 @@
 本文件汇总 310P 实机的常规测试配置，用于自测复现（历史一次性脚本已于 2026-10-16 清理，
 日志保留在板卡 `/data2/*.log`）。方法与指标口径见 [`AGENTS.md`](../AGENTS.md) 与
 [`docs/QWEN35.md`](QWEN35.md)；支持清单见 [`docs/SUPPORT_MATRIX.md`](SUPPORT_MATRIX.md)。
+**实测结果（13 组模型的 TPS/TTFT/TPOT/E 总表）见 [`ASCEND310P_BENCHMARK.md`](ASCEND310P_BENCHMARK.md)。**
 
 ## 运行环境（板卡）
 
