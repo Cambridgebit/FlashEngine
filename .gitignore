@@ -1,4 +1,7 @@
 # Byte-compiled / optimized / DLL files
+# 独立 C++ Git 仓库，不纳入 Python 仓提交。
+/flashengine-cpp/
+/deployment_output/
 __pycache__/
 *.py[cod]
 *$py.class

@@ -1,0 +1,140 @@
+{
+  "status": "passed",
+  "backend": "cuda",
+  "model": "/home/yjq040828/vllm-lab/models/Qwen3-1.7B",
+  "spec_model": "/home/yjq040828/vllm-lab/models/Qwen3-1.7B-Dflash-synth",
+  "synthetic_draft_is_quality_evidence": false,
+  "options": {
+    "model": "/home/yjq040828/vllm-lab/models/Qwen3-1.7B",
+    "backend": "auto",
+    "spec_model": "/home/yjq040828/vllm-lab/models/Qwen3-1.7B-Dflash-synth",
+    "spec_num_tokens": 2,
+    "eager": false,
+    "no_prefix_cache": false,
+    "device": 0,
+    "max_model_len": 1024,
+    "max_num_seqs": 2,
+    "max_tokens": 8,
+    "cycles": 2,
+    "rounds": 3,
+    "memory_budget_mib": 6144,
+    "device_reserve_mib": 512,
+    "drift_tolerance_mib": 16,
+    "runtime_cache_tolerance_mib": 32,
+    "output": "bench_results/python-memory/qwen3-dflash-graph.json"
+  },
+  "cycles": [
+    {
+      "cycle": 0,
+      "memory": {
+        "plan": {
+          "total_bytes": 8585216000,
+          "free_bytes": 3160408064,
+          "resident_bytes": 4124402688,
+          "workspace_bytes": 268435456,
+          "graph_reserve_bytes": 268435456,
+          "device_reserve_bytes": 536870912,
+          "engine_budget_bytes": 6442450944,
+          "block_bytes": 29360128,
+          "num_blocks": 60,
+          "kv_bytes": 1761607680
+        },
+        "stages": {
+          "weights_states_warmup": {
+            "resident_bytes": 4124129280,
+            "peak_bytes": 4165551104
+          },
+          "static_buffers": {
+            "resident_bytes": 4124402688,
+            "peak_bytes": 4165551104
+          },
+          "kv_cache": {
+            "resident_bytes": 5886010368,
+            "peak_bytes": 5886010368
+          },
+          "graphs": {
+            "resident_bytes": 5894531072,
+            "peak_bytes": 5961827840
+          }
+        },
+        "allocated_bytes": 5894531072,
+        "peak_bytes": 5961827840,
+        "device": "cuda:0"
+      },
+      "cache": {
+        "requests": 11,
+        "prefix_hits": 10,
+        "prefix_hit_blocks": 10,
+        "cached_blocks": 10,
+        "new_blocks": 12,
+        "hit_rate": 0.9090909090909091,
+        "used_blocks": 0,
+        "total_blocks": 60
+      },
+      "allocations_bytes": [
+        5894531072,
+        5894531072,
+        5894531072
+      ],
+      "execution_path": "spec_graph",
+      "completion_tokens": 24,
+      "unload_delta_bytes": 17039360
+    },
+    {
+      "cycle": 1,
+      "memory": {
+        "plan": {
+          "total_bytes": 8585216000,
+          "free_bytes": 3095396352,
+          "resident_bytes": 4115883008,
+          "workspace_bytes": 268435456,
+          "graph_reserve_bytes": 268435456,
+          "device_reserve_bytes": 536870912,
+          "engine_budget_bytes": 6442450944,
+          "block_bytes": 29360128,
+          "num_blocks": 57,
+          "kv_bytes": 1673527296
+        },
+        "stages": {
+          "weights_states_warmup": {
+            "resident_bytes": 4115609600,
+            "peak_bytes": 4127015936
+          },
+          "static_buffers": {
+            "resident_bytes": 4115883008,
+            "peak_bytes": 4127015936
+          },
+          "kv_cache": {
+            "resident_bytes": 5789410304,
+            "peak_bytes": 5789410304
+          },
+          "graphs": {
+            "resident_bytes": 5789411328,
+            "peak_bytes": 5840028672
+          }
+        },
+        "allocated_bytes": 5789411328,
+        "peak_bytes": 5840028672,
+        "device": "cuda:0"
+      },
+      "cache": {
+        "requests": 11,
+        "prefix_hits": 10,
+        "prefix_hit_blocks": 10,
+        "cached_blocks": 10,
+        "new_blocks": 12,
+        "hit_rate": 0.9090909090909091,
+        "used_blocks": 0,
+        "total_blocks": 57
+      },
+      "allocations_bytes": [
+        5806450688,
+        5806450688,
+        5806450688
+      ],
+      "execution_path": "spec_graph",
+      "completion_tokens": 24,
+      "unload_delta_bytes": 0
+    }
+  ]
+}

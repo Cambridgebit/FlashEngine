@@ -1,5 +1,6 @@
 import json
 import os
+import torch
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -9,6 +10,7 @@ from flashengine.backends import get_backend
 from flashengine.models.registry import resolve_target_model
 from flashengine.speculative.registry import load_draft_config, resolve_spec_method
 from flashengine.support_matrix import require_supported
+from flashengine.engine.memory import validate_memory_options
 
 
 @dataclass(slots=True)
@@ -20,10 +22,18 @@ class Config:
     enable_chunked_prefill: bool = True
     max_num_partial_prefills: int = 1
     gpu_memory_utilization: float = 0.9
+    memory_budget_bytes: int = 0
+    device_memory_reserve_bytes: int = 0
+    memory_workspace_bytes: int = 256 * 1024 * 1024
+    graph_memory_reserve_bytes: int = 256 * 1024 * 1024
+    device_ids: tuple[int, ...] = ()
+    max_pending_requests: int = 1024
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
     backend: str = "auto"
-    hccl_port: int = 28000
+    dtype: str | None = None
+    hccl_port: int = 0
+    shm_name: str = ""
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256
@@ -58,6 +68,19 @@ class Config:
     dequant_int8_weights: bool = field(default=False, init=False)
 
     def __post_init__(self):
+        validate_memory_options(self.gpu_memory_utilization, self.memory_budget_bytes,
+                                self.device_memory_reserve_bytes, self.memory_workspace_bytes,
+                                self.graph_memory_reserve_bytes, self.num_kvcache_blocks)
+        self.device_ids = tuple(self.device_ids) or tuple(range(self.tensor_parallel_size))
+        if (len(self.device_ids) != self.tensor_parallel_size
+                or len(set(self.device_ids)) != len(self.device_ids)
+                or any(isinstance(i, bool) or not isinstance(i, int) or i < 0 for i in self.device_ids)):
+            raise ValueError("device_ids 必须包含每个 TP rank 对应的独立设备索引")
+        if (isinstance(self.max_pending_requests, bool)
+                or not isinstance(self.max_pending_requests, int) or self.max_pending_requests < 1):
+            raise ValueError("max_pending_requests 必须为正数")
+        if not 0 <= self.hccl_port <= 65535:
+            raise ValueError("hccl_port 必须在 [0, 65535] 内")
         if self.backend != "auto":
             os.environ["FLASHENGINE_BACKEND"] = self.backend
         self.backend_impl = get_backend()
@@ -81,6 +104,15 @@ class Config:
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.target_adapter = resolve_target_model(self.hf_config)
         self.model_config = self.target_adapter.model_config(self.hf_config)
+        if self.dtype is not None:
+            if self.dtype not in ("float16", "bfloat16"):
+                raise ValueError("dtype 仅支持 float16/bfloat16")
+            requested = getattr(torch, self.dtype)
+            forced = self.backend_impl.default_dtype
+            if forced is not None and forced != requested:
+                raise ValueError("dtype 与后端强制计算类型冲突")
+            # planner 和模型必须读取同一个实际 dtype，不能只覆盖权重转换。
+            self.model_config.dtype = requested
         if self.target_adapter.recurrent_state:
             if self.tensor_parallel_size != 1:
                 raise NotImplementedError("带 recurrent 状态的目标模型当前要求 TP=1")

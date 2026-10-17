@@ -1,5 +1,17 @@
 # AGENTS.md
 
+**Python 显存与 Triton 接口增量（2026-10-17）**：本轮用户明确授权优化与测试。新增跨后端启动预算（显式 KV 块数也受校验）、设备映射、独立通信资源、公开请求取消/快照和薄的 `TritonPythonModel.initialize/execute/finalize` 入口；不实现 Triton Server/CV 后端。RoPE 改为按设备/dtype 的弱引用共享，卸载断开 recurrent/prefix 验证器及 NPU 张量缓存。EAGLE3 链式图补齐 host 预展开的累计 KV 长度（MetaBlob 新段在尾部）。说明见 `docs/PYTHON_MEMORY_TRITON.md`，真实设备入口 `scripts/check_python_memory.py`；外部服务器契约替身测试不能当作真实 Triton Server 验收，CoreX/310P 与多卡 TP 仍须对应环境实测。
+
+**三后端源码对齐增量（2026-10-17）**：用户要求本轮只改代码、不测试；独立 C++ 仓新增 310P Qwen3.5/EAGLE3/Quark 参考实现，公共 chunked-prefill CLI/workload 开关及 scheduler/投机观测。详见该仓 `docs/BACKEND_PARITY_SOURCE.md`。未构建、未测试、旧二进制未更新；历史 CUDA 报告不覆盖本轮变更。CoreX/310P 仍无 SDK/真机，ND/ATen 参考路径不等于 ATB/NZ/ixformer 高性能后端，Quark 反量化不是真 int8。
+
+**原生 0.4 功能组合增量**：契约 0.4.0 / bundle 1.3.0，独立 C++ 仓 Prefix 默认开启；Qwen3 dense/MoE + DFlash/EAGLE3、Qwen3.5 文本 dense/MoE + DFlash 的组合见该仓 `docs/FEATURE_COMBINATIONS.md`。快照、状态门控和回滚必须验证，不能仅改开关。组合夹具入口为 `scripts/check_native_combinations.py`；CUDA 报告不替代 CoreX/310P 真机，合成草稿不证明训练质量/加速收益。以下 0.3 限制为历史记录。
+
+**2026-10-17 原生 0.3 增量**：独立 C++ 仓新增普通 Qwen3 Prefix cache、EAGLE3（含 d2t）、Qwen3.5 文本参考执行与 Quark int8 加载期反量化；约束见该仓 `docs/FEATURES_0_3.md`。契约 0.3.0 / bundle 1.2.0；Qwen3.5 的投机回滚、Prefix+spec、310P 新 profile 和真 int8 GEMM 仍未实现。`scripts/check_native_profiles.py` 保存新增功能矩阵；合成夹具通过不扩大为训练模型/正式后端验收。
+
+**原生部署增量（2026-10-16）**：已新增 `tests/test_deployment.py` 纯主机契约测试，以及 `scripts/export_bundle.py`、`export_oracle.py`、`check_native_replay.py`、`check_native_server.py` 等部署工具；下文“无测试套件”是原 GPU 引擎的历史描述，不涵盖这些新测试。执行 `python3 -m unittest discover -s tests -v`。独立 C++ 仓位于同级目录 `D:/Materials/AVIC/FlashEngine.cpp`，遵守其自身 AGENTS.md；不能将其 candidate 能力与 Python 支持矩阵混同。入口与未完成门禁见 `docs/NATIVE_DEPLOYMENT.md`。
+
+**2026-10-17 原生扩展**：契约 0.2.0 增加 Qwen3 MoE；CUDA dense/MoE、DFlash/Graph 已有本机功能回归，合成样例不证明真实性能。CoreX/310P 仅源码准备、无 SDK 编译或真机验收。跨 x86_64/AArch64 部署入口为独立仓 `docs/DEPLOYMENT.md`；不得把 reference attention 或打包模板标成正式高性能后端/已发布 OCI。
+
 FlashEngine：从零实现的极简 vLLM（研究/学习用代码库，非生产项目）。上游分叉点实测 1450 行 Python；当前 `flashengine/` 9848 行 + `scripts/` 2566 行 = 12414 行 Python（最大文件 `engine/model_runner.py` 1993 行、`scripts/openai_server.py` 1318 行、`backends/ascend.py` 1159 行、`models/qwen3_5.py` 836 行、`scripts/bench_concurrent.py` 326 行），另有内置控制台的自包含前端 `scripts/webui.html` 3661 行。**无测试套件、无 CI、无 lint/typecheck 配置**；引擎侧验证手段是在有 GPU 的机器上对本地模型目录跑 `scripts/` 下的引擎脚本与实机验收脚本（`bench_concurrent.py` 只需 HTTP，任何机器都能对着 server 跑）。当前支持面 = **Qwen3 目标模型 ×（EAGLE3 / DFlash / DSpark）三种草稿 × CUDA / CoreX / Ascend 310P 三后端**，另加 **Qwen3 MoE（Qwen3-30B-A3B）×（普通 / DFlash）× 三后端**、**Qwen3.5 dense/MoE ×（普通 / DFlash）× 三后端（当前仅 fp16/bf16、TP=1）**、**W8A8 int8 量化推理（310P 真 int8；cuda/corex 为 Quark int8 检查点加载期反量化）**；完整声明支持清单见 [`docs/SUPPORT_MATRIX.md`](docs/SUPPORT_MATRIX.md)（代码单一事实来源 `flashengine/support_matrix.py`，启动即校验）。Qwen3.5 说明与验证记录见 [`docs/QWEN35.md`](docs/QWEN35.md)。
 
 ## 命令

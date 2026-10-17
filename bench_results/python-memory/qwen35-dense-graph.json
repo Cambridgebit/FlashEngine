@@ -1,0 +1,162 @@
+{
+  "status": "passed",
+  "backend": "cuda",
+  "model": "/home/yjq040828/vllm-lab/models/Qwen3.5-2B",
+  "spec_model": "",
+  "synthetic_draft_is_quality_evidence": false,
+  "options": {
+    "model": "/home/yjq040828/vllm-lab/models/Qwen3.5-2B",
+    "backend": "auto",
+    "spec_model": "",
+    "spec_num_tokens": 2,
+    "eager": false,
+    "no_prefix_cache": false,
+    "device": 0,
+    "max_model_len": 1024,
+    "max_num_seqs": 2,
+    "max_tokens": 8,
+    "cycles": 2,
+    "rounds": 3,
+    "memory_budget_mib": 6144,
+    "device_reserve_mib": 512,
+    "drift_tolerance_mib": 16,
+    "runtime_cache_tolerance_mib": 32,
+    "output": "bench_results/python-memory/qwen35-dense-graph.json"
+  },
+  "cycles": [
+    {
+      "cycle": 0,
+      "memory": {
+        "plan": {
+          "total_bytes": 8585216000,
+          "free_bytes": 2464153600,
+          "resident_bytes": 3897916928,
+          "workspace_bytes": 268435456,
+          "graph_reserve_bytes": 268435456,
+          "device_reserve_bytes": 536870912,
+          "engine_budget_bytes": 6442450944,
+          "block_bytes": 3145728,
+          "num_blocks": 339,
+          "kv_bytes": 1066401792
+        },
+        "stages": {
+          "weights_states_warmup": {
+            "resident_bytes": 3897915904,
+            "peak_bytes": 3909095424
+          },
+          "static_buffers": {
+            "resident_bytes": 3897916928,
+            "peak_bytes": 3909095424
+          },
+          "kv_cache": {
+            "resident_bytes": 4965367296,
+            "peak_bytes": 4965367296
+          },
+          "graphs": {
+            "resident_bytes": 4973901312,
+            "peak_bytes": 5007521280
+          }
+        },
+        "allocated_bytes": 4973901312,
+        "peak_bytes": 5007521280,
+        "device": "cuda:0"
+      },
+      "graph": {
+        "capture_success": 2,
+        "capture_failure": 0,
+        "replay": 49,
+        "fallback": 0,
+        "greedy_replays": 49,
+        "bucket_hits": {
+          "2": 21,
+          "1": 28
+        }
+      },
+      "cache": {
+        "requests": 11,
+        "prefix_hits": 10,
+        "prefix_hit_blocks": 10,
+        "cached_blocks": 10,
+        "new_blocks": 12,
+        "hit_rate": 0.9090909090909091,
+        "used_blocks": 0,
+        "total_blocks": 339
+      },
+      "allocations_bytes": [
+        4973901312,
+        4973901312,
+        4973901312
+      ],
+      "execution_path": "decode_graph",
+      "completion_tokens": 24,
+      "unload_delta_bytes": 17039360
+    },
+    {
+      "cycle": 1,
+      "memory": {
+        "plan": {
+          "total_bytes": 8585216000,
+          "free_bytes": 2401239040,
+          "resident_bytes": 3889397248,
+          "workspace_bytes": 268435456,
+          "graph_reserve_bytes": 268435456,
+          "device_reserve_bytes": 536870912,
+          "engine_budget_bytes": 6442450944,
+          "block_bytes": 3145728,
+          "num_blocks": 319,
+          "kv_bytes": 1003487232
+        },
+        "stages": {
+          "weights_states_warmup": {
+            "resident_bytes": 3889396224,
+            "peak_bytes": 3900932096
+          },
+          "static_buffers": {
+            "resident_bytes": 3889397248,
+            "peak_bytes": 3900932096
+          },
+          "kv_cache": {
+            "resident_bytes": 4893933056,
+            "peak_bytes": 4893933056
+          },
+          "graphs": {
+            "resident_bytes": 4893947392,
+            "peak_bytes": 4920090112
+          }
+        },
+        "allocated_bytes": 4893947392,
+        "peak_bytes": 4920090112,
+        "device": "cuda:0"
+      },
+      "graph": {
+        "capture_success": 2,
+        "capture_failure": 0,
+        "replay": 49,
+        "fallback": 0,
+        "greedy_replays": 49,
+        "bucket_hits": {
+          "2": 21,
+          "1": 28
+        }
+      },
+      "cache": {
+        "requests": 11,
+        "prefix_hits": 10,
+        "prefix_hit_blocks": 10,
+        "cached_blocks": 10,
+        "new_blocks": 12,
+        "hit_rate": 0.9090909090909091,
+        "used_blocks": 0,
+        "total_blocks": 319
+      },
+      "allocations_bytes": [
+        4910986752,
+        4910986752,
+        4910986752
+      ],
+      "execution_path": "decode_graph",
+      "completion_tokens": 24,
+      "unload_delta_bytes": 0
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:flashengine:engine-config:1",
+  "title": "FlashEngine v1 公共运行配置",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "max_model_len": {"type":"integer","minimum":2,"default":2048},
+    "max_num_seqs": {"type":"integer","minimum":1,"default":8},
+    "max_num_batched_tokens": {"type":"integer","minimum":1,"default":2048},
+    "max_num_partial_prefills": {"type":"integer","minimum":1,"default":1},
+    "enable_chunked_prefill": {"type":"boolean","default":true},
+    "enable_prefix_cache": {"type":"boolean","default":true},
+    "recurrent_prefix_cache_bytes": {"type":"integer","minimum":0,"default":268435456},
+    "tensor_parallel_size": {"const":1},
+    "temperature": {"const":0},
+    "backend": {"enum":["cuda","corex","ascend310p"]},
+    "dtype": {"enum":["float16","bfloat16"]},
+    "kvcache_block_size": {"type":"integer","minimum":16,"default":256},
+    "gpu_memory_utilization": {"type":"number","exclusiveMinimum":0,"maximum":1,"default":0.85},
+    "enforce_eager": {"type":"boolean","default":false},
+    "spec_num_tokens": {"type":"integer","minimum":1},
+    "production": {"type":"boolean","default":false}
+  }
+}

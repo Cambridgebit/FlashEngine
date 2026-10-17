@@ -1,0 +1,9 @@
+{
+  "schema_version":1,
+  "units":{"tokens":"token","time":"second","kv":"block"},
+  "counters":["generated_tokens_total","engine_steps_total","prefill_steps_total","decode_steps_total","engine_busy_seconds_total","scheduler_preemptions_total","spec_rounds_total","spec_committed_tokens_total","prefix_requests_total","prefix_hit_requests_total","prefix_cached_blocks_total","prefix_new_blocks_total","decode_graph_replays_total","draft_graph_replays_total","verify_graph_replays_total","graph_fallbacks_total","cancelled_requests_total"],
+  "gauges":["running_requests","waiting_requests","active_requests","kv_used_blocks","kv_total_blocks"],
+  "prometheus_prefix":"flashengine_",
+  "stats_envelope":["info","metrics","requests"],
+  "policy":"metrics 与 stats 共用 host 快照；读取不清零、不设备同步。prefix 为完整页探测/命中/发布计数；resident/evictions 描述缓存驻留和回收。关闭时为零。"
+}

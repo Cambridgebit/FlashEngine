@@ -1,0 +1,19 @@
+{
+  "schema_version":1,
+  "endpoints":{
+    "GET /health":"liveness/readiness；设备异常终止进程",
+    "GET /v1/models":"OpenAI model list",
+    "POST /v1/completions":"字符串或单条 token IDs，n=1，greedy",
+    "POST /v1/chat/completions":"文本 system/user/assistant 消息，n=1，greedy",
+    "GET /metrics":"Prometheus text",
+    "GET /v1/metrics":"Prometheus text",
+    "GET /v1/stats":"info/metrics/requests host snapshot"
+  },
+  "request_fields":["model","prompt","messages","max_tokens","temperature","top_p","top_k","n","stream","stop","stream_options","chat_template_kwargs"],
+  "defaults":{"temperature":0,"top_p":1,"top_k":0,"n":1,"max_tokens":128,"enable_thinking":true,"reserve_output":512},
+  "unsupported":["tools","tool_choice","logprobs","response_format","seed","n>1","temperature>0"],
+  "sse":{"framing":"data: <json>\n\n","terminator":"data: [DONE]\n\n","usage":"stream_options.include_usage"},
+  "errors":{"invalid_request":400,"unauthorized":401,"overloaded":429},
+  "cancellation":"断连仅取消对应请求；下一设备安全点回收 KV 和 draft 状态。",
+  "engine_failure":"任何非预期模型执行、设备或不变量错误使进程非零退出。"
+}

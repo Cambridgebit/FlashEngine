@@ -1,0 +1,19 @@
+name: "flashengine"
+backend: "python"
+max_batch_size: 0
+model_transaction_policy { decoupled: true }
+instance_group [{ count: 1 kind: KIND_GPU gpus: [0] }]
+input [
+  { name: "PROMPT" data_type: TYPE_STRING dims: [1] optional: true },
+  { name: "INPUT_IDS" data_type: TYPE_INT64 dims: [-1] optional: true },
+  { name: "STREAM" data_type: TYPE_BOOL dims: [1] optional: true }
+]
+output [
+  { name: "TOKEN_IDS" data_type: TYPE_INT64 dims: [-1] },
+  { name: "TEXT" data_type: TYPE_STRING dims: [1] },
+  { name: "FINISH_REASON" data_type: TYPE_STRING dims: [1] },
+  { name: "PROMPT_TOKENS" data_type: TYPE_INT64 dims: [1] },
+  { name: "COMPLETION_TOKENS" data_type: TYPE_INT64 dims: [1] }
+]
+parameters { key: "model_path" value: { string_value: "/models/Qwen3-0.6B" } }
+parameters { key: "engine_config" value: { string_value: "{\"backend\":\"cuda\",\"max_num_seqs\":8,\"max_model_len\":2048,\"memory_budget_bytes\":4294967296,\"device_memory_reserve_bytes\":1073741824}" } }

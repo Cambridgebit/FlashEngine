@@ -1,9 +1,13 @@
 import atexit
+import socket
+from uuid import uuid4
+from threading import Lock
 from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 import torch.multiprocessing as mp
+import torch.distributed as dist
 
 from flashengine.config import Config
 from flashengine.sampling_params import SamplingParams
@@ -11,18 +15,41 @@ from flashengine.engine.sequence import Sequence
 from flashengine.engine.scheduler import Scheduler
 from flashengine.engine.model_runner import ModelRunner
 from flashengine.engine.observer import EngineObserver
+from flashengine.engine.requests import EngineRequests
 
 
-class LLMEngine:
+_ENGINE_SLOT = Lock()
+
+
+class LLMEngine(EngineRequests):
 
     def __init__(self, model, **kwargs):
+        # 在 Config/Sequence/后端全局状态产生副作用前拒绝同进程第二份引擎。
+        if not _ENGINE_SLOT.acquire(blocking=False):
+            raise RuntimeError("每个引擎必须在独立进程中运行")
+        if dist.is_initialized():
+            _ENGINE_SLOT.release()
+            raise RuntimeError("当前进程已有分布式进程组，请在独立进程中创建引擎")
+        self._owns_engine_slot = True
         self._closed = False
         self._atexit_callback = self.close
         atexit.register(self._atexit_callback)
+        try:
+            self._initialize(model, **kwargs)
+        except Exception:
+            self.close()
+            raise
+
+    def _initialize(self, model, **kwargs):
         engine_t0 = perf_counter()
         config_fields = {field.name for field in fields(Config) if field.init}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        config.shm_name = f"flashengine-{uuid4().hex}"
+        if config.tensor_parallel_size > 1 and config.hccl_port == 0:
+            with socket.socket() as listener:
+                listener.bind(("127.0.0.1", 0))
+                config.hccl_port = listener.getsockname()[1]
         self.config = config
         print(
             f"[FlashEngine] Initializing engine for model {config.model} "
@@ -124,6 +151,14 @@ class LLMEngine:
     def close(self):
         if getattr(self, "_closed", False):
             return
+        try:
+            self._close()
+        finally:
+            if getattr(self, "_owns_engine_slot", False):
+                self._owns_engine_slot = False
+                _ENGINE_SLOT.release()
+
+    def _close(self):
         self._closed = True
         callback = getattr(self, "_atexit_callback", None)
         if callback is not None:
@@ -134,16 +169,25 @@ class LLMEngine:
 
         runner = getattr(self, "model_runner", None)
         if runner is not None:
+            scheduler = getattr(self, "scheduler", None)
+            if scheduler is not None:
+                for seq in (*scheduler.waiting, *scheduler.running):
+                    try:
+                        self.cancel_request(seq)
+                    except Exception as exc:
+                        print(f"[FlashEngine] Warning: request cleanup failed: {exc}", flush=True)
+                # 状态验证器是绑定方法；卸载时断开，避免间接持有整份模型与状态池。
+                scheduler.block_manager.cache_hit_validator = None
+                scheduler.block_manager.prefix_state_validator = None
+                scheduler.on_preempt = None
+                scheduler.waiting.clear()
+                scheduler.running.clear()
             try:
                 runner.call("exit")
             except Exception as exc:
                 print(f"[FlashEngine] Warning: model runner shutdown failed: {exc}", flush=True)
             finally:
                 del self.model_runner
-        else:
-            import torch.distributed as dist
-            if dist.is_initialized():
-                dist.destroy_process_group()
 
         for process in getattr(self, "ps", []):
             process.join(timeout=30)
@@ -166,12 +210,6 @@ class LLMEngine:
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.close()
-
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
-        if isinstance(prompt, str):
-            prompt = self.tokenizer.encode(prompt)
-        seq = Sequence(prompt, sampling_params)
-        self.scheduler.add(seq)
 
     def _on_preempt_release(self, seq):
         self.model_runner.call("drop_seq_state", seq.seq_id)
@@ -242,6 +280,7 @@ class LLMEngine:
         runner = self.model_runner.runtime_snapshot()
         block_manager = self.scheduler.block_manager
         return {
+            "memory": self.model_runner.memory_snapshot(),
             "engine": {
                 "model": self.config.model,
                 "backend": self.model_runner.backend.name,
@@ -281,29 +320,35 @@ class LLMEngine:
         prompts: list[str] | list[list[int]],
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
-    ) -> list[str]:
-        pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
+    ) -> list[dict]:
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
-        for prompt, sp in zip(prompts, sampling_params):
-            self.add_request(prompt, sp)
-        outputs = {}
-        prefill_throughput = decode_throughput = 0.
-        while not self.is_finished():
-            t = perf_counter()
-            output, num_tokens = self.step()
-            if num_tokens > 0:
-                prefill_throughput = num_tokens / (perf_counter() - t)
-            else:
-                decode_throughput = -num_tokens / (perf_counter() - t)
-            pbar.set_postfix({
-                "Prefill": f"{int(prefill_throughput)}tok/s",
-                "Decode": f"{int(decode_throughput)}tok/s",
-            })
-            for seq_id, token_ids in output:
-                outputs[seq_id] = token_ids
-                pbar.update(1)
-        pbar.close()
-        outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
-        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
-        return outputs
+        if len(sampling_params) != len(prompts):
+            raise ValueError("prompts 与 sampling_params 的数量必须一致")
+        pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
+        submitted = []
+        try:
+            for prompt, sp in zip(prompts, sampling_params):
+                submitted.append(self.add_request(prompt, sp))
+            outputs = {}
+            prefill_throughput = decode_throughput = 0.
+            while not self.is_finished():
+                t = perf_counter()
+                output, num_tokens = self.step()
+                if num_tokens > 0:
+                    prefill_throughput = num_tokens / (perf_counter() - t)
+                else:
+                    decode_throughput = -num_tokens / (perf_counter() - t)
+                pbar.set_postfix({"Prefill": f"{int(prefill_throughput)}tok/s",
+                                  "Decode": f"{int(decode_throughput)}tok/s"})
+                for seq_id, token_ids in output:
+                    outputs[seq_id] = token_ids
+                    pbar.update(1)
+            return [{"text": self.tokenizer.decode(outputs[s.seq_id]),
+                     "token_ids": outputs[s.seq_id]} for s in submitted]
+        except Exception:
+            for seq in submitted:
+                self.cancel_request(seq)
+            raise
+        finally:
+            pbar.close()

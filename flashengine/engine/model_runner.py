@@ -3,6 +3,8 @@ import os
 import pickle
 import time
 import traceback
+import tempfile
+from pathlib import Path
 from collections import OrderedDict
 from itertools import accumulate
 
@@ -15,6 +17,7 @@ from flashengine.backends.graph import DecodeGraphPlan
 from flashengine.config import Config
 from flashengine.engine.block_manager import BlockManager
 from flashengine.engine.sequence import Sequence
+from flashengine.engine.memory import MemoryBudgetError, plan_kv_memory
 from flashengine.layers.sampler import Sampler
 from flashengine.utils.context import set_context, get_context, reset_context
 
@@ -119,6 +122,26 @@ class MetaBlob:
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+        default_dtype = torch.get_default_dtype()
+        default_device = torch.get_default_device()
+        try:
+            self._initialize(config, rank, event)
+        except Exception:
+            if getattr(self, "_owns_process_group", False):
+                self.exit()
+            else:
+                # 尚未获得进程组时，不触碰其他模型的上下文或后端运行时。
+                store_dir = getattr(self, "_store_dir", None)
+                self.__dict__.clear()
+                self._closed = True
+                if store_dir is not None:
+                    store_dir.cleanup()
+            raise
+        finally:
+            torch.set_default_device(default_device)
+            torch.set_default_dtype(default_dtype)
+
+    def _initialize(self, config: Config, rank: int, event: Event | list[Event]):
         startup_t0 = time.perf_counter()
         self.startup_stats: dict[str, float] = {}
         self.config = config
@@ -149,7 +172,7 @@ class ModelRunner:
                     flush=True,
                 )
                 config.enable_prefix_cache = False
-        self.device = self.backend.device_name
+        self.device = f"{self.backend.device_name}:{config.device_ids[rank]}"
         self.dtype = self.backend.default_dtype or config.model_config.dtype
         self.spec_enabled = bool(config.spec_model)
         self.spec_runtime = None
@@ -184,8 +207,20 @@ class ModelRunner:
              ('ctx_cu', M + 1), ('bt', M * W), ('topks', M)],
             [('temperatures', M), ('top_ps', M)], device=self.device)
 
-        dist.init_process_group(self.backend.dist_name, f"tcp://localhost:{config.hccl_port}", world_size=self.world_size, rank=rank)
-        self.backend.set_device(rank)
+        self.backend.set_device(config.device_ids[rank])
+        self._owns_process_group = False
+        if dist.is_initialized():
+            raise RuntimeError("每个引擎必须在独立进程中拥有自己的分布式进程组")
+        if self.world_size == 1:
+            self._store_dir = tempfile.TemporaryDirectory(prefix="flashengine-dist-")
+            rendezvous = (Path(self._store_dir.name) / "store").as_uri()
+        else:
+            rendezvous = f"tcp://localhost:{config.hccl_port}"
+        dist.init_process_group(self.backend.dist_name, rendezvous,
+                                world_size=self.world_size, rank=rank)
+        self._owns_process_group = True
+        self._memory_baseline = self.backend.memory_stats()["allocated_bytes.all.current"]
+        self.memory_stages = {}
         default_dtype = torch.get_default_dtype()
         if self.backend.default_dtype is not None and self.backend.default_dtype != config.model_config.dtype:
             print(
@@ -195,7 +230,7 @@ class ModelRunner:
                 flush=True,
             )
         torch.set_default_dtype(self.dtype)
-        torch.set_default_device(self.backend.device_name)
+        torch.set_default_device(self.device)
         model_load_t0 = time.perf_counter()
         self.target_adapter = config.target_adapter
         self.model = self.target_adapter.build(hf_config)
@@ -243,9 +278,15 @@ class ModelRunner:
         warmup_t0 = time.perf_counter()
         self.warmup_model()
         self.startup_stats["model_warmup_s"] = time.perf_counter() - warmup_t0
-        kv_t0 = time.perf_counter()
-        self.allocate_kv_cache()
-        self.startup_stats["kv_cache_allocation_s"] = time.perf_counter() - kv_t0
+        stats = self.backend.memory_stats()
+        self._warmup_workspace = max(0, stats["allocated_bytes.all.peak"]
+                                     - stats["allocated_bytes.all.current"])
+        self._record_memory("weights_states_warmup")
+        # 先物化静态缓冲，再按实际常驻量规划 KV；临时 padding 在分配后重置。
+        requested_blocks = config.num_kvcache_blocks
+        config.num_kvcache_blocks = 2
+        self._dblob.device_i64()
+        self._dblob.device_f32()
         if self.spec_enabled:
             k = self.config.spec_num_tokens
             rows = k + 1
@@ -259,11 +300,25 @@ class ModelRunner:
                  ('chain_slots', k * M), ('v_pos', rows * M), ('v_slots', rows * M),
                  ('v_cu_k', M + 1), ('ctopks', M), ('v_topks', rows * M), ('btables', M * W),
                  ('v_ctx_lens', rows * M), ('v_btables_exp', rows * M * W)]
-                + df_segments,
+                + df_segments + [('chain_cu_k', k * (M + 1))],
                 [('ctemps', M), ('ctopps', M), ('v_temps', rows * M), ('v_topps', rows * M)], device=self.device)
             self._sg = self._alloc_spec_graph_vars(self._graph_max_bs, rows, k)
             if self.config.spec_is_block_draft:
                 self._sg.update(self._alloc_df_graph_vars(self._graph_max_bs, rows))
+            self._sblob.device_i64()
+            self._sblob.device_f32()
+        config.num_kvcache_blocks = requested_blocks
+        self._record_memory("static_buffers")
+        kv_t0 = time.perf_counter()
+        self.allocate_kv_cache()
+        self.startup_stats["kv_cache_allocation_s"] = time.perf_counter() - kv_t0
+        if self.spec_enabled:
+            for name in ("chain_btables", "v_btables", "v_btables_exp"):
+                self._sg[name].fill_(self._graph_pad_block())
+            for name in ("chain_slots", "v_slots", "df_ctx_slots"):
+                if name in self._sg:
+                    self._sg[name].fill_(self._graph_pad_slot())
+        self._record_memory("kv_cache")
         self.spec_graphs = None
         self.spec_greedy_graphs = {}
         self._spec_capture_greedy = False
@@ -346,6 +401,7 @@ class ModelRunner:
                     self.graph_capture_attempted = True
                     self.spec_runtime.capture_graph()
         self.startup_stats["graph_capture_s"] = time.perf_counter() - graph_t0
+        self._record_memory("graphs")
         for key in self.prefill_cache_stats:
             self.prefill_cache_stats[key] = 0
         torch.set_default_device("cpu")
@@ -354,11 +410,11 @@ class ModelRunner:
 
         if self.world_size > 1:
             if rank == 0:
-                self.shm = SharedMemory(name="flashengine", create=True, size=2**20)
+                self.shm = SharedMemory(name=config.shm_name, create=True, size=2**20)
                 dist.barrier()
             else:
                 dist.barrier()
-                self.shm = SharedMemory(name="flashengine")
+                self.shm = SharedMemory(name=config.shm_name)
                 self.loop()
 
     def graph_mode(self) -> str:
@@ -443,6 +499,12 @@ class ModelRunner:
 
     def startup_details(self) -> list[tuple[str, str]]:
         details = self.spec_runtime.startup_details() if self.spec_runtime else []
+        plan = self.memory_plan
+        details.append(("Device", self.device))
+        details.append(("Memory budget", f"engine={plan.engine_budget_bytes / 2**20:.0f} MiB "
+                        f"(0=auto), workspace={plan.workspace_bytes / 2**20:.0f} MiB, "
+                        f"graph={plan.graph_reserve_bytes / 2**20:.0f} MiB, "
+                        f"external reserve={plan.device_reserve_bytes / 2**20:.0f} MiB"))
         if self.state_runtime:
             details.append(("Recurrent state", f"{self.state_runtime.slot_count} slots / {self.state_runtime.bytes / 2**20:.1f} MiB"))
             if self.config.enable_prefix_cache:
@@ -454,9 +516,11 @@ class ModelRunner:
             return
         self._closed = True
         backend = self.backend
+        owns_group = getattr(self, "_owns_process_group", False)
+        store_dir = getattr(self, "_store_dir", None)
         world_size = self.world_size
         rank = self.rank
-        if self.world_size > 1:
+        if self.world_size > 1 and hasattr(self, "shm"):
             self.shm.close()
             if dist.is_initialized():
                 dist.barrier()
@@ -476,16 +540,34 @@ class ModelRunner:
             backend.empty_cache()
         except Exception as exc:
             print(f"[FlashEngine] Warning: device cache cleanup failed: {exc}", flush=True)
-        if dist.is_initialized():
+        if owns_group and dist.is_initialized():
             try:
                 dist.destroy_process_group()
             except Exception as exc:
                 print(f"[FlashEngine] Warning: process-group shutdown failed: {exc}",
                       flush=True)
         try:
-            backend.shutdown()
+            backend.release_engine()
         except Exception as exc:
             print(f"[FlashEngine] Warning: device runtime shutdown failed: {exc}", flush=True)
+        if store_dir is not None:
+            store_dir.cleanup()
+
+    def _record_memory(self, stage):
+        stats = self.backend.memory_stats()
+        current = max(0, stats["allocated_bytes.all.current"] - self._memory_baseline)
+        peak = max(0, stats["allocated_bytes.all.peak"] - self._memory_baseline)
+        self.memory_stages[stage] = {"resident_bytes": current, "peak_bytes": peak}
+        if self.config.memory_budget_bytes and peak > self.config.memory_budget_bytes:
+            raise MemoryBudgetError(
+                f"{stage} 显存峰值 {peak} 超过引擎预算 {self.config.memory_budget_bytes}")
+
+    def memory_snapshot(self):
+        stats = self.backend.memory_stats()
+        return {"plan": self.memory_plan.snapshot(), "stages": dict(self.memory_stages),
+                "allocated_bytes": max(0, stats["allocated_bytes.all.current"] - self._memory_baseline),
+                "peak_bytes": max(0, stats["allocated_bytes.all.peak"] - self._memory_baseline),
+                "device": self.device}
 
     def loop(self):
         while True:
@@ -561,27 +643,24 @@ class ModelRunner:
         requested = config.num_kvcache_blocks
         for _ in range(6):
             free, total = self.backend.mem_get_info()
-            used = total - free
-            peak = self.backend.memory_stats()["allocated_bytes.all.peak"]
-            current = self.backend.memory_stats()["allocated_bytes.all.current"]
-            computed = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-            if requested > 0:
-                config.num_kvcache_blocks = requested
+            stats = self.backend.memory_stats()
+            current = stats["allocated_bytes.all.current"]
+            try:
+                self.memory_plan = plan_kv_memory(
+                    total=total, free=free, resident=max(0, current - self._memory_baseline),
+                    workspace=max(config.memory_workspace_bytes, self._warmup_workspace),
+                    block_bytes=block_bytes, utilization=config.gpu_memory_utilization,
+                    budget_bytes=config.memory_budget_bytes,
+                    reserve_bytes=config.device_memory_reserve_bytes,
+                    graph_bytes=0 if self.enforce_eager else config.graph_memory_reserve_bytes,
+                    requested_blocks=requested,
+                    minimum_blocks=2 if self.backend.reserve_dummy_kv_block() else 1)
+                config.num_kvcache_blocks = self.memory_plan.num_blocks
                 break
-            config.num_kvcache_blocks = computed
-            if config.num_kvcache_blocks > 0:
-                break
+            except MemoryBudgetError:
+                if requested > 0 or config.memory_budget_bytes or _ == 5:
+                    raise
             time.sleep(5)
-        else:
-            raise RuntimeError(
-                f"Insufficient device-memory budget for KV cache: "
-                f"{block_bytes / 2**20:.1f} MiB is required per block"
-                + f"; gpu_memory_utilization={config.gpu_memory_utilization} leaves zero blocks "
-                f"(used={used / 2**20:.0f} MiB, peak={peak / 2**20:.0f} MiB, "
-                f"current={current / 2**20:.0f} MiB, "
-                f"budget={total * config.gpu_memory_utilization / 2**20:.0f} MiB). "
-                "Reduce max_model_len or block_size, or check other device-memory users."
-            )
         layers = self.backend.allocate_kv_layers(
             num_layers=num_attn_layers,
             num_blocks=config.num_kvcache_blocks,
@@ -1115,6 +1194,13 @@ class ModelRunner:
             [self.spec_carry[seq.seq_id][1] for seq in seqs], dtype=torch.int64)
 
     def _push_spec_meta(self):
+        # 链式 decode 的累计长度在 host 展开，图内仅复制固定形状元数据。
+        blob = self._sblob
+        k, M = self.config.spec_num_tokens, self._pin_M
+        lengths = blob.view_i64('chain_ctxlen', (k, M))
+        cumulative = blob.view_i64('chain_cu_k', (k, M + 1))
+        cumulative[:, 0] = 0
+        torch.cumsum(lengths, dim=1, out=cumulative[:, 1:])
         self._sblob.h2d()
 
     def _readback_spec_commit(self, seqs: list[Sequence]) -> list[list[int]]:
@@ -1480,7 +1566,7 @@ class ModelRunner:
         self.spec_greedy_graphs = {}
         try:
             prepare()
-            self._sblob.h2d()
+            self._push_spec_meta()
             for bs in reversed(self.spec_graph_bs):
                 self._sg['v_cu_k'][:bs + 1] = self._sg['v_cu_q'][:bs + 1]
                 for _ in range(self.backend.graph_warmup_iters()):
@@ -1641,6 +1727,8 @@ class ModelRunner:
             chain_pos=torch.zeros(k, max_bs, dtype=torch.int64),
             chain_slots=torch.full((k, max_bs), pad_slot, dtype=slot_dtype),
             chain_ctxlen=torch.full((k, max_bs), self._graph_pad_ctx(), dtype=torch.int32),
+            chain_cu_q=torch.arange(max_bs + 1, dtype=torch.int32),
+            chain_cu_k=torch.zeros(k, max_bs + 1, dtype=torch.int32),
             chain_btables=torch.full((max_bs, max_num_blocks), pad_block, dtype=torch.int32),
             chain_temps=torch.ones(max_bs, dtype=torch.float32),
             chain_topps=torch.ones(max_bs, dtype=torch.float32),
@@ -1689,6 +1777,8 @@ class ModelRunner:
             g['chain_pos'][i][:bs].copy_(cp[i, :bs])
             g['chain_ctxlen'][i][:bs].copy_(cc[i, :bs])
             g['chain_slots'][i][:bs].copy_(cs[i, :bs])
+            g['chain_cu_k'][i, :bs + 1].copy_(
+                blob.device_view_i64('chain_cu_k', (k, M + 1))[i, :bs + 1])
         g['v_positions'][:bs * rows].copy_(blob.device_view_i64('v_pos')[:bs * rows])
         g['v_slots'][:bs * rows].copy_(blob.device_view_i64('v_slots')[:bs * rows])
         g['v_cu_k'][:bs + 1].copy_(blob.device_view_i64('v_cu_k')[:bs + 1])
@@ -1709,23 +1799,17 @@ class ModelRunner:
     def _sg_draft_chain(self, bs: int, use_cuda_graph: bool):
         g = self._sg
         k = self.config.spec_num_tokens
-        set_context(False,
-                    slot_mapping=g['chain_slots'][1][:bs],
-                    context_lens=g['chain_ctxlen'][1][:bs],
-                    block_tables=g['chain_btables'][:bs],
-                    max_context_len=self.config.max_model_len,
-                    use_cuda_graph=use_cuda_graph,
-                    block_size=self.block_size)
         seed = g['carry_seed'][:bs]
         for i in range(1, k):
-            if i > 1:
-                set_context(False,
-                            slot_mapping=g['chain_slots'][i][:bs],
-                            context_lens=g['chain_ctxlen'][i][:bs],
-                            block_tables=g['chain_btables'][:bs],
-                            max_context_len=self.config.max_model_len,
-                            use_cuda_graph=use_cuda_graph,
-                            block_size=self.block_size)
+            set_context(False,
+                        slot_mapping=g['chain_slots'][i][:bs],
+                        context_lens=g['chain_ctxlen'][i][:bs],
+                        block_tables=g['chain_btables'][:bs],
+                        cu_seqlens_q=g['chain_cu_q'][:bs + 1],
+                        cu_seqlens_k=g['chain_cu_k'][i, :bs + 1],
+                        max_context_len=self.config.max_model_len,
+                        use_cuda_graph=use_cuda_graph,
+                        block_size=self.block_size)
             seed, logits = self.draft_model.forward_decode(
                 g['chain_pos'][i][:bs], seed, g['drafted_ids'][i - 1][:bs])
             ids = self._sg_sample(

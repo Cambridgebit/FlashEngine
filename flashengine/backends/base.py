@@ -229,6 +229,10 @@ class BackendBase(ABC):
         self.synchronize()
         self.empty_cache()
 
+    def release_engine(self):
+        """释放当前引擎；后端可保留进程运行时以允许再次加载。"""
+        self.shutdown()
+
     def mem_get_info(self):
         return torch.cuda.mem_get_info()
 

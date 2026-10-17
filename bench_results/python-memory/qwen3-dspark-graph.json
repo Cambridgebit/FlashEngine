@@ -1,0 +1,168 @@
+{
+  "status": "passed",
+  "backend": "cuda",
+  "model": "/home/yjq040828/vllm-lab/models/Qwen3-0.6B",
+  "spec_model": "/home/yjq040828/vllm-lab/models/Qwen3-0.6B-Dspark-fullvocab",
+  "synthetic_draft_is_quality_evidence": false,
+  "options": {
+    "model": "/home/yjq040828/vllm-lab/models/Qwen3-0.6B",
+    "backend": "auto",
+    "spec_model": "/home/yjq040828/vllm-lab/models/Qwen3-0.6B-Dspark-fullvocab",
+    "spec_num_tokens": 2,
+    "eager": false,
+    "no_prefix_cache": false,
+    "device": 0,
+    "max_model_len": 1024,
+    "max_num_seqs": 2,
+    "max_tokens": 8,
+    "cycles": 2,
+    "rounds": 3,
+    "memory_budget_mib": 4096,
+    "device_reserve_mib": 512,
+    "drift_tolerance_mib": 16,
+    "runtime_cache_tolerance_mib": 32,
+    "output": "bench_results/python-memory/qwen3-dspark-graph.json"
+  },
+  "cycles": [
+    {
+      "cycle": 0,
+      "memory": {
+        "plan": {
+          "total_bytes": 8585216000,
+          "free_bytes": 5037359104,
+          "resident_bytes": 2249103872,
+          "workspace_bytes": 268435456,
+          "graph_reserve_bytes": 268435456,
+          "device_reserve_bytes": 536870912,
+          "engine_budget_bytes": 4294967296,
+          "block_bytes": 29360128,
+          "num_blocks": 51,
+          "kv_bytes": 1497366528
+        },
+        "stages": {
+          "weights_states_warmup": {
+            "resident_bytes": 2249006592,
+            "peak_bytes": 2286037504
+          },
+          "static_buffers": {
+            "resident_bytes": 2249103872,
+            "peak_bytes": 2286037504
+          },
+          "kv_cache": {
+            "resident_bytes": 3746470400,
+            "peak_bytes": 3746470400
+          },
+          "graphs": {
+            "resident_bytes": 3754991104,
+            "peak_bytes": 3822085632
+          }
+        },
+        "allocated_bytes": 3754991104,
+        "peak_bytes": 3822085632,
+        "device": "cuda:0"
+      },
+      "graph": {
+        "capture_success": 2,
+        "capture_failure": 0,
+        "replay": 28,
+        "eager_rounds": 0,
+        "sampling_fallbacks": 0,
+        "greedy_replays": 28,
+        "greedy_capture_success": 2,
+        "context_limited_rounds": 0,
+        "bucket_hits": {
+          "2": 12,
+          "1": 16
+        }
+      },
+      "cache": {
+        "requests": 11,
+        "prefix_hits": 10,
+        "prefix_hit_blocks": 10,
+        "cached_blocks": 10,
+        "new_blocks": 12,
+        "hit_rate": 0.9090909090909091,
+        "used_blocks": 0,
+        "total_blocks": 51
+      },
+      "allocations_bytes": [
+        3754991104,
+        3754991104,
+        3754991104
+      ],
+      "execution_path": "spec_graph",
+      "completion_tokens": 24,
+      "unload_delta_bytes": 17039360
+    },
+    {
+      "cycle": 1,
+      "memory": {
+        "plan": {
+          "total_bytes": 8585216000,
+          "free_bytes": 4970250240,
+          "resident_bytes": 2240780800,
+          "workspace_bytes": 268435456,
+          "graph_reserve_bytes": 268435456,
+          "device_reserve_bytes": 536870912,
+          "engine_budget_bytes": 4294967296,
+          "block_bytes": 29360128,
+          "num_blocks": 51,
+          "kv_bytes": 1497366528
+        },
+        "stages": {
+          "weights_states_warmup": {
+            "resident_bytes": 2240683520,
+            "peak_bytes": 2248092160
+          },
+          "static_buffers": {
+            "resident_bytes": 2240780800,
+            "peak_bytes": 2248092160
+          },
+          "kv_cache": {
+            "resident_bytes": 3738147328,
+            "peak_bytes": 3738147328
+          },
+          "graphs": {
+            "resident_bytes": 3738148352,
+            "peak_bytes": 3788633088
+          }
+        },
+        "allocated_bytes": 3738148352,
+        "peak_bytes": 3788633088,
+        "device": "cuda:0"
+      },
+      "graph": {
+        "capture_success": 2,
+        "capture_failure": 0,
+        "replay": 28,
+        "eager_rounds": 0,
+        "sampling_fallbacks": 0,
+        "greedy_replays": 28,
+        "greedy_capture_success": 2,
+        "context_limited_rounds": 0,
+        "bucket_hits": {
+          "2": 12,
+          "1": 16
+        }
+      },
+      "cache": {
+        "requests": 11,
+        "prefix_hits": 10,
+        "prefix_hit_blocks": 10,
+        "cached_blocks": 10,
+        "new_blocks": 12,
+        "hit_rate": 0.9090909090909091,
+        "used_blocks": 0,
+        "total_blocks": 51
+      },
+      "allocations_bytes": [
+        3755187712,
+        3755187712,
+        3755187712
+      ],
+      "execution_path": "spec_graph",
+      "completion_tokens": 24,
+      "unload_delta_bytes": 0
+    }
+  ]
+}

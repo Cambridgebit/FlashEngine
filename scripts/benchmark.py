@@ -73,6 +73,7 @@ def main():
     parser.add_argument("--no-think", action="store_true")
     parser.add_argument("--backend", default="auto", choices=["auto", "cuda", "corex", "ascend310p"])
     parser.add_argument("--eager", action="store_true")
+    parser.add_argument("--dtype", choices=("float16", "bfloat16"), help="固定实际计算类型，默认跟随模型/后端")
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--max-num-seqs", type=int, default=8)
     parser.add_argument("--max-num-batched-tokens", type=int, default=16384)
@@ -80,6 +81,8 @@ def main():
     parser.add_argument("--max-num-partial-prefills", type=int, default=1)
     parser.add_argument("--block-size", type=int, default=256)
     parser.add_argument("--gpu-mem-util", type=float, default=0.9)
+    from scripts.memory_options import add_memory_arguments, memory_kwargs
+    add_memory_arguments(parser)
     args = parser.parse_args()
 
     # 先给一行反馈：torch/torch_npu 导入在板卡上需 ~20s，期间没有任何输出。
@@ -103,6 +106,9 @@ def main():
                   recurrent_prefix_cache_bytes=args.recurrent_prefix_cache_mb * 1024 * 1024)
     if args.spec_model:
         kwargs.update(spec_model=args.spec_model, spec_num_tokens=args.spec_num_tokens)
+    if args.dtype:
+        kwargs["dtype"] = args.dtype
+    kwargs.update(memory_kwargs(args))
     llm = LLM(args.model, **kwargs)
     cfg = llm.config
     pcache = "on" if cfg.enable_prefix_cache else "off"

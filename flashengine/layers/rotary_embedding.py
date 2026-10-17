@@ -1,4 +1,4 @@
-from functools import lru_cache
+from weakref import WeakValueDictionary
 
 import torch
 from torch import nn
@@ -37,14 +37,26 @@ class RotaryEmbedding(nn.Module):
         return self.backend.rope(positions, query, key, self.cos_sin_cache)
 
 
-@lru_cache(1)
+_ROPE_CACHE = WeakValueDictionary()
+
+
+def _cached_rope(cls, *args):
+    # 同模型各层共享，但缓存不延长设备张量寿命，也不跨设备/类型复用。
+    key = (cls, args, str(torch.get_default_device()), torch.get_default_dtype())
+    rope = _ROPE_CACHE.get(key)
+    if rope is None:
+        rope = cls(*args)
+        _ROPE_CACHE[key] = rope
+    return rope
+
+
 def get_rope(
     head_size: int,
     rotary_dim: int,
     max_position: int,
     base: float,
 ):
-    return RotaryEmbedding(head_size, rotary_dim, max_position, base)
+    return _cached_rope(RotaryEmbedding, head_size, rotary_dim, max_position, base)
 
 
 class PartialRotaryEmbedding(nn.Module):
@@ -97,6 +109,5 @@ class PartialRotaryEmbedding(nn.Module):
         return query, key
 
 
-@lru_cache(1)
 def get_partial_rope(head_size, rotary_dim, max_position, base):
-    return PartialRotaryEmbedding(head_size, rotary_dim, max_position, base)
+    return _cached_rope(PartialRotaryEmbedding, head_size, rotary_dim, max_position, base)

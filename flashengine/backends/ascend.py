@@ -692,6 +692,14 @@ class Ascend310PBackend(BackendBase):
     def empty_cache(self):
         torch.npu.empty_cache()
 
+    def release_engine(self):
+        """模型卸载不终止进程级 NPU 运行时，以便 Triton 再次加载。"""
+        self.synchronize()
+        for cache in (self._nz_mask, self._nd_mask, self._dflash_mask, self._splitfuse_mask,
+                      self._decode_out, self._rope_cache, self._rope_apply_cache):
+            cache.clear()
+        self.empty_cache()
+
     def shutdown(self):
         try:
             self.synchronize()

@@ -8,6 +8,12 @@
 
 ## Quickstart
 
+Python 引擎的显存预算、请求取消与外部 Triton Python Backend 的 `initialize/execute/finalize` 调用入口见 [显存管理与 Triton 接口](docs/PYTHON_MEMORY_TRITON.md)。本仓只提供引擎适配，不实现 Triton Server 或 CV 后端。
+
+Python 快速迭代与纯 C++ 部署的双仓实现已开始，离线契约、打包及验收入口见 [原生部署说明](docs/NATIVE_DEPLOYMENT.md)。C++ 当前为独立 candidate，不能沿用本仓的后端支持/验收声明。
+
+Python/C++ 同机冻结输入的 [CUDA 严格验证与 benchmark](docs/BENCHMARK_NATIVE.md) 分开记录引擎串行和 HTTP 并发；真实模型严格分歧尚未收敛，性能数字不代表发布合格。
+
 Qwen3.5 DFlash 的 CUDA 性能热点已融合，保守复验约 135 tok/s（修复前约 72），
 本机已测 k=15 最快。配置、数值边界与复现口径见 [DFlash 性能修复](docs/DFLASH_PERFORMANCE.md)。
 

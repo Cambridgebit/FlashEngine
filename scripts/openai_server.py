@@ -442,19 +442,7 @@ def _drain(queue):
 
 def _abort(seq):
     with engine_lock:
-        seq.status = SequenceStatus.FINISHED
-        scheduler = engine.scheduler
-        if scheduler.on_preempt is not None:
-            scheduler.on_preempt(seq)
-        scheduler.block_manager.deallocate(seq)
-        try:
-            scheduler.running.remove(seq)
-        except ValueError:
-            pass
-        try:
-            scheduler.waiting.remove(seq)
-        except ValueError:
-            pass
+        engine.cancel_request(seq)
 
 
 def _log_request(st):
@@ -900,21 +888,19 @@ def _openai_body(req_id, model, mode, content, finish_reason, usage):
 
 
 def _chunk(req_id, model, mode, delta_text, finish_reason=None, role=False):
-    if role:
-        delta = {"role": "assistant"}
+    choice = {"index": 0, "finish_reason": finish_reason}
+    if mode == "completion":
+        # Completions 的 SSE 文本直接位于 choice；delta 是 Chat 的字段。
+        choice["text"] = delta_text
     else:
-        delta = {"text": delta_text} if mode == "completion" and delta_text else \
-                {"content": delta_text} if mode == "chat" and delta_text else {}
+        choice["delta"] = {"role": "assistant"} if role else \
+                          {"content": delta_text} if delta_text else {}
     return {
         "id": req_id,
         "object": "chat.completion.chunk" if mode == "chat" else "text_completion",
         "created": int(time.time()),
         "model": model,
-        "choices": [{
-            "index": 0,
-            "delta": delta,
-            "finish_reason": finish_reason,
-        }],
+        "choices": [choice],
     }
 
 
@@ -1283,6 +1269,7 @@ def main():
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--api-key", default=None)
     parser.add_argument("--eager", action="store_true")
+    parser.add_argument("--dtype", choices=("float16", "bfloat16"), help="固定实际模型及 Graph planner 类型")
     parser.add_argument("--backend", default="auto", choices=["auto", "cuda", "corex", "ascend310p"])
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--max-num-seqs", type=int, default=None)
@@ -1290,6 +1277,7 @@ def main():
     parser.add_argument("--disable-chunked-prefill", action="store_true")
     parser.add_argument("--max-num-partial-prefills", type=int, default=1)
     parser.add_argument("--block-size", type=int, default=None)
+    parser.add_argument("--kv-blocks", type=int, default=None, help="固定可分配 KV 页数，默认按显存预算计算")
     parser.add_argument("--no-prefix-cache", action="store_true", help="关闭前缀 KV 与状态复用")
     parser.add_argument("--recurrent-prefix-cache-mb", type=int, default=256,
                         help="recurrent 前缀状态的主机内存上限，默认 256 MiB；0 关闭")
@@ -1309,6 +1297,8 @@ def main():
         "--webui", default=None, metavar="HTML",
         help="Web 控制台 HTML 文件路径（默认 scripts/webui.html；"
              "内置可选 scripts/webui-aero.html）")
+    from scripts.memory_options import add_memory_arguments, memory_kwargs
+    add_memory_arguments(parser)
     args = parser.parse_args()
 
     # 先给一行反馈：torch/torch_npu 导入在板卡上需 ~20s，期间没有任何输出。
@@ -1331,6 +1321,7 @@ def main():
     kwargs = dict(
         model=args.model,
         enforce_eager=args.eager,
+        dtype=args.dtype,
         tensor_parallel_size=1,       # server 只支持 TP=1（引擎同进程驱动）
         max_model_len=args.max_model_len,
         max_num_batched_tokens=args.max_num_batched_tokens,
@@ -1349,7 +1340,10 @@ def main():
         kwargs["max_num_seqs"] = 8
     if args.block_size is not None:
         kwargs["kvcache_block_size"] = args.block_size
+    if args.kv_blocks is not None:
+        kwargs["num_kvcache_blocks"] = args.kv_blocks
 
+    kwargs.update(memory_kwargs(args))
     engine = LLM(**kwargs)
     _tokenizer = engine.tokenizer
     _eos = engine.scheduler.eos

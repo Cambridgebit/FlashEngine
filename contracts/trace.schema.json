@@ -1,0 +1,21 @@
+{
+  "$schema":"https://json-schema.org/draft/2020-12/schema",
+  "$id":"urn:flashengine:trace:1",
+  "type":"object",
+  "required":["schema_version","contract_version","oracle","cases"],
+  "properties":{
+    "schema_version":{"const":1},
+    "contract_version":{"enum":["0.1.0","0.2.0","0.3.0","0.4.0"]},
+    "oracle":{"type":"object","required":["git_sha","bundle_sha256","environment"]},
+    "cases":{"type":"array","items":{
+      "type":"object","required":["prompt_token_ids","output_token_ids","sampling","finish_reason"],
+      "properties":{
+        "prompt_token_ids":{"type":"array","minItems":1,"items":{"type":"integer","minimum":0}},
+        "output_token_ids":{"type":"array","items":{"type":"integer","minimum":0}},
+        "sampling":{"type":"object"},
+        "finish_reason":{"enum":["stop","length","cancelled"]},
+        "rounds":{"type":"array","items":{"type":"object","required":["draft_ids","verify_ids","accepted_count","committed_ids","context_length"]}}
+      }
+    }}
+  }
+}
