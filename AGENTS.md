@@ -1,5 +1,7 @@
 # AGENTS.md
 
+**310P W8A8 MoE 长跑退化修复（2026-10-23）**：板卡实测定位到预填充/解码共用按 token 数索引的 attention 输出缓冲，且 mask/RoPE/输出缓存的有界 LRU 会淘汰仍被 NPUGraph 或异步算子引用的张量；坏 KV 进入 prefix cache 后持续退化。修复：prefill 单张最大预算缓冲、decode 按图桶固定不淘汰、图捕获 key 永久 pin、淘汰先保活并 `torch.npu.synchronize()`、prefix hash 拒绝 stale/断链。自造负载验证：引擎级 1000 条 0 bad、canary 全 `OK`（15001 graph replay / 0 fallback）；2k–18k 长度 sweep 0 bad；HTTP 300 条 0 bad；50 个 host 单测 OK（2 skipped）；30B W8A8 benchmark 21.19 tok/s。详见 [`docs/ASCEND310P_W8A8_LONGRUN.md`](docs/ASCEND310P_W8A8_LONGRUN.md)。历史降级只代表 seqs=1、无投机配置，高并发/DFlash/CoreX 未覆盖。
+
 **Python 显存与 Triton 接口增量（2026-10-17）**：本轮用户明确授权优化与测试。新增跨后端启动预算（显式 KV 块数也受校验）、设备映射、独立通信资源、公开请求取消/快照和薄的 `TritonPythonModel.initialize/execute/finalize` 入口；不实现 Triton Server/CV 后端。RoPE 改为按设备/dtype 的弱引用共享，卸载断开 recurrent/prefix 验证器及 NPU 张量缓存。EAGLE3 链式图补齐 host 预展开的累计 KV 长度（MetaBlob 新段在尾部）。说明见 `docs/PYTHON_MEMORY_TRITON.md`，真实设备入口 `scripts/check_python_memory.py`；外部服务器契约替身测试不能当作真实 Triton Server 验收，CoreX/310P 与多卡 TP 仍须对应环境实测。
 
 **三后端源码对齐增量（2026-10-17）**：用户要求本轮只改代码、不测试；独立 C++ 仓新增 310P Qwen3.5/EAGLE3/Quark 参考实现，公共 chunked-prefill CLI/workload 开关及 scheduler/投机观测。详见该仓 `docs/BACKEND_PARITY_SOURCE.md`。未构建、未测试、旧二进制未更新；历史 CUDA 报告不覆盖本轮变更。CoreX/310P 仍无 SDK/真机，ND/ATen 参考路径不等于 ATB/NZ/ixformer 高性能后端，Quark 反量化不是真 int8。

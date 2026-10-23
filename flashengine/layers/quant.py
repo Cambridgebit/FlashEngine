@@ -41,7 +41,9 @@ def _setup_quant_params(module, scheme: str) -> None:
         raise NotImplementedError(f"Unsupported Ascend W8A8 scheme: {scheme}")
     weight = module.weight
     out_size, in_size = weight.shape
-    out_dtype = weight.dtype
+    # 310P 在加载期把权重转成后端默认 dtype（fp16）；量化尺度/输出也必须用同一
+    # dtype，否则 npu_quant_matmul 会拿 bf16 尺度配 fp16 激活，长输出逐步崩坏。
+    out_dtype = get_backend().default_dtype or weight.dtype
     weight_loader = getattr(weight, "weight_loader", None)
     # 非浮点 dtype 的 Parameter 必须显式 requires_grad=False（int8/int32/int64 不可求导）。
     module.weight = nn.Parameter(torch.empty(out_size, in_size, dtype=torch.int8),
@@ -55,7 +57,10 @@ def _setup_quant_params(module, scheme: str) -> None:
         module.weight_offset = nn.Parameter(torch.empty(out_size, 1, dtype=out_dtype))
         module.quant_bias = nn.Parameter(torch.empty(out_size, dtype=torch.int32),
                                          requires_grad=False)
-        module.deq_scale = nn.Parameter(torch.empty(out_size, dtype=torch.int64),
+        # 检查点 deq_scale 是 float32；310P 的 npu_quant_matmul 要求 int64 尺度
+        # 由 npu_trans_quant_param 生成，故这里保留 float32 参数，在
+        # prepare_quant_linear 里生成 aclnn_deq_scale。
+        module.deq_scale = nn.Parameter(torch.empty(out_size, dtype=torch.float32),
                                         requires_grad=False)
         # per-tensor 激活参数（整表，不分片）。
         module.input_scale = nn.Parameter(torch.empty(1, dtype=out_dtype))
@@ -77,8 +82,11 @@ def _setup_quant_params(module, scheme: str) -> None:
 def _quant_forward(module, x: torch.Tensor) -> torch.Tensor:
     backend = get_backend()
     if module.quant_scheme_name == W8A8_STATIC:
+        # prepare_quant_linear 预生成的 int64 尺度（npu_trans_quant_param），
+        # 避免每次 GEMM 走 float32 尺度的慢路径。
+        scale = getattr(module, "aclnn_deq_scale", module.deq_scale)
         return backend.quant_linear_static(
-            x, module.weight, module.deq_scale, module.quant_bias,
+            x, module.weight, scale, module.quant_bias,
             module.aclnn_input_scale, module.aclnn_input_scale_reciprocal,
             module.aclnn_input_offset, module.quant_out_dtype, module.bias,
         )

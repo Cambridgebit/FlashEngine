@@ -80,7 +80,13 @@ class BlockManager:
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
             block_id = self.hash_to_block_id.get(h, -1)
-            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+            # 哈希表条目必须仍然对应该块当前的哈希：块被重新分配/重写后
+            # 旧映射可能残留（hash_blocks 只更新块上的 hash，不清理旧键），
+            # 仅比对 token_ids 会把「同内容、不同前缀」的块误判为命中，
+            # 读到用别的上下文算出的 KV。stale 映射一律按未命中处理。
+            if (block_id == -1
+                    or self.blocks[block_id].hash != h
+                    or self.blocks[block_id].token_ids != token_ids):
                 break
             if self.cache_hit_validator is not None and not self.cache_hit_validator(block_id, h):
                 break
@@ -157,11 +163,24 @@ class BlockManager:
         if self.keep_last_block_unhashed:
             end = min(end, max(seq.num_blocks - 1, 0))
         if start >= end: return
-        h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
+        if start > 0:
+            parent = self.blocks[seq.block_table[start - 1]].hash
+            # 前缀链断了（父块未登记 / 被 clear_prefix_cache 清掉）时不能
+            # 把 start 号块当成「链首」登记：它的 token 内容可能与别的
+            # 前缀首块相同（重复文本很常见），后续请求会命中一段用错误
+            # 上下文算出的 KV。宁可少缓存，也不登记不完整的链。
+            if parent == -1:
+                return
+            h = parent
+        else:
+            h = -1
         for i in range(start, end):
             block = self.blocks[seq.block_table[i]]
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
+            old = block.hash
+            if old != -1 and self.hash_to_block_id.get(old) == block.block_id:
+                del self.hash_to_block_id[old]
             block.update(h, token_ids)
             self.hash_to_block_id[h] = block.block_id
 

@@ -53,13 +53,50 @@ def _lru_get(cache: "OrderedDict", key):
     return value
 
 
-def _lru_put(cache: "OrderedDict", key, value, max_bytes: int) -> None:
+def _is_capturing() -> bool:
+    """当前是否处于图捕获（NPU 或 CUDA）。"""
+    for mod in (getattr(torch, "npu", None), getattr(torch, "cuda", None)):
+        fn = getattr(mod, "is_current_stream_capturing", None) if mod is not None else None
+        if fn is None:
+            continue
+        try:
+            if fn():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _lru_put(cache: "OrderedDict", key, value, max_bytes: int,
+             pinned=None) -> None:
     cache[key] = value
     cache.move_to_end(key)
+    # 捕获期不能同步设备，也不做淘汰：桶数有限，捕获结束后的正常调用再收缩。
+    if _is_capturing():
+        return
     total = sum(_tensor_bytes(item) for item in cache.values())
+    dropped = []
     while total > max_bytes and len(cache) > 1:
-        _, dropped = cache.popitem(last=False)
-        total -= _tensor_bytes(dropped)
+        # 图捕获引用过的 buffer 地址已被烧进 NPUGraph，淘汰会让回放读写
+        # 已释放/复用的显存（表现为固定 canary 从 OK 变成 !OK，随后整段
+        # 乱码）。这类 key 永久钉住，只淘汰未参与捕获的 prefill 临时项。
+        victim = next((k for k in cache if pinned is None or k not in pinned), None)
+        if victim is None:
+            break
+        item = cache.pop(victim)
+        total -= _tensor_bytes(item)
+        dropped.append(item)
+    if not dropped:
+        return
+    # 被淘汰的张量可能仍被尚未完成的异步算子引用。先保活到同步点，再释放；
+    # 直接丢弃会让 NPU 缓存的显存被下一次分配复用。
+    try:
+        synchronize = getattr(getattr(torch, "npu", None), "synchronize", None)
+        if synchronize is not None:
+            synchronize()
+    except Exception:
+        pass
+    dropped.clear()
 
 _REQUIRED_OPS = (
     "_npu_reshape_and_cache",
@@ -183,6 +220,9 @@ class Ascend310PBackend(BackendBase):
                 flush=True,
             )
             config.kvcache_block_size = preferred
+        # prefill 输出缓冲只保留一张「最大预算」的，避免按 token 数累积。
+        self._prefill_out_rows = max(
+            1, min(int(config.max_num_batched_tokens), int(config.max_model_len)))
 
     def validate_config(self, config) -> None:
         if config.tensor_parallel_size != 1:
@@ -214,7 +254,16 @@ class Ascend310PBackend(BackendBase):
         self._nd_mask = OrderedDict()
         self._dflash_mask = OrderedDict()
         self._splitfuse_mask = {}
-        self._decode_out = {}
+        self._decode_out = OrderedDict()
+        # prefill 输出用一张最大预算缓冲；decode 输出按桶固定，均不淘汰。
+        self._prefill_out = {}
+        self._prefill_out_rows = 0
+        self._prefill_out_retired = []
+        # 图捕获期引用过的 buffer key：地址已固化进 NPUGraph，永不淘汰。
+        self._nz_mask_pinned = set()
+        self._nd_mask_pinned = set()
+        self._dflash_mask_pinned = set()
+        self._rope_apply_pinned = set()
         self._rope_cache = {}
         self._rope_apply_cache = OrderedDict()
         # vllm_ascend 的 unquantized_gemm 在后台线程导入（见 _start_vllm_gemm_import），
@@ -525,6 +574,10 @@ class Ascend310PBackend(BackendBase):
                 module.weight.data, acl_format).transpose(0, 1)
             module.weight_scale.data = module.weight_scale.data.flatten()
             module.weight_offset.data = module.weight_offset.data.flatten()
+            # npu_quant_matmul 的 int64 尺度必须由 npu_trans_quant_param 生成；
+            # 直接位拼 float32 会引入偏差（长上下文会退化成重复 token）。
+            module.aclnn_deq_scale = tn.npu_trans_quant_param(
+                module.deq_scale.data.to(torch.float32))
         else:
             module.weight.data = tn.npu_format_cast(
                 module.weight.data, acl_format).transpose(0, 1)
@@ -571,6 +624,8 @@ class Ascend310PBackend(BackendBase):
     def _dflash_noncausal_mask(self, query_tokens: int, max_seq_len: int, device):
         cache = self._dflash_mask
         key = (query_tokens, max_seq_len, str(device), self._splitfuse_v2 is not None)
+        if _is_capturing() or self._graph_context():
+            self._dflash_mask_pinned.add(key)
         mask = _lru_get(cache, key)
         if mask is not None:
             return mask
@@ -585,7 +640,8 @@ class Ascend310PBackend(BackendBase):
                 (query_tokens, max_seq_len), dtype=torch.float16, device=device
             )
             mask = self._nd_to_nz_spec(mask_nd)
-        _lru_put(cache, key, mask, _DFLASH_MASK_CACHE_BYTES)
+        _lru_put(cache, key, mask, _DFLASH_MASK_CACHE_BYTES,
+                 pinned=self._dflash_mask_pinned)
         return mask
 
     def dflash_paged_attention(
@@ -696,8 +752,13 @@ class Ascend310PBackend(BackendBase):
         """模型卸载不终止进程级 NPU 运行时，以便 Triton 再次加载。"""
         self.synchronize()
         for cache in (self._nz_mask, self._nd_mask, self._dflash_mask, self._splitfuse_mask,
-                      self._decode_out, self._rope_cache, self._rope_apply_cache):
+                      self._decode_out, self._prefill_out, self._rope_cache,
+                      self._rope_apply_cache):
             cache.clear()
+        self._prefill_out_retired.clear()
+        for pinned in (self._nz_mask_pinned, self._nd_mask_pinned,
+                       self._dflash_mask_pinned, self._rope_apply_pinned):
+            pinned.clear()
         self.empty_cache()
 
     def shutdown(self):
@@ -1031,6 +1092,26 @@ class Ascend310PBackend(BackendBase):
         return out
 
     def _get_decode_out(self, bs, num_heads, head_dim, dtype, device):
+        from flashengine.utils.context import get_context
+        context = get_context()
+        if context.is_prefill:
+            # prefill 不参与 decode 图捕获：所有层共用一张最大预算缓冲。
+            # 输出被 o_proj 消费后才进入下一层，流顺序保证不会提前覆盖。
+            key = (num_heads, head_dim, dtype, str(device))
+            rows = max(int(bs), self._prefill_out_rows)
+            buf = self._prefill_out.get(key)
+            if buf is None or buf.shape[0] < rows:
+                old = buf
+                buf = torch.empty((rows, num_heads, head_dim),
+                                  dtype=dtype, device=device)
+                self._prefill_out[key] = buf
+                if old is not None:
+                    # 极端情况下扩容：旧缓冲可能仍在 in-flight，保活到同步点。
+                    self._prefill_out_retired.append(old)
+            return buf[:bs]
+
+        # decode：每个图桶/并发数一张固定缓冲，地址会被 NPUGraph 捕获，
+        # 因此只增不减，绝不淘汰。桶数由 max_num_seqs 决定，天然有界。
         key = (bs, num_heads, head_dim, dtype, str(device))
         buf = self._decode_out.get(key)
         if buf is None:
@@ -1040,6 +1121,8 @@ class Ascend310PBackend(BackendBase):
 
     def _causal_mask_nz(self, max_seq_len, device):
         seq_len = _bucket_mask_len(max_seq_len)
+        if _is_capturing() or self._graph_context():
+            self._nz_mask_pinned.add(seq_len)
         cached = _lru_get(self._nz_mask, seq_len)
         if cached is not None:
             return cached
@@ -1053,11 +1136,18 @@ class Ascend310PBackend(BackendBase):
         mask_nd[:seq_len, :seq_len].masked_fill_(upper, float("-inf"))
         mask = mask_nd.reshape(1, aligned, aligned // 16, 16).permute(0, 2, 1, 3).contiguous()
         mask = tn.npu_format_cast(mask, _acl_format_nz())
-        _lru_put(self._nz_mask, seq_len, mask, _MASK_CACHE_BYTES)
+        _lru_put(self._nz_mask, seq_len, mask, _MASK_CACHE_BYTES,
+                 pinned=self._nz_mask_pinned)
         return mask
+
+    def _graph_context(self) -> bool:
+        from flashengine.utils.context import get_context
+        return bool(get_context().use_cuda_graph)
 
     def _causal_mask_nd(self, max_seq_len, device):
         seq_len = _bucket_mask_len(max_seq_len)
+        if _is_capturing() or self._graph_context():
+            self._nd_mask_pinned.add(seq_len)
         cached = _lru_get(self._nd_mask, seq_len)
         if cached is not None:
             return cached
@@ -1067,7 +1157,8 @@ class Ascend310PBackend(BackendBase):
             diagonal=1,
         )
         mask.masked_fill_(upper, float("-inf"))
-        _lru_put(self._nd_mask, seq_len, mask, _MASK_CACHE_BYTES)
+        _lru_put(self._nd_mask, seq_len, mask, _MASK_CACHE_BYTES,
+                 pinned=self._nd_mask_pinned)
         return mask
 
     def _compressed_splitfuse_mask(self, device):
@@ -1213,6 +1304,8 @@ class Ascend310PBackend(BackendBase):
                     cache.data_ptr(), num_tokens, rotary_dim,
                     str(q.device), q.dtype,
                 )
+                if _is_capturing() or context.use_cuda_graph:
+                    self._rope_apply_pinned.add(buffer_key)
                 buffers = _lru_get(self._rope_apply_cache, buffer_key)
                 if buffers is None:
                     buffers = (
@@ -1226,7 +1319,8 @@ class Ascend310PBackend(BackendBase):
                         ),
                     )
                     _lru_put(self._rope_apply_cache, buffer_key, buffers,
-                             _ROPE_BUFFER_CACHE_BYTES)
+                             _ROPE_BUFFER_CACHE_BYTES,
+                             pinned=self._rope_apply_pinned)
                 context.rope_cos, context.rope_sin = buffers
                 context.rope_cos.copy_(cos.contiguous().view_as(context.rope_cos))
                 context.rope_sin.copy_(sin.contiguous().view_as(context.rope_sin))
