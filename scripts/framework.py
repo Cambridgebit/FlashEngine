@@ -147,6 +147,57 @@ def server_arguments(settings):
     return arguments
 
 
+def benchmark_arguments(settings, args):
+    """把统一设置翻译成既有串行基准的命令行（不复制其计时/统计实现）。
+
+    基准只认 float16/bfloat16 两种显式 dtype，其他精密度取值在这里提前拒绝；
+    ``--questions`` 缺省指向仓库内数据集，避免落到历史口径的 ``../question.jsonl``。
+    """
+    if settings.precision not in ("auto", "float16", "bfloat16"):
+        raise ValueError("基准只支持 precision=auto/float16/bfloat16")
+    arguments = [
+        settings.model,
+        "--backend", settings.backend,
+        "--max-model-len", str(settings.max_model_len),
+        "--max-num-seqs", str(settings.max_num_seqs),
+        "--max-num-batched-tokens", str(settings.max_num_batched_tokens),
+        "--max-num-partial-prefills", str(settings.max_num_partial_prefills),
+        "--gpu-mem-util", str(settings.gpu_memory_utilization),
+        "--block-size", str(settings.kvcache_block_size),
+        "--spec-model", settings.spec_model,
+        "--spec-num-tokens", str(settings.spec_num_tokens),
+        "--temperature", str(settings.temperature),
+        "--top-p", str(settings.top_p),
+        "--top-k", str(settings.top_k),
+        "--max-tokens", str(settings.max_tokens),
+        "--recurrent-prefix-cache-mb",
+        str(settings.recurrent_prefix_cache_bytes // (1024 * 1024)),
+    ]
+    if settings.precision != "auto":
+        arguments += ["--dtype", settings.precision]
+    if settings.device_ids:
+        arguments += ["--device", str(settings.device_ids[0])]
+    for field, flag in (("memory_budget_bytes", "--memory-budget-mib"),
+                        ("device_memory_reserve_bytes", "--device-reserve-mib"),
+                        ("memory_workspace_bytes", "--memory-workspace-mib"),
+                        ("graph_memory_reserve_bytes", "--graph-reserve-mib")):
+        arguments += [flag, str(getattr(settings, field) // (1024 * 1024))]
+    for enabled, flag in ((settings.enforce_eager, "--eager"),
+                          (not settings.enable_chunked_prefill, "--disable-chunked-prefill"),
+                          (not settings.enable_prefix_cache, "--no-prefix-cache"),
+                          (not settings.enable_thinking, "--no-think")):
+        if enabled:
+            arguments.append(flag)
+    # 基准独占开关（不在 RuntimeSettings 里）：未显式给出时沿用基准自身默认。
+    for name, flag in (("questions", "--questions"), ("category", "--category"),
+                       ("num_prompts", "--num-prompts"), ("num_repeats", "--num-repeats"),
+                       ("seed", "--seed"), ("warmup", "--warmup")):
+        value = getattr(args, name, None)
+        if value is not None:
+            arguments += [flag, str(value)]
+    return arguments
+
+
 def synchronize(engine):
     """压测/计时边界同步设备（主项目暂无 ``LLMEngine.synchronize()`` 的公开入口）。"""
     backend = getattr(getattr(engine, "model_runner", None), "backend", None)
@@ -197,6 +248,7 @@ _COMMANDS = (
     ("start", "后台启动并等待就绪"),
     ("status", "读取本框架服务状态"),
     ("stop", "验证 PID 身份后优雅停止本框架"),
+    ("benchmark", "运行串行基准（封装 scripts.benchmark）"),
 )
 
 
@@ -216,6 +268,16 @@ def main(argv=None):
         if name in {"start", "stop", "status"}:
             child.add_argument("--timeout", type=float, default=240 if name == "start" else 60,
                                help="就绪/退出等待秒数")
+        if name == "benchmark":
+            child.add_argument("--questions", default="bench_data/question.jsonl",
+                               help="题目 jsonl 路径，默认仓库内数据集")
+            child.add_argument("--category", default=None, help="数据集分类（coding/writing/agent…）")
+            child.add_argument("--num-prompts", type=int, default=None, help="题目数（默认 10）")
+            child.add_argument("--num-repeats", type=int, default=None,
+                               help="同题重复次数，用于前缀缓存冷热对照（默认 1）")
+            child.add_argument("--seed", type=int, default=None,
+                               help="数据集洗牌种子，-1 保持文件顺序（默认 0）")
+            child.add_argument("--warmup", type=int, default=None, help="预热请求数（默认 5）")
         if name == "serve":
             child.add_argument("--raw-log", default=None, metavar="PATH",
                                help="把模型原始输出以 JSONL 追加写入该文件（透传既有服务开关）")
@@ -236,6 +298,10 @@ def main(argv=None):
         if args.command == "generate":
             _require_model(settings, "generate")
             return generate(settings, args)
+        if args.command == "benchmark":
+            _require_model(settings, "benchmark")
+            from scripts.benchmark import main as bench
+            return bench(benchmark_arguments(settings, args)) or 0
         if args.command == "serve":
             _require_model(settings, "serve")
             if settings.tensor_parallel_size != 1:

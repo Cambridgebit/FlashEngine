@@ -50,7 +50,7 @@ def print_graph_stats(label, stats, fallback_key):
     print(f"{label} = " + ", ".join(f"{key}={value}" for key, value in fields.items()))
 
 
-def main():
+def main(argv=None):
     global Sequence
     parser = argparse.ArgumentParser(
         description="Serial TPS/TTFT benchmark compatible with vllm bench serve.")
@@ -83,7 +83,7 @@ def main():
     parser.add_argument("--gpu-mem-util", type=float, default=0.9)
     from scripts.memory_options import add_memory_arguments, memory_kwargs
     add_memory_arguments(parser)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # 先给一行反馈：torch/torch_npu 导入在板卡上需 ~20s，期间没有任何输出。
     print("[FlashEngine] Importing runtime (torch / torch_npu / transformers, "

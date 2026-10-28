@@ -261,8 +261,11 @@ python3 -m scripts.benchmark /data/Qwen3-0.6B \
 显存/设备/TP 配置、`--raw-log`、`device_rng`、weakref RoPE 共享、权重加载进度条等）**一行未删**。合入 9 项新能力：
 
 1. **统一配置与入口**：`flashengine/runtime.py`（`RuntimeSettings` + `create_engine`，import 期纯标准库）、`python -m flashengine`
-   的 6 个子命令（`config/generate/serve/start/status/stop`）、`configs/{default,eager,batch}.json`、
+   的 7 个子命令（`config/benchmark/generate/serve/start/status/stop`）、`configs/{default,eager,spec,batch}.json`、
    `scripts/framework.py`、`scripts/service_control.py`（PID+启动计数+cwd+argv+源码根五重归属校验，pidfd/SIGTERM）。
+   `benchmark`/`generate` 与 `serve` 同源：前者把 `RuntimeSettings` 翻成 `scripts.benchmark` 的 argv（`benchmark_arguments()`，
+   缺省 `--questions bench_data/question.jsonl`），后者翻成 `scripts.openai_server` 的 argv（`server_arguments()`，含
+   `--device`/`--memory-*-mib` 四项显存预算透传；服务仅 TP=1，传非 1 直接报错）。
 2. **服务端点与生命周期**：`GET /healthy`、`GET /ready`（`{status,pid,service,version}`，均免鉴权）、`GET /v1/runtime`
    （`engine.runtime_snapshot()`）、`--api-key-env`（密钥不进 argv）、SIGTERM 优雅停机、引擎线程致命异常 → 就绪端点 503。
 3. **精度守卫（开关化）**：`flashengine/precision.py`（`require_unquantized_checkpoint`）、`flashengine/validation.py`

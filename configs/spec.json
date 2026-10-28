@@ -1,0 +1,19 @@
+{
+  "model": "/models/qwen3-8b",
+  "backend": "ascend310p",
+  "precision": "float16",
+  "max_model_len": 2048,
+  "max_num_seqs": 1,
+  "max_num_batched_tokens": 256,
+  "kvcache_block_size": 128,
+  "enable_chunked_prefill": true,
+  "enable_prefix_cache": false,
+  "gpu_memory_utilization": 0.5,
+  "enforce_eager": false,
+  "spec_model": "/models/qwen3-8b-dflash",
+  "spec_num_tokens": 15,
+  "host": "0.0.0.0",
+  "port": 8000,
+  "enable_thinking": false,
+  "web_ui": true
+}
