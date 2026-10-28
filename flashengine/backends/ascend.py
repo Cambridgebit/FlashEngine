@@ -179,6 +179,29 @@ def _acl_format_nd():
     return acl_format
 
 
+def _host_positions_kwarg(host_positions):
+    """host_positions 的 set_context 关键字（Context 尚未提供该字段时降级为空）。"""
+    try:
+        from dataclasses import fields
+
+        from flashengine.utils.context import Context
+
+        if any(field.name == "host_positions" for field in fields(Context)):
+            return {"host_positions": host_positions}
+    except Exception:
+        pass
+    return {}
+
+
+# 模块名后缀 → 线性层用途标签（linear_for_role 的 selective 分派依据）。
+_LINEAR_ROLE_BY_SUFFIX = {
+    "qkv_proj": "qkv",
+    "o_proj": "o",
+    "down_proj": "down",
+    "gate_up_proj": "gate_up",
+}
+
+
 class Ascend310PBackend(BackendBase):
 
     name = "ascend310p"
@@ -266,6 +289,33 @@ class Ascend310PBackend(BackendBase):
         self._rope_apply_pinned = set()
         self._rope_cache = {}
         self._rope_apply_cache = OrderedDict()
+        # cos|sin 半分配对的预展开表（按 (data_ptr, device, dtype) 复用）。
+        self._rope_full_tables = {}
+        # ---- 单行 decode 线性算子与 greedy 归约位置（默认值 = 主项目原行为）----
+        self.linear_backend = os.getenv(
+            "LITEQ_DECODE_LINEAR_BACKEND", "functional").strip().lower()
+        if self.linear_backend not in {"selective", "functional"}:
+            raise ValueError(
+                "LITEQ_DECODE_LINEAR_BACKEND 必须是 selective 或 functional，"
+                f"收到 {self.linear_backend!r}"
+            )
+        if (self.linear_backend == "selective"
+                and not callable(getattr(tn, "npu_linear", None))):
+            print(
+                "[FlashEngine] torch_npu.npu_linear 不可用，selective Linear "
+                "回退 functional。",
+                flush=True,
+            )
+            self.linear_backend = "functional"
+        self.greedy_backend = os.getenv(
+            "LITEQ_GREEDY_BACKEND", "npu").strip().lower()
+        if self.greedy_backend not in {"npu", "cpu"}:
+            raise ValueError(
+                "LITEQ_GREEDY_BACKEND 必须是 npu 或 cpu，"
+                f"收到 {self.greedy_backend!r}"
+            )
+        # validate_model_decode 的结论（{"checked": False} = 未做候选算子切换）。
+        self.linear_validation = {"checked": False}
         # vllm_ascend 的 unquantized_gemm 在后台线程导入（见 _start_vllm_gemm_import），
         # 这里只登记未解析状态，首次 linear()/runtime_info() 时再惰性取算子。
         self._unquantized_gemm = None
@@ -338,7 +388,16 @@ class Ascend310PBackend(BackendBase):
             f"nd={len(self._nd_mask)}({nd_bytes >> 20}MiB), "
             f"nz={len(self._nz_mask)}({nz_bytes >> 20}MiB)"
         )
+        info["decode_linear_backend"] = self.linear_backend
+        info["greedy_backend"] = self.greedy_backend
+        info["linear_validation"] = self._linear_validation_text()
         return info
+
+    def _linear_validation_text(self) -> str:
+        """linear_validation 的单行摘要（运行摘要/日志用，明细见 self.linear_validation）。"""
+        if not self.linear_validation.get("checked"):
+            return "not_checked"
+        return "passed" if self.linear_validation.get("passed") else "functional_fallback"
 
     def _gemm_op(self):
         """取 vllm_ascend 的 unquantized_gemm（后台导入完成后解析一次）。"""
@@ -360,14 +419,148 @@ class Ascend310PBackend(BackendBase):
             return gemm(x, weight, bias)
         return F.linear(x, weight, bias)
 
-    def optimize_model_weights(self, model) -> int:
+    def linear_for_role(self, x, weight, bias=None, role: str = "generic"):
+        """selective：仅非 Prefill 的单行 QKV/O/Down 走 npu_linear。
+
+        Gate-Up、LM Head、多行输入与草稿模型一律保留 functional，避免把 310P
+        的私有格式边界（ND/NZ）扩散到别的形状；未开 selective 时与 linear()
+        逐位等价。所有条件都必须是主机侧可知的静态量，才能在图内安全分叉。
+        """
+        from flashengine.utils.context import get_context
+
+        if (self.linear_backend == "selective" and role in {"qkv", "o", "down"}
+                and not get_context().is_prefill and x.ndim == 2
+                and x.shape[0] == 1 and x.dtype == torch.float16):
+            return _torch_npu().npu_linear(x, weight, bias)
+        return self.linear(x, weight, bias)
+
+    def greedy_tokens(self, logits) -> list[int]:
+        """CPU 路径只搬运原 FP16 logits，省掉设备侧 argmax 与一次同步。"""
+        if self.greedy_backend == "cpu":
+            return logits.detach().cpu().argmax(dim=-1).tolist()
+        return super().greedy_tokens(logits)
+
+    def _prepare_rope_tables(self, cache):
+        """把 cos|sin 半分配对的表一次展开成 full（供前后各层与各步复用）。
+
+        apply_rotary_pos_emb 的 half 语义要求 full cos/sin（前半段重复一遍），
+        旧实现每步 index_select 后再 chunk+cat；预展开后只剩一次 gather，
+        eager 单 token 更能直接用主机位置取行视图、连 gather 都省掉。
+        """
+        key = (cache.data_ptr(), str(cache.device), cache.dtype)
+        tables = self._rope_full_tables.get(key)
+        if tables is None:
+            half_cos, half_sin = cache.chunk(2, dim=-1)
+            tables = (
+                torch.cat((half_cos, half_cos), dim=-1),
+                torch.cat((half_sin, half_sin), dim=-1),
+            )
+            self._rope_full_tables[key] = tables
+        return tables
+
+    @torch.inference_mode()
+    def validate_model_decode(self, model, config) -> dict:
+        """selective Linear 的数值守卫：dummy 块上跑单行 decode，与 functional 对比。
+
+        只用 reserve_dummy_kv_block 保留的最后一块（不被任何序列使用）写 KV，
+        因此可以在真实服务开始前安全执行。比较不通过就地回退 functional，把结论
+        留在 self.linear_validation / runtime_info() 里，不把未验证的算子带进图。
+        """
+        self.linear_validation = {"checked": False, "backend": self.linear_backend}
+        if self.linear_backend != "selective":
+            return dict(self.linear_validation)
+        try:
+            from flashengine.validation import compare_logits
+        except ImportError as exc:
+            # 缺少数值比较模块时不冒险：selective 只在验证通过后才允许启用。
+            self.linear_backend = "functional"
+            self.linear_validation = {
+                "checked": False, "backend": "functional",
+                "fallback_reason": f"validation 模块不可用：{exc}",
+            }
+            print(
+                "[FlashEngine] 无法导入 flashengine.validation，selective Linear "
+                "回退 functional。",
+                flush=True,
+            )
+            return dict(self.linear_validation)
+        if not self.reserve_dummy_kv_block():
+            self.linear_backend = "functional"
+            self.linear_validation = {
+                "checked": False, "backend": "functional",
+                "fallback_reason": "没有保留的 dummy KV 块，拒绝在真实块上验算",
+            }
+            return dict(self.linear_validation)
+
+        from flashengine.utils.context import reset_context, set_context
+
+        device = self.device_name
+        try:
+            device = next(model.parameters()).device
+        except Exception:
+            pass
+        block = int(config.num_kvcache_blocks) - 1
+        block_size = int(config.kvcache_block_size)
+        ids = torch.ones((1,), dtype=torch.int64, device=device)
+        positions = torch.zeros((1,), dtype=torch.int64, device=device)
+        slots = torch.full((1,), block * block_size, dtype=torch.int32, device=device)
+        context_lens = torch.ones((1,), dtype=torch.int32, device=device)
+        block_tables = torch.full((1, 1), block, dtype=torch.int32, device=device)
+        extra = _host_positions_kwarg((0,))
+
+        def forward():
+            set_context(
+                False,
+                slot_mapping=slots,
+                context_lens=context_lens,
+                block_tables=block_tables,
+                block_size=block_size,
+                max_context_len=int(config.max_model_len),
+                **extra,
+            )
+            hidden = model(ids, positions)
+            if isinstance(hidden, tuple):
+                hidden = hidden[0]
+            return model.compute_logits(hidden)
+
+        try:
+            # compare_logits 内部统一转 CPU float32 再比，这里只传张量。
+            self.linear_backend = "functional"
+            reference = forward()
+            self.linear_backend = "selective"
+            candidate = forward()
+            metrics = compare_logits(reference, candidate)
+            self.linear_validation = {
+                "checked": True, "backend": "selective", "passed": True,
+                **metrics,
+            }
+        except Exception as exc:
+            # 守卫是可选增强：无论是数值不达标还是 dummy 前向本身不可用，都回到
+            # 主项目现状（functional）继续启动，绝不让候选算子把引擎拖崩。
+            self.linear_backend = "functional"
+            self.linear_validation = {
+                "checked": True, "backend": "functional", "passed": False,
+                "fallback_reason": f"{type(exc).__name__}: {exc}",
+            }
+            print(
+                "[FlashEngine] selective Linear 数值守卫未通过（或 dummy 单行 decode "
+                f"前向不可用），回退 functional：{exc}",
+                flush=True,
+            )
+        finally:
+            reset_context()
+        print(f"[FlashEngine] FP16_LINEAR_VALIDATION {self.linear_validation}",
+              flush=True)
+        return dict(self.linear_validation)
+
+    def optimize_model_weights(self, model, decode_roles: bool = False) -> int:
         from flashengine.layers.embed_head import ParallelLMHead
         from flashengine.layers.linear import LinearBase
 
         tn = _torch_npu()
         acl_format = _acl_format_nz()
         converted = 0
-        for module in model.modules():
+        for name, module in model.named_modules():
             if isinstance(module, ParallelLMHead):
                 weight = module.weight.detach()
                 if weight.ndim >= 2 and min(weight.shape[-2:]) > 1:
@@ -381,6 +574,12 @@ class Ascend310PBackend(BackendBase):
                 converted += 1
                 continue
             if isinstance(module, LinearBase):
+                # 按模块名后缀打用途标签，供 linear_for_role 的 selective 分派；
+                # 未开 decode_roles 时统一 generic（= 落后端默认路径）。
+                module.linear_role = (
+                    _LINEAR_ROLE_BY_SUFFIX.get(name.rsplit(".", 1)[-1], "generic")
+                    if decode_roles else "generic"
+                )
                 weight = module.weight.data
                 if (weight.dtype != torch.float32 and weight.ndim >= 2
                         and min(weight.shape[-2:]) > 1):
@@ -753,7 +952,7 @@ class Ascend310PBackend(BackendBase):
         self.synchronize()
         for cache in (self._nz_mask, self._nd_mask, self._dflash_mask, self._splitfuse_mask,
                       self._decode_out, self._prefill_out, self._rope_cache,
-                      self._rope_apply_cache):
+                      self._rope_apply_cache, self._rope_full_tables):
             cache.clear()
         self._prefill_out_retired.clear()
         for pinned in (self._nz_mask_pinned, self._nd_mask_pinned,
@@ -805,7 +1004,11 @@ class Ascend310PBackend(BackendBase):
 
     def create_decode_graph_executor(self, plan):
         from flashengine.backends.ascend310p.graph import NPUGraphDecodeRunner
-        return NPUGraphDecodeRunner(plan)
+
+        # greedy 归约放在 CPU 时，图内 argmax 的结果没人用，改为图内只出 logits，
+        # 由 greedy_tokens() 在图外读回归约——两处口径必须同一个开关，否则
+        # try_run 会把图内 argmax 当成结果返回。
+        return NPUGraphDecodeRunner(plan, capture_greedy=self.greedy_backend == "npu")
 
     def prefix_cache_disable_reason(self) -> str | None:
         if not self.supports_splitfuse:
@@ -1291,40 +1494,57 @@ class Ascend310PBackend(BackendBase):
 
             context = get_context()
             num_tokens = q_shape[0]
+            # 单 token eager：位置主机已知，直接取预展开表的行视图（省掉一次
+            # gather + 两次 buffer 拷贝）；图模式必须让设备 positions 决定位号，
+            # 不能把某个主机位置烧进图，故只在非图、非捕获时启用。
+            host_position = None
+            if (not context.use_cuda_graph and not _is_capturing()
+                    and num_tokens == 1):
+                host_positions = getattr(context, "host_positions", None)
+                if host_positions is not None and len(host_positions) == 1:
+                    host_position = int(host_positions[0])
             forward_key = (
                 cache.data_ptr(), positions.data_ptr(), num_tokens,
-                rotary_dim, str(q.device), q.dtype,
+                rotary_dim, str(q.device), q.dtype, host_position,
             )
             if context.rope_cache_key != forward_key:
-                cos_sin = cache.index_select(0, positions)
-                cos_half, sin_half = cos_sin.chunk(2, dim=-1)
-                cos = torch.cat((cos_half, cos_half), dim=-1)
-                sin = torch.cat((sin_half, sin_half), dim=-1)
-                buffer_key = (
-                    cache.data_ptr(), num_tokens, rotary_dim,
-                    str(q.device), q.dtype,
-                )
-                if _is_capturing() or context.use_cuda_graph:
-                    self._rope_apply_pinned.add(buffer_key)
-                buffers = _lru_get(self._rope_apply_cache, buffer_key)
-                if buffers is None:
-                    buffers = (
-                        torch.empty(
-                            (1, num_tokens, 1, rotary_dim),
-                            dtype=q.dtype, device=q.device,
-                        ),
-                        torch.empty(
-                            (1, num_tokens, 1, rotary_dim),
-                            dtype=q.dtype, device=q.device,
-                        ),
+                cos_table, sin_table = self._prepare_rope_tables(cache)
+                if host_position is not None and host_position < cos_table.shape[0]:
+                    context.rope_cos = cos_table[
+                        host_position:host_position + 1
+                    ].view(1, num_tokens, 1, rotary_dim)
+                    context.rope_sin = sin_table[
+                        host_position:host_position + 1
+                    ].view(1, num_tokens, 1, rotary_dim)
+                    context.rope_cache_key = forward_key
+                else:
+                    cos = cos_table.index_select(0, positions)
+                    sin = sin_table.index_select(0, positions)
+                    buffer_key = (
+                        cache.data_ptr(), num_tokens, rotary_dim,
+                        str(q.device), q.dtype,
                     )
-                    _lru_put(self._rope_apply_cache, buffer_key, buffers,
-                             _ROPE_BUFFER_CACHE_BYTES,
-                             pinned=self._rope_apply_pinned)
-                context.rope_cos, context.rope_sin = buffers
-                context.rope_cos.copy_(cos.contiguous().view_as(context.rope_cos))
-                context.rope_sin.copy_(sin.contiguous().view_as(context.rope_sin))
-                context.rope_cache_key = forward_key
+                    if _is_capturing() or context.use_cuda_graph:
+                        self._rope_apply_pinned.add(buffer_key)
+                    buffers = _lru_get(self._rope_apply_cache, buffer_key)
+                    if buffers is None:
+                        buffers = (
+                            torch.empty(
+                                (1, num_tokens, 1, rotary_dim),
+                                dtype=q.dtype, device=q.device,
+                            ),
+                            torch.empty(
+                                (1, num_tokens, 1, rotary_dim),
+                                dtype=q.dtype, device=q.device,
+                            ),
+                        )
+                        _lru_put(self._rope_apply_cache, buffer_key, buffers,
+                                 _ROPE_BUFFER_CACHE_BYTES,
+                                 pinned=self._rope_apply_pinned)
+                    context.rope_cos, context.rope_sin = buffers
+                    context.rope_cos.copy_(cos.contiguous().view_as(context.rope_cos))
+                    context.rope_sin.copy_(sin.contiguous().view_as(context.rope_sin))
+                    context.rope_cache_key = forward_key
             q4 = q.contiguous().view(1, num_tokens, -1, rotary_dim)
             k4 = k.contiguous().view(1, num_tokens, -1, rotary_dim)
             q4, k4 = apply_op(

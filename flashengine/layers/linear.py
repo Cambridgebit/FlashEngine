@@ -21,6 +21,9 @@ class LinearBase(nn.Module):
     ):
         super().__init__()
         self.backend = get_backend()
+        # 按层用途分派算子（310P selective decode GEMM）；默认 generic = 原行为。
+        # 具体角色由 backend.optimize_model_weights(decode_roles=True) 按模块名后缀写入。
+        self.linear_role = "generic"
         self.tp_dim = tp_dim
         self.tp_rank = dist.get_rank()
         self.tp_size = dist.get_world_size()
@@ -50,7 +53,7 @@ class ReplicatedLinear(LinearBase):
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.backend.linear(x, self.weight, self.bias)
+        return self.backend.linear_for_role(x, self.weight, self.bias, self.linear_role)
 
 
 class ColumnParallelLinear(LinearBase):
@@ -72,7 +75,7 @@ class ColumnParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.backend.linear(x, self.weight, self.bias)
+        return self.backend.linear_for_role(x, self.weight, self.bias, self.linear_role)
 
 
 class MergedColumnParallelLinear(ColumnParallelLinear):
@@ -152,7 +155,8 @@ class RowParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.backend.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
+        y = self.backend.linear_for_role(
+            x, self.weight, self.bias if self.tp_rank == 0 else None, self.linear_role)
         if self.tp_size > 1:
             self.backend.all_reduce(y)
         return y

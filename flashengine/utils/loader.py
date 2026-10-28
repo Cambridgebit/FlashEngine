@@ -7,16 +7,43 @@ from torch import nn
 from safetensors import safe_open
 from tqdm import tqdm
 
+# fp16_only 模式的加载期浮点校验开关。默认关闭：主项目要保留 W8A8 int8 权重与
+# Quark 加载期反量化，默认路径上逐张量校验会直接打断它们。
+_REQUIRE_FLOAT_WEIGHTS = False
+
+
+def set_require_float_weights(enabled: bool) -> None:
+    """fp16_only 模式打开加载期浮点校验；默认关闭，避免影响 W8A8/int8 反量化。"""
+    global _REQUIRE_FLOAT_WEIGHTS
+    _REQUIRE_FLOAT_WEIGHTS = bool(enabled)
+
 
 def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
     param.data.copy_(loaded_weight)
+
+
+def require_float_weight(tensor: torch.Tensor) -> None:
+    """fp16_only 加载期守卫：参与计算的权重必须来自浮点检查点。
+
+    由模块级开关 `_REQUIRE_FLOAT_WEIGHTS` 控制（`Config.fp16_only` 为真时经
+    `set_require_float_weights(True)` 打开），默认关闭，因此不会阻断 W8A8 int8
+    权重与 Quark `dequantize_int8_weight` 反量化路径；反量化后的权重本身已是
+    浮点，即使开关打开也能通过。
+    """
+    if not tensor.is_floating_point():
+        raise ValueError(
+            f"fp16_only 拒绝整数或量化计算权重：dtype={tensor.dtype}"
+        )
 
 
 def iter_safetensors(path: str):
     for file in sorted(glob(os.path.join(path, "*.safetensors"))):
         with safe_open(file, "pt", "cpu") as f:
             for name in f.keys():
-                yield name, f.get_tensor(name)
+                tensor = f.get_tensor(name)
+                if _REQUIRE_FLOAT_WEIGHTS:
+                    require_float_weight(tensor)
+                yield name, tensor
 
 
 def safetensors_total_bytes(path: str, skip=None) -> int | None:
@@ -134,6 +161,10 @@ def load_model(model: nn.Module, path: str, weights=None):
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     source = weights if weights is not None else iter_safetensors(path)
     for weight_name, tensor in source:
+        # 自定义 weights 源（iter_with_progress / 模型自带加载器）也过一遍守卫；
+        # 默认关闭，故 W8A8 int8 与 Quark 反量化路径不受影响。
+        if _REQUIRE_FLOAT_WEIGHTS:
+            require_float_weight(tensor)
         for k in packed_modules_mapping:
             if k in weight_name:
                 v, shard_id = packed_modules_mapping[k]

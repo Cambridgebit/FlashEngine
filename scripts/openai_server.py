@@ -1,6 +1,9 @@
 import argparse
 import json
+import math
+import os
 import pathlib
+import signal
 import sys
 import threading
 import time
@@ -10,6 +13,7 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from flashengine.engine.observer import EngineObserver
+from flashengine.version import SERVICE_NAME, VERSION
 
 
 
@@ -19,6 +23,8 @@ _eos = None
 _model_name = "flashengine"
 _api_key = None
 _default_temperature = 0.0
+_default_top_p = 1.0
+_default_top_k = 0
 _max_model_len = 4096
 _default_thinking = None
 _default_reserve = 512
@@ -29,6 +35,7 @@ _ui_html_failed = False
 _raw_log_path = None                 # --raw-log：模型原始输出 JSONL 落盘路径
 _raw_log_fh = None
 _raw_log_lock = threading.Lock()
+_engine_failure = None               # 引擎线程的致命异常：就绪端点据此报告 NOT_READY
 
 
 def _webui_html():
@@ -312,6 +319,11 @@ def _prometheus_metrics():
     ).encode("ascii")
 
 
+def _is_ready():
+    """就绪 = 引擎已构造 + 未进入停机 + 引擎线程未记录致命异常。"""
+    return engine is not None and not _shutdown.is_set() and _engine_failure is None
+
+
 def _engine_info():
     global _engine_info_cache
     if _engine_info_cache is not None:
@@ -342,6 +354,8 @@ def _engine_info():
         "dtype": core["dtype"],
         "tensor_parallel_size": cfg.tensor_parallel_size,
         "default_temperature": _default_temperature,
+        "default_top_p": _default_top_p,
+        "default_top_k": _default_top_k,
         "default_thinking": "off" if _default_thinking is False else "template",
         "reserve_output": _default_reserve,
         "execution_path": _execution_path(_default_temperature),
@@ -588,6 +602,7 @@ def _has_repetition_loop(tokens):
     return False
 
 def _engine_loop():
+    global _engine_failure
     while not _shutdown.is_set():
         with engine_lock:
             if _active and not engine.is_finished():
@@ -597,6 +612,9 @@ def _engine_loop():
                     step_elapsed = time.perf_counter() - step_t0
                     _record_engine_step(num_tokens, step_elapsed)
                 except Exception as exc:    # 引擎异常：让所有存活请求报错退出
+                    # 记录致命异常：/ready 与 /healthy 据此返回 503，托管脚本不会
+                    # 把「HTTP 端口还在、引擎已死」的服务当成就绪。
+                    _engine_failure = str(exc)
                     with _gen_lock:
                         _metrics_total["request_errors"] += len(_active)
                     for st in list(_active.values()):
@@ -992,8 +1010,29 @@ class Handler(BaseHTTPRequestHandler):
         self._http_begin()
         try:
             path = urlsplit(self.path).path
+            # 健康/就绪探针不鉴权：托管脚本与编排系统要先能问「能不能接流量」，
+            # 而且它们不返回任何请求数据。其余 /v1/* 仍按 --api-key 校验。
+            if path in ("/healthy", "/healthz"):
+                ready = _is_ready()
+                self._bytes(b"OK" if ready else b"NOT_READY", "text/plain",
+                            200 if ready else 503)
+                return
+            if path in ("/ready", "/readyz"):
+                ready = _is_ready()
+                self._json({"status": "ok" if ready else "not_ready", "pid": os.getpid(),
+                            "service": SERVICE_NAME, "version": VERSION},
+                           200 if ready else 503)
+                return
             if path.startswith("/v1/") and not self._check_auth():
                 self._error("invalid api key", 401)
+                return
+            if path == "/v1/runtime":
+                if engine is None:
+                    self._error("engine is not ready", 503)
+                    return
+                with engine_lock:
+                    snapshot = engine.runtime_snapshot()
+                self._json(snapshot)
                 return
             if _ui_enabled and path in ("/", "/index.html", "/ui", "/webui"):
                 body = _webui_html()
@@ -1075,13 +1114,19 @@ class Handler(BaseHTTPRequestHandler):
             temperature = body.get("temperature")
             if temperature is None:
                 temperature = _default_temperature
-            temperature = max(float(temperature), 0.0)    # 0 = greedy
+            temperature = float(temperature)
+            if not math.isfinite(temperature):
+                raise ValueError("temperature 不允许 NaN 或无穷大")
+            temperature = max(temperature, 0.0)    # 0 = greedy
             top_p = body.get("top_p")
             if top_p is None:
-                top_p = 1.0
-            top_p = min(max(float(top_p), 1e-6), 1.0)
+                top_p = _default_top_p
+            top_p = float(top_p)
+            if not math.isfinite(top_p):
+                raise ValueError("top_p 不允许 NaN 或无穷大")
+            top_p = min(max(top_p, 1e-6), 1.0)
             top_k = body.get("top_k")
-            top_k = max(int(top_k), 0) if top_k is not None else 0
+            top_k = max(int(top_k), 0) if top_k is not None else _default_top_k
         except (TypeError, ValueError) as exc:
             self._error(f"invalid sampling parameters: {exc}", 400)
             return
@@ -1256,18 +1301,28 @@ class _ServerObserver(EngineObserver):
                 _metrics_total["spec_accepted_tokens"] += max(n - 1, 0)
 
 
-def main():
-    global engine, _tokenizer, _eos, _model_name, _api_key
-    global SamplingParams, Sequence, SequenceStatus
-    global _default_temperature
-    global _max_model_len, _default_thinking, _default_reserve
-    global TPS_INTERVAL, _ui_html_path
+def _terminate_gracefully(signum, frame):
+    """把托管服务的 SIGTERM 转成可清理退出：走 KeyboardInterrupt 的 finally 路径释放引擎。
 
+    直接 os._exit 会漏掉 NPU 上下文释放与子 rank 回收，长跑板上会留下占卡进程。
+    """
+    raise KeyboardInterrupt
+
+
+def _build_parser():
+    """HTTP 服务的命令行定义。
+
+    独立成函数是为了让 host 侧契约测试能在没有 torch 的环境里校验参数面
+    （``RuntimeSettings.server_arguments`` 生成的参数必须始终被这个 parser 接受）。
+    """
     parser = argparse.ArgumentParser(description="FlashEngine OpenAI-compatible server (TP=1)")
     parser.add_argument("model")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--api-key", default=None)
+    parser.add_argument("--api-key-env", default="FLASHENGINE_API_KEY",
+                        help="从该环境变量读取 API key（优先于 --api-key 之外的空值），"
+                             "避免密钥出现在命令行与进程表里")
     parser.add_argument("--eager", action="store_true")
     parser.add_argument("--dtype", choices=("float16", "bfloat16"), help="固定实际模型及 Graph planner 类型")
     parser.add_argument("--backend", default="auto", choices=["auto", "cuda", "corex", "ascend310p"])
@@ -1279,11 +1334,24 @@ def main():
     parser.add_argument("--block-size", type=int, default=None)
     parser.add_argument("--kv-blocks", type=int, default=None, help="固定可分配 KV 页数，默认按显存预算计算")
     parser.add_argument("--no-prefix-cache", action="store_true", help="关闭前缀 KV 与状态复用")
+    parser.add_argument("--prefix-cache", action="store_true", default=None,
+                        help="显式开启前缀复用（默认开启；与 --no-prefix-cache 互斥）")
+    parser.add_argument("--decode-linear-backend", choices=("selective", "functional"),
+                        default=None,
+                        help="单 token FP16 Linear 的候选与对照开关（仅 ascend310p 生效；"
+                             "不指定则沿用 LITEQ_DECODE_LINEAR_BACKEND 或后端默认 functional）")
+    parser.add_argument("--greedy-backend", choices=("npu", "cpu"), default=None,
+                        help="greedy 归约位置（仅 ascend310p 生效；不指定则沿用 "
+                             "LITEQ_GREEDY_BACKEND 或后端默认 npu）")
+    parser.add_argument("--fp16-only", action="store_true",
+                        help="FP16 专用守卫：拒绝量化检查点并把计算参数固定为 FP16")
     parser.add_argument("--recurrent-prefix-cache-mb", type=int, default=256,
                         help="recurrent 前缀状态的主机内存上限，默认 256 MiB；0 关闭")
     parser.add_argument("--spec-model", default="")
     parser.add_argument("--spec-num-tokens", type=int, default=3)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-p", type=float, default=1.0, help="默认 top-p，请求体可覆盖")
+    parser.add_argument("--top-k", type=int, default=0, help="默认 top-k，请求体可覆盖；0 关闭")
     parser.add_argument("--no-think", action="store_true")
     parser.add_argument("--reserve-output", type=int, default=512)
     parser.add_argument("--gpu-mem-util", type=float, default=0.9)
@@ -1297,9 +1365,32 @@ def main():
         "--webui", default=None, metavar="HTML",
         help="Web 控制台 HTML 文件路径（默认 scripts/webui.html；"
              "内置可选 scripts/webui-aero.html）")
-    from scripts.memory_options import add_memory_arguments, memory_kwargs
+    from scripts.memory_options import add_memory_arguments
     add_memory_arguments(parser)
-    args = parser.parse_args()
+    return parser
+
+
+def main(argv=None):
+    global engine, _tokenizer, _eos, _model_name, _api_key
+    global SamplingParams, Sequence, SequenceStatus
+    global _default_temperature, _default_top_p, _default_top_k
+    global _max_model_len, _default_thinking, _default_reserve
+    global TPS_INTERVAL, _ui_html_path, _engine_failure
+
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+
+    if args.prefix_cache and args.no_prefix_cache:
+        parser.error("--prefix-cache 与 --no-prefix-cache 不能同时使用")
+    enable_prefix_cache = True if args.prefix_cache else not args.no_prefix_cache
+    # 310P 算子选择开关必须在后端导入/初始化之前进环境变量。只有显式传参才写：
+    # 未传时保留用户导出的 LITEQ_* （后端据此决定，默认 functional/npu）。
+    if args.decode_linear_backend is not None:
+        os.environ["LITEQ_DECODE_LINEAR_BACKEND"] = args.decode_linear_backend
+    if args.greedy_backend is not None:
+        os.environ["LITEQ_GREEDY_BACKEND"] = args.greedy_backend
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, _terminate_gracefully)
 
     # 先给一行反馈：torch/torch_npu 导入在板卡上需 ~20s，期间没有任何输出。
     print("[FlashEngine] Importing runtime (torch / torch_npu / transformers, "
@@ -1309,8 +1400,11 @@ def main():
     from flashengine.engine.sequence import Sequence, SequenceStatus
 
     global _ui_enabled
-    _api_key = args.api_key
+    # API key 优先取显式参数，其次取环境变量：托管服务不把密钥写进 argv/状态文件。
+    _api_key = args.api_key or (os.getenv(args.api_key_env) if args.api_key_env else None) or None
     _default_temperature = args.temperature
+    _default_top_p = args.top_p
+    _default_top_k = args.top_k
     _default_thinking = False if args.no_think else None
     _default_reserve = max(1, args.reserve_output)
     TPS_INTERVAL = max(0.0, args.stats_interval)
@@ -1331,8 +1425,9 @@ def main():
         spec_model=args.spec_model,
         spec_num_tokens=args.spec_num_tokens,
         gpu_memory_utilization=args.gpu_mem_util,
-        enable_prefix_cache=not args.no_prefix_cache,
+        enable_prefix_cache=enable_prefix_cache,
         recurrent_prefix_cache_bytes=args.recurrent_prefix_cache_mb * 1024 * 1024,
+        fp16_only=args.fp16_only,
     )
     if args.max_num_seqs is not None:
         kwargs["max_num_seqs"] = args.max_num_seqs
@@ -1342,6 +1437,8 @@ def main():
         kwargs["kvcache_block_size"] = args.block_size
     if args.kv_blocks is not None:
         kwargs["num_kvcache_blocks"] = args.kv_blocks
+
+    from scripts.memory_options import memory_kwargs
 
     kwargs.update(memory_kwargs(args))
     engine = LLM(**kwargs)
@@ -1373,7 +1470,8 @@ def main():
         _log("INFO", "Web console disabled (--no-ui); /metrics still available.")
     _log(
         "INFO",
-        f"Request defaults: temperature={_default_temperature:g}, thinking="
+        f"Request defaults: temperature={_default_temperature:g}, "
+        f"top_p={_default_top_p:g}, top_k={_default_top_k}, thinking="
         f"{'off' if _default_thinking is False else 'on(template default)'}, "
         f"reserve_output={_default_reserve}tok, max_num_seqs="
         f"{engine.config.max_num_seqs}, chunked_prefill="

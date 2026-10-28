@@ -73,3 +73,51 @@
    `--max-num-seqs 1` 串行可用（本表口径满足）。
 4. **Qwen3.5 的 TTFT（770-935ms）** 是 GDN prefill 的算子路径成本，不是配置问题。
 5. 常态复测建议用当日上午的 30B 值（22.2/26.4）作对照；本表其余组当天均为稳定样本。
+
+## 合并后回归验证（2026-10-28，板卡 192.168.16.118 / 容器 vllm018）
+
+把 FP16 统一版（`nano_flashengine_fp16_1_0`）功能并入本仓后，按上表同口径复测 Qwen3-8B，
+确认既有能力未退化。代码 = 本地合并工作区（HEAD `ea3543f` + 本轮新增模块）；
+环境与上表一致（310P / CANN 9.0.T3 / torch_npu 2.9.0.post2-dev / t5 venv）。
+日志：板卡 `/data2/logs/{bench_base_8b,bench_spec_8b,bench_eager_8b,switch_matrix2,batch_prefix,server_test,service_mgr}.log`。
+
+| 项 | 本轮实测 | 上表/锚点 | 判定 |
+|---|---:|---:|---|
+| Qwen3-8B decode（图） | 10.7–11.0 | 10.9 | 一致 |
+| Qwen3-8B + DFlash(k15) | 38.3 / **E=4.878** | 37.6 / E=4.878 | E 逐位相同，TPS +1.9% |
+| Qwen3-8B decode（`--eager`） | 7.4 | — | 图相对 eager **1.46×** |
+| 批量聚合 bs=1/4/8（agg） | 10.7 / 41.3 / 80.8 | — | 线性扩展正常 |
+| Qwen3-8B-W8A8 decode | 15.4 | 15.4 / 15.5 | 一致（头号特性 W8A8 长跑修复未回退） |
+
+**新增开关矩阵**（Qwen3-8B decode，图路径，`LITEQ_DECODE_LINEAR_BACKEND` × `LITEQ_GREEDY_BACKEND`）：
+四档 `functional|selective` × `npu|cpu` 分别 **11.0 / 10.8 / 10.6 / 10.5** tok/s，
+`captures_ok=1, fallback=0, replay_rate=100%` —— 即 selective LINEAR 与 CPU 端 greedy 归约
+都能正常进图，且图数值守卫（`FLASHENGINE_GRAPH_NUMERIC_GUARD` 默认开）未把任何桶判失效。
+差异 ≤4.5%，属开关自身开销与噪声，无功能退化。
+
+**其余链路**（同一代码、同一容器）：
+
+- 精度守卫：`require_unquantized_checkpoint` 对 `/data/Qwen3-8B-W8A8` 与
+  `/data/Qwen3-Coder-30B-A3B-Instruct-w8a8` 正确拒绝（识别依据 `quant_model_description.json`），
+  对 `/data/Qwen3-8B`、`/data/Qwen3-8B-Dflash` 放行。
+- HTTP：`/healthy`、`/ready`（`{status,pid,service,version}`）、`/v1/runtime`（含新增
+  `precision` / `linear_validation` 段）、`/v1/stats`、`/metrics`、`/v1/chat/completions` 全 200；
+  旧别名 `/runtime` 正确 404。投机服务端 `graph_mode=spec_graph`、`spec.method=dflash`、
+  `spec.num_tokens=15`，单请求 `path=spec_graph` E=2.32 / 19.1 tok/s（80 token 短答，含 prefill）。
+- 服务托管：`start` → `FRAMEWORK_SERVICE_READY` → `status running=true ready=true` →
+  `stop` → `FRAMEWORK_SERVICE_STOPPED` → `status running=false`，全链路 0 退出。
+  注意 `stop` 只管理 `start` 自己登记的进程（精确核对 argv/cwd/start_ticks），
+  手工用别的包装脚本起 `serve` 后 `stop` 报 `FRAMEWORK_SERVICE_NOT_RUNNING` 属预期，
+  需自行终止。
+- Prefix cache：`--num-repeats 2` 的 ON/OFF 均正常（TTFT cold 177/181 ms）；
+  本题集 prompt 仅 ~48 token < block_size 128，不命中属预期。
+
+**判读提醒**：`configs/*.json` 里的 `model` 是占位路径 `/models/qwen3-8b`，板卡实际模型在
+`/data`，**必须用 `--model /data/Qwen3-8B` 覆盖**（`config` 子命令只回显不校验路径）。
+
+**同步方式与完整性**：板卡仓库（`/data2/FlashEngine`）的 `main` 与本机 `main` 是两条独立提交
+谱系（板卡 HEAD `ce94022`「Qwen3.5 及 DFlash 前缀缓存」，无本地 `ea3543f` 对象），但两条谱系
+的**工作区文件内容逐字节等价**——15 个被覆盖文件 `diff -w` 全为 0 行，差异纯粹是 CRLF/LF
+换行（板卡文件由 Windows `docker cp` 带入，带 CRLF）。本次同步把 CRLF 归一为 LF，
+板卡 `git status` 因此显示 66 项改动（原 51 项 + 新增模块/文档），**无内容丢失**。
+同步前完整备份：板卡 `/data2/fe_board_backup_0119_0410.tar.gz`。

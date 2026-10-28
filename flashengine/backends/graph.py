@@ -30,7 +30,12 @@ class DecodeGraphExecutor:
         raise NotImplementedError
 
     def snapshot(self) -> dict:
-        raise NotImplementedError
+        """图执行统计快照（replay/fallback/bucket_hits/captured 等）。
+
+        默认返回空字典：未实现统计的执行器不会让运行快照接口报错，调用方按
+        「缺键即未采集」处理即可。
+        """
+        return {}
 
     def reset(self) -> None:
         raise NotImplementedError

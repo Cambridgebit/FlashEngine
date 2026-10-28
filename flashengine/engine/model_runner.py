@@ -175,6 +175,13 @@ class ModelRunner:
         self.device = f"{self.backend.device_name}:{config.device_ids[rank]}"
         self.dtype = self.backend.default_dtype or config.model_config.dtype
         self.spec_enabled = bool(config.spec_model)
+        # 主机侧线程数只由显式 env 决定：未设置时保持主项目原有线程行为不变。
+        _cpu_threads = os.environ.get("LITEQ_CPU_THREADS")
+        if _cpu_threads is not None:
+            cpu_threads = int(_cpu_threads)
+            if cpu_threads < 1:
+                raise ValueError("LITEQ_CPU_THREADS 必须是正整数")
+            torch.set_num_threads(cpu_threads)
         self.spec_runtime = None
         if self.spec_enabled and not self.backend.supports_spec:
             raise RuntimeError(
@@ -262,7 +269,9 @@ class ModelRunner:
                 self._df_ctx_free = set(range(config.max_num_seqs))
                 self._df_prefix_restored: set[int] = set()
                 self.spec_ctx_pending: dict[int, torch.Tensor | None] = {}
-        weight_nz_count = self.backend.optimize_model_weights(self.model)
+        # decode_roles=True 让后端按模块用途给 LinearBase 打标（供 selective 线性算子），
+        # 默认后端忽略该形参，行为与主项目现状一致。
+        weight_nz_count = self.backend.optimize_model_weights(self.model, decode_roles=True)
         if self.config.is_moe:
             # MoE 专家权重不走 LinearBase 路径（stacked [E,...] 参数），单独后处理。
             weight_nz_count += self.backend.optimize_moe_weights(self.model)
@@ -274,6 +283,7 @@ class ModelRunner:
                 )
         self.startup_stats["weight_layout_conversions"] = float(weight_nz_count)
         self.startup_stats["model_load_s"] = time.perf_counter() - model_load_t0
+        self.precision_audit = self._audit_precision(config)
         self.sampler = Sampler(device_rng=self.backend.supports_device_sampling_rng)
         warmup_t0 = time.perf_counter()
         self.warmup_model()
@@ -319,6 +329,9 @@ class ModelRunner:
                 if name in self._sg:
                     self._sg[name].fill_(self._graph_pad_slot())
         self._record_memory("kv_cache")
+        # 图捕获前的算子数值守卫：后端用保留的 dummy 块跑单行 decode 对比候选算子，
+        # 未启用候选算子的后端返回 {"checked": False}，与主项目现状一致。
+        self.linear_validation = self.backend.validate_model_decode(self.model, config)
         self.spec_graphs = None
         self.spec_greedy_graphs = {}
         self._spec_capture_greedy = False
@@ -417,6 +430,20 @@ class ModelRunner:
                 self.shm = SharedMemory(name=config.shm_name)
                 self.loop()
 
+    def _graph_runner_available(self) -> bool:
+        """图执行器是否真的能出图。
+
+        全桶失效时不再误报在用图；未实现可用性判定的执行器按「交出即在用」
+        处理，保持主项目原有判定不变。
+        """
+        runner = self.graph_runner
+        if runner is None:
+            return False
+        try:
+            return bool(runner.is_available())
+        except NotImplementedError:
+            return True
+
     def graph_mode(self) -> str:
         if self.enforce_eager:
             return "eager"
@@ -424,7 +451,7 @@ class ModelRunner:
             if self.spec_graphs:
                 return "spec_graph"
             return "eager_fallback" if self.graph_capture_attempted else "eager"
-        if self.graph_runner is not None or self.graphs is not None:
+        if self._graph_runner_available() or self.graphs is not None:
             return "decode_graph"
         return "eager_fallback" if self.graph_capture_attempted else "eager"
 
@@ -448,17 +475,35 @@ class ModelRunner:
             for key in self.state_runtime.prefix_stats:
                 self.state_runtime.prefix_stats[key] = 0
 
+    def _audit_precision(self, config) -> dict:
+        """精度审计：fp16_only 为真时严格审计，否则只记录不改变行为的默认值。
+
+        主项目支持 bf16/fp32 与 W8A8/Quark 反量化，默认不能按「必须全 FP16」审计，
+        故未开启 fp16_only 时只填 runtime_dtype/quantization 供运行快照读取。
+        """
+        if getattr(config, "fp16_only", False):
+            from flashengine.validation import audit_fp16_parameters
+            models = [self.model] + ([self.draft_model] if self.spec_enabled else [])
+            return dict(audit_fp16_parameters(*models))
+        return {
+            "checked": False,
+            "runtime_dtype": str(self.dtype),
+            "quantization": getattr(config, "quant_method", "") or "none",
+        }
+
     def runtime_snapshot(self) -> dict:
         source = (self.spec_graph_stats if self.spec_enabled else
                   self.graph_runner.snapshot() if self.graph_runner is not None else
                   self.decode_graph_stats)
         graph = dict(source)
-        graph["bucket_hits"] = dict(graph["bucket_hits"])
+        graph["bucket_hits"] = dict(graph.get("bucket_hits", {}))
         spec = dict(self.spec_accept_stats)
         spec["positions"] = list(spec["positions"])
         return {
             "recurrent": self.state_runtime.snapshot() if self.state_runtime else None,
             "mode": self.graph_mode(),
+            "precision": dict(self.precision_audit),
+            "linear_validation": dict(self.linear_validation),
             "graph": graph,
             "prefill": dict(self.prefill_cache_stats),
             "spec": {
@@ -489,7 +534,7 @@ class ModelRunner:
             if self.graph_sample or temperature <= 1e-10:
                 return "spec_graph"
             return "eager_spec(sampling)"
-        return "decode_graph" if self.graph_runner is not None or self.graphs else "eager"
+        return "decode_graph" if self._graph_runner_available() or self.graphs else "eager"
 
     def prefix_cache_validator(self):
         return self.spec_runtime.prefix_cache_validator() if self.spec_runtime else None
@@ -955,7 +1000,11 @@ class ModelRunner:
                     cu_seqlens_q=cu_seqlens_q,
                     cu_seqlens_k=cu_seqlens_k,
                     max_context_len=self.config.max_model_len,
-                    block_size=self.block_size)
+                    block_size=self.block_size,
+                    # 主机已知的本步位置：eager 单 token RoPE 直接取主机表视图，
+                    # 不必为取一行位置再发一次设备 gather。图路径不传（图内按设备
+                    # positions 动态取表，避免把主机位置固化进图）。
+                    host_positions=tuple(len(seq) - 1 for seq in seqs))
         if self.state_runtime:
             self.state_runtime.bind_decode(get_context(), n)
         return input_ids, positions
@@ -1029,14 +1078,17 @@ class ModelRunner:
                     if sampled:
                         token_ids = result.tolist()
                     else:
-                        sample = self.prepare_sample(seqs, False)
-                        token_ids = self._sample(result, seqs, sample).tolist()
+                        # greedy 批不必准备采样参数，采样入口内部直接走后端 argmax。
+                        token_ids = self._sample_logits(result, seqs)
                 else:
                     token_ids = None
                 reset_context()
                 return token_ids
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        sample = self.prepare_sample(seqs, is_prefill) if self.rank == 0 else None
+        # 纯 greedy 批无需采样参数（图内采样仍需要，故 graph_sample 保留准备）。
+        needs_sample = self.graph_sample or any(seq.temperature > 1e-10 for seq in seqs)
+        sample = (self.prepare_sample(seqs, is_prefill)
+                  if self.rank == 0 and needs_sample else None)
         result, sampled = self.run_model(input_ids, positions, is_prefill)
         if is_prefill:
             if self.state_runtime:
@@ -1044,19 +1096,23 @@ class ModelRunner:
             self._record_prefill_cache_state(seqs)
         if self.rank == 0:
             token_ids = (result.tolist() if sampled
-                         else self._sample(result, seqs, sample).tolist())
+                         else self._sample_logits(result, seqs, is_prefill, sample))
         else:
             token_ids = None
         reset_context()
         return token_ids
 
-    def _sample(self, logits, seqs, prepared=None):
-        """由 host 请求参数决定纯 greedy；混合/随机请求保留完整采样语义。"""
+    def _sample_logits(self, logits, seqs, is_prefill: bool = False, prepared=None):
+        """统一采样入口：整批 greedy 直接走后端 argmax 读回。
+
+        greedy 快路径不排序、不生成随机数、也不准备采样参数；只有需要随机采样时
+        才准备参数。图内采样仍由图本身产出 token_id，不经过这里。
+        """
         if all(seq.temperature <= 1e-10 for seq in seqs):
-            return logits.argmax(dim=-1)
-        if prepared is None:
-            prepared = self.prepare_sample(seqs)
-        return self.sampler(logits, *prepared)
+            return self.backend.greedy_tokens(logits)
+        sample = (prepared if prepared is not None
+                  else self.prepare_sample(seqs, is_prefill))
+        return self.sampler(logits, *sample).tolist()
 
     @torch.inference_mode()
     def run_prefill_spec(self, seqs: list[Sequence]) -> list[int]:
@@ -1068,8 +1124,7 @@ class ModelRunner:
         input_ids, positions = self.prepare_prefill(seqs)
         hidden, aux = self.model(input_ids, positions)
         logits = self.model.compute_logits(hidden)
-        sample = self.prepare_sample(seqs)
-        token_ids = self._sample(logits, seqs, sample).tolist()
+        token_ids = self._sample_logits(logits, seqs, True)
         offsets = list(accumulate([0] + [seq.num_scheduled_tokens for seq in seqs]))
         seed = self.draft_model.project_aux(aux)
         shifted = []
@@ -1122,7 +1177,7 @@ class ModelRunner:
         ids, positions = self.prepare_decode(seqs)
         hidden, _ = self.model(ids, positions)
         logits = self.model.compute_logits(hidden)
-        tokens = self._sample(logits, seqs).tolist()
+        tokens = self._sample_logits(logits, seqs)
         result = [[token] for token in tokens]
         self._record_spec_acceptance(result)
         self.spec_graph_stats["eager_rounds"] += 1
@@ -1367,7 +1422,7 @@ class ModelRunner:
         if self.state_runtime:
             self.state_runtime.finish_prefill()
         logits = self.model.compute_logits(hidden)
-        token_ids = self._sample(logits, seqs).tolist()
+        token_ids = self._sample_logits(logits, seqs, True)
         self._record_prefill_cache_state(seqs)
         reset_context()
         offsets = list(accumulate([0] + [seq.num_scheduled_tokens for seq in seqs]))
@@ -1758,6 +1813,8 @@ class ModelRunner:
         )
 
     def _sg_sample(self, logits, temps, topps, topks, use_cuda_graph: bool):
+        # 图内分支保留主项目的 greedy 图变体标记（_spec_capture_greedy）；
+        # 图外分支用整批 greedy 判定（与 _spec_batch_greedy 同值）。
         if ((use_cuda_graph and (self._spec_capture_greedy or not self.graph_sample))
                 or (not use_cuda_graph and self._spec_batch_greedy)):
             return logits.argmax(dim=-1)

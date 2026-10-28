@@ -206,3 +206,9 @@ cython_debug/
 # FlashInfer 实机回归工件
 /bench_results/flashinfer-check/
 /bench_results/qwen35-check/
+/release
+
+# 统一入口（python -m flashengine）的服务状态目录
+/runtime/
+/.cc-safety-net
+/.merge_tmp

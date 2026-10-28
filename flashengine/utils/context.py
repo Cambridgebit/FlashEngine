@@ -19,6 +19,10 @@ class Context:
     rope_cos: torch.Tensor | None = None
     rope_sin: torch.Tensor | None = None
     host_seq_lens_q: torch.Tensor | None = None
+    # decode 单步的主机侧位置（每序列的最后一个 token 位置）。310P 的 rope 单 token
+    # eager 路径用它直接取主机已知位置的 cos/sin 表视图，避免设备读回；
+    # 图模式仍由每桶的 positions 设备张量 gather（见 backends/ascend310p/graph.py）。
+    host_positions: tuple[int, ...] | None = None
     # qlens/mask、展开后的 per-query PA 表）。这些量只由 set_context 传入的
     attn_scratch: dict | None = None
     prefill_cache_hit: bool = False
@@ -57,6 +61,7 @@ def set_context(
     use_cuda_graph=False,
     block_size=0,
     host_seq_lens_q=None,
+    host_positions=None,
     prefill_cache_hit=False,
     prefix_cache_hit_blocks=0,
     prefill_query_tokens=0,
@@ -77,6 +82,7 @@ def set_context(
         use_cuda_graph=use_cuda_graph,
         block_size=block_size,
         host_seq_lens_q=host_seq_lens_q,
+        host_positions=host_positions,
         prefill_cache_hit=prefill_cache_hit,
         prefix_cache_hit_blocks=prefix_cache_hit_blocks,
         prefill_query_tokens=prefill_query_tokens,

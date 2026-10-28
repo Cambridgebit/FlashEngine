@@ -315,6 +315,10 @@ class LLMEngine(EngineRequests):
     def execution_path(self, temperature: float) -> str:
         return self.model_runner.execution_path(temperature)
 
+    def synchronize(self):
+        """供压测边界使用，服务每步不额外同步。"""
+        self.model_runner.backend.synchronize()
+
     def generate(
         self,
         prompts: list[str] | list[list[int]],

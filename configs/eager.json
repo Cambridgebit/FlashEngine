@@ -1,0 +1,14 @@
+{
+  "model": "/models/qwen3-8b",
+  "backend": "ascend310p",
+  "precision": "float16",
+  "max_model_len": 4096,
+  "max_num_seqs": 1,
+  "max_num_batched_tokens": 256,
+  "kvcache_block_size": 128,
+  "enforce_eager": true,
+  "enable_prefix_cache": false,
+  "decode_linear_backend": "functional",
+  "greedy_backend": "npu",
+  "port": 8010
+}

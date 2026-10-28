@@ -179,7 +179,10 @@ class Qwen3DecoderLayer(nn.Module):
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
-            max_position=config.max_position_embeddings,
+            # RoPE 表按实际窗口准备（Config 写入 _liteq_max_position_embeddings），
+            # 缺该属性时退回检查点原始 max_position_embeddings。
+            max_position=getattr(
+                config, "_liteq_max_position_embeddings", config.max_position_embeddings),
             rms_norm_eps=config.rms_norm_eps,
             qkv_bias=getattr(config, 'attention_bias', True),
             head_dim=getattr(config, 'head_dim', None),

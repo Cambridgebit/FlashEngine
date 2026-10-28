@@ -1,5 +1,6 @@
 
 from dataclasses import dataclass
+import os
 import traceback
 
 import torch
@@ -39,15 +40,20 @@ class DecodeGraphEntry:
     attn_captures: list | None = None
     enabled: bool = True
     capture_error: str | None = None
+    # 已用真实输入做过多少次图内外 logits 对比（每桶只查前两次，避免常驻开销）。
+    validated_steps: int = 0
 
 class NPUGraphDecodeRunner(DecodeGraphExecutor):
 
-    def __init__(self, plan: DecodeGraphPlan):
+    def __init__(self, plan: DecodeGraphPlan, capture_greedy: bool = True):
         self.model = plan.model
         self.state_runtime = plan.state_runtime
         self.config = plan.config
         self.device = plan.device
         self.block_size = plan.block_size
+        # greedy 归约在图外（LITEQ_GREEDY_BACKEND=cpu）时，图内 argmax 无人使用，
+        # 改为图内只出 logits，省一次图内归约。
+        self.capture_greedy = capture_greedy
         max_bs = plan.max_batch_size
         sizes = [x for x in ([1, 2, 4, 8] + list(range(16, max_bs + 1, 16))) if x <= max_bs]
         if not sizes or sizes[-1] != max_bs:
@@ -66,12 +72,25 @@ class NPUGraphDecodeRunner(DecodeGraphExecutor):
                 torch.empty(1, device=self.device)
         from flashengine.backends.ascend310p.aclgraph_attn import supports_pa_graph_update
         self._pa_update_ok = supports_pa_graph_update()
+        self._compare_logits_fn = None
+        self._compare_resolved = False
+        # 图内外复算对比要求「多跑一次前向没有副作用」。Qwen3.5/GDN 的解码会把
+        # conv/ssm 设备侧状态就地推进，多跑一次前向就多消费一个 token，故这类
+        # 模型只保留按桶回退，不做复算比对（行为与主项目一致）。
+        # 另外主项目文档记录过 310P 上图内外 ULP 差可致 argmax 翻转：数值门禁
+        # 可能把本来可用的桶判失效并静默回退 eager，故提供 `=0` 关闭口。
+        self._numeric_guard_enabled = os.environ.get(
+            "FLASHENGINE_GRAPH_NUMERIC_GUARD", "1") != "0"
+        self._numeric_guard_safe = plan.state_runtime is None and self._numeric_guard_enabled
         self.stats = {
             "capture_success": 0,
             "capture_failure": 0,
             "replay": 0,
             "fallback": 0,
             "bucket_hits": {},
+            # 图内外数值对比（捕获自检 + 每桶前两次真实输入）
+            "numeric_checks": 0,
+            "numeric_failures": 0,
         }
 
     @property
@@ -103,12 +122,53 @@ class NPUGraphDecodeRunner(DecodeGraphExecutor):
     def snapshot(self) -> dict:
         stats = dict(self.stats)
         stats["bucket_hits"] = dict(stats["bucket_hits"])
+        stats["captured_greedy"] = self.capture_greedy
+        # 复算守卫是否对当前模型启用（递归状态模型恒 False，见 _numeric_guard_safe）。
+        stats["numeric_guard"] = self._numeric_guard_safe
+        # 只有 enabled 且真的捕到图的桶才算「在用图」；失效桶靠 enabled=False
+        # + capture_error 表达，不再出现在 active_buckets 里被误报为在用。
+        stats["active_buckets"] = [
+            size for size, entry in self.entries.items()
+            if entry.enabled and entry.graph is not None
+        ]
         return stats
 
     def reset(self):
         self.stats["replay"] = 0
         self.stats["fallback"] = 0
         self.stats["bucket_hits"] = {}
+        self.stats["numeric_checks"] = 0
+        self.stats["numeric_failures"] = 0
+
+    def _resolve_compare_logits(self):
+        """惰性取 compare_logits；模块不可用时返回 None（守卫关闭=主项目原行为）。"""
+        if not self._compare_resolved:
+            self._compare_resolved = True
+            try:
+                from flashengine.validation import compare_logits
+                self._compare_logits_fn = compare_logits
+            except Exception as exc:  # noqa: BLE001 -- 守卫是可选增强，缺模块不影响出图
+                print(
+                    "[FlashEngine] 310P 图数值守卫不可用，跳过图内外 logits 对比："
+                    f"{exc}",
+                    flush=True,
+                )
+        return self._compare_logits_fn
+
+    def _compare_numeric(self, reference, candidate):
+        """对比两份 logits：通过返回 None，不通过返回失败描述（不抛）。
+
+        compare_logits 内部统一转 CPU float32 再比（310P 上避免设备侧 fp16
+        舍入差），失败会抛 RuntimeError，这里转成描述串交给调用方决定回退。
+        """
+        compare_logits = self._resolve_compare_logits()
+        if compare_logits is None:
+            return None
+        try:
+            compare_logits(reference, candidate)
+        except Exception as exc:  # noqa: BLE001 -- 由调用方决定回退策略
+            return f"{type(exc).__name__}: {exc}"
+        return None
 
     def _bind(self, entry: DecodeGraphEntry):
         set_context(
@@ -222,8 +282,12 @@ class NPUGraphDecodeRunner(DecodeGraphExecutor):
                 begin_attn_capture,
                 finish_attn_capture,
             )
-            for _ in range(self.warmup_iters):
-                self._forward(entry)
+            reference = None
+            for _ in range(max(1, self.warmup_iters)):
+                reference = self._forward(entry)
+            # 捕获前的 eager 结果留作自检基准（clone 出来，避免与图内输出缓冲同块）。
+            if reference is not None:
+                reference = reference.detach().clone()
             torch.npu.synchronize()
 
             graph = self._npu.NPUGraph()
@@ -236,7 +300,8 @@ class NPUGraphDecodeRunner(DecodeGraphExecutor):
             try:
                 with self._npu.graph(graph, **graph_kwargs):
                     logits = self._forward(entry)
-                    greedy_token_ids = logits.argmax(dim=-1)
+                    greedy_token_ids = (
+                        logits.argmax(dim=-1) if self.capture_greedy else None)
                 torch.npu.synchronize()
                 if self._pa_update_ok:
                     entry.attn_captures = finish_attn_capture()
@@ -246,6 +311,22 @@ class NPUGraphDecodeRunner(DecodeGraphExecutor):
                 if self._pa_update_ok:
                     finish_attn_capture()
                 raise
+
+            # 捕获后立即回放一次做自检：不再把「捕到了但数值不对」的桶登记成可用。
+            # 递归状态模型跳过（回放会推进设备侧 conv/ssm 状态，见 _numeric_guard_safe）。
+            if reference is not None and self._numeric_guard_safe:
+                graph.replay()
+                torch.npu.synchronize()
+                failure = self._compare_numeric(reference, logits)
+                reference = None
+                if failure is None:
+                    if self._compare_logits_fn is not None:
+                        self.stats["numeric_checks"] += 1
+                else:
+                    self.stats["numeric_failures"] += 1
+                    raise RuntimeError(
+                        f"捕获后回放数值自检失败（batch_size={graph_bs}）：{failure}"
+                    )
 
             entry.graph = graph
             entry.logits = logits
@@ -325,8 +406,33 @@ class NPUGraphDecodeRunner(DecodeGraphExecutor):
                 )
                 return None
         entry.graph.replay()
+        if self._numeric_guard_safe and entry.validated_steps < 2:
+            # 每桶前两次「真实输入」再复核一次：捕获自检只覆盖 dummy 元数据，
+            # 真实 block_table/context_lens 走的是 PA 元数据刷新通路，只有真实
+            # 输入才能暴露该通路没生效（图内读旧元数据）这类问题。复算只对无副作用
+            # 的模型做：Qwen3.5/GDN 多跑一次前向会推进 conv/ssm 状态。
+            graph_logits = entry.logits.detach().clone()
+            reference = self._forward(entry)
+            failure = self._compare_numeric(reference, graph_logits)
+            del graph_logits, reference
+            if failure is None:
+                entry.validated_steps += 1
+                if self._compare_logits_fn is not None:
+                    self.stats["numeric_checks"] += 1
+            else:
+                entry.enabled = False
+                entry.capture_error = f"真实输入数值检查失败：{failure}"
+                self.stats["numeric_failures"] += 1
+                self.stats["fallback"] += 1
+                print(
+                    f"[FlashEngine] NPUGraph disabled for batch_size={graph_bs} "
+                    f"after a real-input numeric check failure; falling back to "
+                    f"eager mode: {failure}",
+                    flush=True,
+                )
+                return None
         self.stats["replay"] += 1
         self.stats["bucket_hits"][graph_bs] = self.stats["bucket_hits"].get(graph_bs, 0) + 1
-        if all(seq.temperature <= 1e-10 for seq in seqs):
+        if self.capture_greedy and all(seq.temperature <= 1e-10 for seq in seqs):
             return entry.greedy_token_ids[:real_bs], True
         return entry.logits[:real_bs], False

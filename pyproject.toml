@@ -17,6 +17,9 @@ flashinfer = ["flashinfer-python"]
 corex = ["ixformer"]
 ascend = ["torch-npu"]
 
+[project.scripts]
+flashengine = "scripts.framework:main"
+
 [tool.setuptools.packages.find]
 include = ["flashengine*", "scripts*"]
 

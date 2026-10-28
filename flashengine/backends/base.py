@@ -81,8 +81,36 @@ class BackendBase(ABC):
     def linear(self, x, weight, bias=None):
         return F.linear(x, weight, bias)
 
-    def optimize_model_weights(self, model) -> int:
+    # ---- 按用途分派线性算子（selective Linear；默认关闭时=主项目原行为）----
+    def linear_for_role(self, x, weight, bias=None, role: str = "generic"):
+        """按模块用途选择线性算子。
+
+        role ∈ {qkv, o, down, gate_up, generic}，由
+        optimize_model_weights(decode_roles=True) 按模块名后缀写入
+        LinearBase.linear_role。默认实现与 linear() 完全一致，故未打开后端
+        selective 开关时行为零变化。
+        """
+        return self.linear(x, weight, bias)
+
+    def greedy_tokens(self, logits) -> list[int]:
+        """图外 greedy 读回入口；后端可覆盖成设备侧/主机侧不同的归约位置。"""
+        return logits.argmax(dim=-1).tolist()
+
+    def optimize_model_weights(self, model, decode_roles: bool = False) -> int:
+        """权重装载后的设备侧后处理。
+
+        decode_roles=True 时后端可额外按模块用途打标（或换算子）；默认实现
+        忽略该形参，保留主项目既有行为。
+        """
         return 0
+
+    def validate_model_decode(self, model, config) -> dict:
+        """可选的候选算子数值守卫，由引擎在捕获图之前调用。
+
+        返回 {"checked": False} 表示本后端没有候选算子切换，行为与主项目现状
+        一致；真正换过算子的后端应返回 checked=True 并附 passed 等字段。
+        """
+        return {"checked": False}
 
     def optimize_block_draft_weights(self, draft_model, target_lm_head) -> int:
         return 0

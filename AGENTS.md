@@ -253,3 +253,48 @@ python3 -m scripts.benchmark /data/Qwen3-0.6B \
 - **图内全静态**：捕获期与回放期不得出现 host 同步（`.item()`/`tolist()`）、动态形状、index 写或动态 Add——元数据在 host 预展开填 pinned，图内只做 `copy_`/`scatter`（310P 的验收用 float 静态比较绕开 AICPU Add，见其能力矩阵）。
 - 本仓**不使用 `torch.compile`**（旧文档的 `compile=True` 配置项已随精简移除）；性能路径 = CUDA Graph / NPUGraph + 稠密算子融合。
 - 本地 `main` 分支通常领先 `origin/main` 且带未提交工作——动代码前先 `git status`。
+
+## 统一 FP16 框架增量合并（2026-10-28，源：`nano_flashengine_fp16_1_0`）
+
+**只增不减**：把独立发布版（Ascend 310P / Qwen3-8B / FP16 / 无量化 / 不依赖 MindIE 的统一框架）的**功能增量**合入本仓；
+本仓既有能力（Qwen3.5/GDN、W8A8 与 Quark 量化装配、FlashInfer、Triton/deployment、speculators 草稿格式、recurrent 状态、
+显存/设备/TP 配置、`--raw-log`、`device_rng`、weakref RoPE 共享、权重加载进度条等）**一行未删**。合入 9 项新能力：
+
+1. **统一配置与入口**：`flashengine/runtime.py`（`RuntimeSettings` + `create_engine`，import 期纯标准库）、`python -m flashengine`
+   的 6 个子命令（`config/generate/serve/start/status/stop`）、`configs/{default,eager,batch}.json`、
+   `scripts/framework.py`、`scripts/service_control.py`（PID+启动计数+cwd+argv+源码根五重归属校验，pidfd/SIGTERM）。
+2. **服务端点与生命周期**：`GET /healthy`、`GET /ready`（`{status,pid,service,version}`，均免鉴权）、`GET /v1/runtime`
+   （`engine.runtime_snapshot()`）、`--api-key-env`（密钥不进 argv）、SIGTERM 优雅停机、引擎线程致命异常 → 就绪端点 503。
+3. **精度守卫（开关化）**：`flashengine/precision.py`（`require_unquantized_checkpoint`）、`flashengine/validation.py`
+   （`compare_logits` / `audit_fp16_parameters`）、`Config.fp16_only`（默认 False；为真才拒绝量化检查点、强制 fp16、
+   加载期 `require_float_weight`、启动参数审计；实现为 `utils/loader.set_require_float_weights()` 进程级开关，按配置设定）。
+4. **310P 按用途选线性算子**：`BackendBase.linear_for_role` + `LinearBase.linear_role`；只有 qkv/o/down + 非 Prefill + 单行 +
+   FP16 才用 `npu_linear`；启动时用保留 dummy 块比 functional vs selective 全 logits（失败自动回退 functional）。
+5. **greedy 归约位置可选**：`BackendBase.greedy_tokens()`；`LITEQ_GREEDY_BACKEND=npu|cpu`（cpu = 读回 FP16
+   logits 主机归约）、`LITEQ_CPU_THREADS`。本仓原有的 `_sample` 纯 greedy 快路径保留，只是改走 `greedy_tokens` 以支持归约位置选择。
+6. **RoPE 预展开 + host_positions**：cos/sin half→full 全表启动展开并跨层复用；eager 单 token 用 `Context.host_positions`
+   取表视图（图路径仍走原 LRU+pinned buffer + `copy_`，未改）；表长跟随 `Config` 写入的 `_liteq_max_position_embeddings`。
+7. **310P 图数值守卫**：捕获后立即 replay 比对、每桶前两次真实输入再比对图内外 logits，失败则禁用该桶并回退 eager；
+   `snapshot()` 增加 `numeric_checks`/`numeric_failures`/`captured_greedy`/`active_buckets`。**对带 recurrent 状态的目标模型
+   （Qwen3.5/GDN）关闭复算守卫**（多跑一次前向会推进设备状态），只保留按桶回退。
+8. **采样参数显式校验**：`SamplingParams` 的 `assert` 改 `ValueError`（类型/有限性/范围）；HTTP 侧 temperature/top_p 拒绝 NaN/∞，
+   新增 `--top-p/--top-k` 默认值。
+9. **`LLMEngine.synchronize()`** 与 `ModelRunner.runtime_snapshot()` 的 `precision`/`linear_validation` 两个新键。
+
+**环境变量**（310P 生效）：`LITEQ_DECODE_LINEAR_BACKEND=functional|selective`、`LITEQ_GREEDY_BACKEND=npu|cpu`、
+`LITEQ_CPU_THREADS`；统一入口另设 `FLASHENGINE_ACLGRAPH_PA_UPDATE=auto|0|1`。
+
+**有意跳过**：源发布版删掉的主项目能力；它的 `tests/`、`docs/`、`MANIFEST.sha256`、`release.json`；它的 `webui.html`/`benchmark.py`
+（本仓更新）；`bench_concurrent.py`/`webui-aero.html`（本仓工作区已删除）；以及**全部验收/基准/打包脚本与部署 shell**
+（`check_api`/`check_framework`/`preflight_unified`/`benchmark_unified`/`bench_matrix`/`sweep_unified`/`profile_unified`/
+`unified_metrics`/`validate_host`/`verify_package`/`package_release` 与 `host_run.sh`/`run_board.sh`/`start_release.sh`/
+`stop_release.sh`/`acceptance.sh`）——按用户要求只保留实现功能的最简代码，部署改为手工 `docker cp` + `python -m flashengine`。
+**上下文尾部单步未合并**——本仓 `LLMEngine._step_spec` 早已用 `ModelRunner.context_limited_spec_round` 实现同一机制
+（还带 `context_limited_rounds` 统计），源版的 `split_spec_tail`/`run_target_only` 是重复实现，合并时已回退。
+
+**验证状态**（本机无 torch/torch_npu/NPU，全部为 host 级）：`python -m compileall flashengine scripts` 通过；
+`python -m flashengine --help|config` 可用（`config` 不加载 torch）；三份 `configs/*.json` 经
+`RuntimeSettings.load → server_arguments → openai_server._build_parser()` 往返通过；15 个新模块 torch-free 可导入；
+`flashengine.precision` 导入不拉 torch；既有能力回归清单（Qwen3.5/量化/speculators/recurrent/FlashInfer/mask LRU/prefix 校验/
+raw-log/device_rng 等）静态检查全绿。**运行期未验证**：`npu_linear` 与 NZ 权重兼容性、selective 与图的交互、图数值守卫在
+310P 上的 top-1 一致率、服务 start/stop/status、docker 部署流程、`package_release` 实际打包——需按既有 310P 板端流程复测。

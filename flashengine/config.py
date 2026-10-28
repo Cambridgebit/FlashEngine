@@ -8,6 +8,7 @@ from transformers import AutoConfig
 
 from flashengine.backends import get_backend
 from flashengine.models.registry import resolve_target_model
+from flashengine.precision import require_unquantized_checkpoint
 from flashengine.speculative.registry import load_draft_config, resolve_spec_method
 from flashengine.support_matrix import require_supported
 from flashengine.engine.memory import validate_memory_options
@@ -32,6 +33,13 @@ class Config:
     enforce_eager: bool = False
     backend: str = "auto"
     dtype: str | None = None
+    # ---- 统一 FP16 发布入口（默认关闭，保持主项目既有行为）----
+    # fp16_only：拒绝量化/反量化检查点 + 计算类型固定 FP16 + 启动参数审计。
+    fp16_only: bool = False
+    # 310P 单行 decode 的线性算子：functional（默认）/ selective（QKV/O/Down 走 npu_linear）。
+    decode_linear_backend: str = "functional"
+    # 图外 greedy 归约位置：npu（设备 argmax，默认）/ cpu（FP16 logits 读回）。
+    greedy_backend: str = "npu"
     hccl_port: int = 0
     shm_name: str = ""
     hf_config: AutoConfig | None = None
@@ -81,9 +89,23 @@ class Config:
             raise ValueError("max_pending_requests 必须为正数")
         if not 0 <= self.hccl_port <= 65535:
             raise ValueError("hccl_port 必须在 [0, 65535] 内")
+        if self.decode_linear_backend not in ("functional", "selective"):
+            raise ValueError("decode_linear_backend 仅支持 functional/selective")
+        if self.greedy_backend not in ("npu", "cpu"):
+            raise ValueError("greedy_backend 仅支持 npu/cpu")
         if self.backend != "auto":
             os.environ["FLASHENGINE_BACKEND"] = self.backend
+        # 显式传入的非默认值覆盖 env（保持默认值时不动 env，避免盖掉外部设置）。
+        if self.decode_linear_backend != "functional":
+            os.environ["LITEQ_DECODE_LINEAR_BACKEND"] = self.decode_linear_backend
+        if self.greedy_backend != "npu":
+            os.environ["LITEQ_GREEDY_BACKEND"] = self.greedy_backend
         self.backend_impl = get_backend()
+        if (self.backend_impl.name != "ascend310p"
+                and (self.decode_linear_backend != "functional" or self.greedy_backend != "npu")):
+            # 仅告警不失败：这两个开关只作用于 310P，其它后端保持既有行为。
+            print("[FlashEngine] decode_linear_backend/greedy_backend 仅对 ascend310p 生效，"
+                  f"当前后端 {self.backend_impl.name} 按默认实现。", flush=True)
         if not os.path.isdir(self.model):
             raise ValueError(f"Model must be a local directory: {self.model}")
         if self.kvcache_block_size < 16 or (
@@ -104,6 +126,17 @@ class Config:
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.target_adapter = resolve_target_model(self.hf_config)
         self.model_config = self.target_adapter.model_config(self.hf_config)
+        # 加载期浮点守卫是进程级开关，按本次配置显式设定并复位，避免同进程内
+        # 先构造 fp16_only 配置后影响后续默认配置；不开 fp16_only 时等价于不校验。
+        from flashengine.utils.loader import set_require_float_weights
+        set_require_float_weights(bool(self.fp16_only))
+        if self.fp16_only:
+            # 统一 FP16 发布入口：先拒绝量化/反量化检查点，再固定计算类型。
+            # 默认关闭时不进入本分支，W8A8/Quark 装配逻辑完全保持原样。
+            require_unquantized_checkpoint(self.model, self.hf_config)
+            if self.dtype not in (None, "float16"):
+                raise ValueError("fp16_only 要求 dtype 为 float16 或不指定（跟随统一入口）")
+            self.model_config.dtype = torch.float16
         if self.dtype is not None:
             if self.dtype not in ("float16", "bfloat16"):
                 raise ValueError("dtype 仅支持 float16/bfloat16")
@@ -123,6 +156,9 @@ class Config:
         self.max_model_len = min(
             self.max_model_len, self.model_config.max_position_embeddings
         )
+        # RoPE 表准备上限跟随实际窗口（后端按它展开 cos/sin 全表），避免按
+        # 检查点原始 max_position_embeddings（如 40960）白准备内存。
+        self.model_config._liteq_max_position_embeddings = self.max_model_len
         # ---- MoE（Qwen3-30B-A3B）元数据（形状自 model_config 取）----
         self.is_moe = bool(getattr(self.target_adapter, "is_moe", False))
         if self.is_moe:
@@ -159,6 +195,9 @@ class Config:
             if self.spec_num_tokens < 1:
                 raise ValueError("spec_num_tokens must be positive")
             self.draft_config = load_draft_config(self.spec_model)
+            if self.fp16_only:
+                # 草稿侧同样只接受原始浮点检查点（与目标模型同口径）。
+                require_unquantized_checkpoint(self.spec_model, self.draft_config)
             self.spec_adapter = resolve_spec_method(self.draft_config)
             self.spec_method = self.spec_adapter.name
             self.spec_is_block_draft = self.spec_adapter.block_draft
@@ -227,6 +266,13 @@ class Config:
           per-channel scale/zero_point，无 int8 算子的后端（cuda/corex）在加载期反量化。
         量化本身的支持范围（后端/目标）由 support_matrix 统一裁决。
         """
+        if self.fp16_only:
+            # fp16_only：__post_init__ 已拒绝量化检查点，这里固定为未量化，
+            # 避免模型侧按 quant_scheme 构造量化线性层。
+            self.quant_method = ""
+            self.quant_scheme = {}
+            self.dequant_int8_weights = False
+            return
         quant_desc = os.path.join(self.model, "quant_model_description.json")
         if os.path.exists(quant_desc):
             with open(quant_desc, "r", encoding="utf-8") as f:
