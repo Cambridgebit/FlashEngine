@@ -127,6 +127,15 @@ def server_arguments(settings):
         arguments += ["--dtype", settings.precision]
     if settings.num_kvcache_blocks >= 0:
         arguments += ["--kv-blocks", str(settings.num_kvcache_blocks)]
+    # 显存预算与设备索引：服务端参数以 MiB 为单位，配置以字节保存。四项总是透传，
+    # 让配置文件里的 0 与 256 MiB 等显式值与服务端默认保持同一语义。
+    if settings.device_ids:
+        arguments += ["--device", str(settings.device_ids[0])]
+    for field, flag in (("memory_budget_bytes", "--memory-budget-mib"),
+                        ("device_memory_reserve_bytes", "--device-reserve-mib"),
+                        ("memory_workspace_bytes", "--memory-workspace-mib"),
+                        ("graph_memory_reserve_bytes", "--graph-reserve-mib")):
+        arguments += [flag, str(getattr(settings, field) // (1024 * 1024))]
     if settings.fp16_only:
         arguments.append("--fp16-only")
     for enabled, flag in ((settings.enforce_eager, "--eager"),
@@ -229,6 +238,10 @@ def main(argv=None):
             return generate(settings, args)
         if args.command == "serve":
             _require_model(settings, "serve")
+            if settings.tensor_parallel_size != 1:
+                raise ValueError(
+                    "HTTP 服务只支持同进程 TP=1；请在配置里设 tensor_parallel_size=1，"
+                    "或改用 generate/scripts.benchmark 做多卡验证")
             from scripts.openai_server import main as serve
             extra = []
             if getattr(args, "raw_log", None):

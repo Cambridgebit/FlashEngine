@@ -59,7 +59,7 @@ python3 -m pip install -e ".[cuda]"    # CUDA：triton + flash-attn
 # corex：厂商环境 + ixformer；ascend：CANN + torch-npu（310P 不依赖 vLLM）
 ```
 
-### 统一入口
+### 统一入口一览
 
 ```bash
 python -m flashengine config   --config configs/default.json --model /data/Qwen3-8B
@@ -70,7 +70,7 @@ python -m flashengine status
 python -m flashengine stop
 ```
 
-`configs/` 提供三档模板：`default.json`（图模式）、`eager.json`（关闭图，调试用）、`batch.json`（多并发 + 前缀缓存）。模板中的模型路径是占位值，用 `--model` 覆盖即生效，命令行覆盖优先级最高。`python -m scripts.framework` 与 `python -m flashengine` 等价。
+`configs/` 提供三档模板：`default.json`（图模式）、`eager.json`（关闭图，调试用）、`batch.json`（多并发 + 前缀缓存）。模板中的模型路径是占位值，用 `--model` 覆盖即生效，命令行覆盖优先级最高。`python -m scripts.framework` 与 `python -m flashengine` 等价。每个子命令的职责、与原始入口的关系、以及全部可调参数见下方 [使用方式](#使用方式)。
 
 ### Python API
 
@@ -109,6 +109,164 @@ python -m scripts.benchmark /data/Qwen3-8B \
 ```
 
 `--spec-model` 开启投机基准并输出接受长度 E 与逐位置接受率，`--num-repeats` 与 `--no-prefix-cache` 做缓存冷热对照，`--eager` 关闭图。脚本以 `python3 -m scripts.<名称>` 形式从仓库根目录运行。
+
+## 使用方式
+
+### 六个子命令的职责
+
+| 子命令 | 做什么 | 加载模型 | 占用设备 |
+|---|---|---|:---:|
+| `config` | 把 `--config` 加命令行覆盖合并成最终配置，打印 JSON 后退出 | 否 | 否 |
+| `generate` | 离线跑一次生成：套 chat 模板 → 推理 → 打印文本，可选 `--output` 存 JSON（含 token、耗时、运行快照），结束后释放设备 | 是 | 是（跑完释放） |
+| `serve` | **前台**运行 HTTP 服务与 Web 控制台，Ctrl-C 结束 | 是 | 是 |
+| `start` | **后台**启动服务，等到 `/ready` 通过才返回，并把 PID、内核启动计数、cwd、argv 写入 `runtime/service.json` | 是（在子进程） | 是 |
+| `status` | 读状态文件、校验进程身份与 `/ready`，打印 `{"running","ready","pid","log"}`；未就绪时退出码非 0 | 否 | 否 |
+| `stop` | 重新核对 PID / 启动计数 / cwd / 完整 argv 四项，全部匹配才发 `SIGTERM` 优雅停止 | 否 | 否 |
+
+`config` 只做配置装配与校验，和 `status`/`stop` 一样不加载 torch，在没有设备运行时的机器上也能直接跑——适合先确认配置合法再上设备。`status` 与 `stop` 只读状态文件，不需要再传 `--config` 或 `--model`。`start` 的日志落在 `runtime/server_<随机>.log`，`status` 会打印路径。
+
+`start`/`status`/`stop` 依赖 `/proc`、pidfd 与 `SIGTERM`，**只能在 Linux 开发板或容器内执行**；在 Windows 上会直接报错退出。`config`/`generate`/`serve` 不受此限制。
+
+注意 `stop` **只管理 `start` 自己启动的进程**：用 `serve` 前台起的、或用其它包装脚本起的进程不在其管辖范围，会报 `FRAMEWORK_SERVICE_NOT_RUNNING`。这是刻意的安全边界——宁可拒绝，也不误杀占用端口的其他服务。
+
+### 与原始入口的关系
+
+`serve` 并不是服务的另一份实现，而是**把统一配置翻译成原始服务的命令行**（`server_arguments()` 逐项映射，再调用 `scripts/openai_server.main`）。调度、流式、投机、Web 控制台全部沿用原实现。所以三条路等价，按需要选：
+
+```bash
+# A. 原始入口：参数最全（--api-key 明文、--raw-log、--webui、显存预算等）
+python -m scripts.openai_server /data/Qwen3-8B --backend ascend310p --port 8000
+
+# B. 统一入口前台：从 JSON 装配，透传 --raw-log / --webui
+python -m flashengine serve --config configs/default.json --model /data/Qwen3-8B --raw-log /tmp/raw.jsonl
+
+# C. 统一入口后台托管：可用 status/stop 管理生命周期
+python -m flashengine start --config configs/default.json --model /data/Qwen3-8B
+```
+
+**`benchmark` 不在统一入口内，用法完全不变。** 这是有意的：基准需要精确控制 seed、warmup、repeats、数据集、输出长度等测量口径，套一层配置反而碍事。`configs/*.json` 是给服务用的，不是给基准用的。
+
+```bash
+python -m scripts.benchmark /data/Qwen3-8B \
+    --backend ascend310p --no-think --gpu-mem-util 0.5 --max-model-len 2048 \
+    --max-num-seqs 1 --warmup 1 --num-prompts 3 --max-tokens 64 \
+    --questions bench_data/question.jsonl --no-prefix-cache
+```
+
+一句话决策：**跑性能用 `scripts.benchmark`，起服务用 `flashengine serve/start`，只查配置用 `config`，快速验证模型用 `generate`。**
+
+### 投机推理
+
+四个入口都能开，优先级为 命令行 > 配置文件 > 默认值：
+
+```bash
+# 1) 统一入口（config / generate / serve / start 都支持）
+python -m flashengine serve --config configs/default.json --model /data/Qwen3-8B \
+    --spec-model /data/Qwen3-8B-Dflash --spec-num-tokens 7
+python -m flashengine serve --config configs/default.json --model /data/Qwen3-8B \
+    --spec-model ""                      # 空串 = 关闭
+
+# 2) 写进配置文件
+#    { "spec_model": "/data/Qwen3-8B-Dflash", "spec_num_tokens": 7 }
+
+# 3) 基准
+python -m scripts.benchmark /data/Qwen3-8B <参数> --spec-model /data/Qwen3-8B-Dflash
+
+# 4) 原始服务入口
+python -m scripts.openai_server /data/Qwen3-8B --spec-model /data/Qwen3-8B-Dflash
+```
+
+草稿长度 `k` 的规则：**EAGLE3** 由 `--spec-num-tokens` 直接指定（默认 3）；**DFlash / DSpark** 由草稿 checkpoint 的 `block_size` 自动派生，上限 `block_size-1`，且**默认值 3 和 4 视为「未显式指定」**——8B 草稿（block 16）自动跑 k=15，30B（block 8）自动跑 k=7。要强制指定就传别的数字。
+
+确认投机真的在跑，别只看启动日志：
+
+```bash
+curl -s http://127.0.0.1:8000/v1/runtime | python3 -m json.tool | grep -A3 '"spec"'
+```
+
+应看到 `"enabled": true`、`"method": "dflash"`、`"num_tokens": 15`，同时 `engine.graph_mode` 为 `spec_graph`。请求日志里每条的 `path=` 字段标出实际执行路径（`spec_graph` / `eager_spec` / `decode_graph` / `eager`），这是判断有没有掉回 eager 最快的办法。
+
+### 可控制的参数
+
+配置键名与命令行旗标一一对应（JSON 用下划线，命令行用连字符），未列出的键会被拒绝而不是静默忽略。下表标注每个参数的实际生效范围。
+
+**模型与后端**
+
+| 配置键 / 旗标 | 默认 | 说明 | 生效范围 |
+|---|---|---|---|
+| `model` / `--model` | 必填 | 本地模型目录，不接受 hub ID | config/generate/serve/start |
+| `backend` / `--backend` | `auto` | `cuda` / `corex` / `ascend310p`，`auto` 按运行时探测 | 全部 |
+| `precision` / `--precision` | `auto` | `auto`/`float16`/`bfloat16`/`float32`，非 auto 时映射为服务的 `--dtype` | 全部 |
+| `quantization` / `--quantization` | `none` | `none`/`w8a8`/`quark_w8a8`。**仅作声明与一致性校验**，实际量化方式以检查点元数据为准，不一致会打印告警 | 全部 |
+| `fp16_only` / `--fp16-only` | `false` | 拒绝加载量化检查点，防止 FP16 版误用 W8A8 权重 | 全部 |
+| `tensor_parallel_size` / `--tensor-parallel-size` | 1 | TP 规模。HTTP 服务只支持同进程 TP=1，传非 1 会直接报错 | 仅 generate |
+| `device_ids` / `--device-ids` | 空 | 逗号分隔的设备索引；服务取首个作为 `--device` | 全部 |
+
+**显存与 KV cache**
+
+| 配置键 / 旗标 | 默认 | 说明 |
+|---|---|---|
+| `max_model_len` / `--max-model-len` | 4096 | 上下文窗口上限，超出按淘汰策略裁剪 |
+| `max_num_seqs` / `--max-num-seqs` | 8 | 同时调度的序列数；310P 建议 1–8 |
+| `max_num_batched_tokens` / `--max-num-batched-tokens` | 16384 | 每步 prefill 的 token 预算 |
+| `max_num_partial_prefills` / `--max-num-partial-prefills` | 1 | 未完成 prefill 的并发上限 |
+| `enable_chunked_prefill` / `--chunked-prefill` / `--no-chunked-prefill` | true | 分块预填充开关 |
+| `enable_prefix_cache` / `--prefix-cache` / `--no-prefix-cache` | true | 前缀缓存开关；310P 缺 SplitFuse 时自动关闭 |
+| `gpu_memory_utilization` / `--gpu-mem-util` | 0.9 | KV 池按整卡比例分配；空卡建议 0.5–0.85 留出图捕获余量 |
+| `kvcache_block_size` / `--block-size` | 256 | KV 块大小；310P 仅 64 或 128，CUDA 需 256 的倍数 |
+| `num_kvcache_blocks` / `--kv-blocks` | -1 | 显式指定 KV 块数，`-1` 为按预算自动计算 |
+| `recurrent_prefix_cache_bytes` / `--recurrent-prefix-cache-mb` | 256 MiB | Qwen3.5 前充缓存（GDN conv/SSM 快照）的主机内存预算，0 关闭 |
+| `memory_budget_bytes` / `--memory-budget-mib` | 0 | 引擎显存预算，0 表示只按整卡比例规划 |
+| `device_memory_reserve_bytes` / `--device-reserve-mib` | 0 | 为其他模型与工作区预留的显存 |
+| `memory_workspace_bytes` / `--memory-workspace-mib` | 256 MiB | 运行工作区最低预留 |
+| `graph_memory_reserve_bytes` / `--graph-reserve-mib` | 256 MiB | Graph 额外预留，eager 不使用 |
+
+**投机、执行与图**
+
+| 配置键 / 旗标 | 默认 | 说明 |
+|---|---|---|
+| `spec_model` / `--spec-model` | 空 | 与目标匹配的草稿目录，空串关闭投机 |
+| `spec_num_tokens` / `--spec-num-tokens` | 4 | 草稿长度；块草稿自动派生，3/4 视为未指定 |
+| `enforce_eager` / `--eager` / `--no-eager` | false | 关闭图捕获；仅调试用，310P/CoreX 上代价极大 |
+| `decode_linear_backend` / `--decode-linear-backend` | `functional` | `functional` 或 `selective`，310P 解码线性层实现 |
+| `greedy_backend` / `--greedy-backend` | `npu` | `npu` 或 `cpu`，greedy 归约位置 |
+| `cpu_threads` / `--cpu-threads` | 4 | 主机侧线程数 |
+| `pa_graph_update` / `--pa-graph-update` | `auto` | `auto`/`0`/`1`，NPU 图内 PA 元数据更新；310P 多数驱动不支持 |
+
+**采样默认值与服务**
+
+| 配置键 / 旗标 | 默认 | 说明 |
+|---|---|---|
+| `temperature` / `--temperature` | 0 | 请求未显式传 temperature 时使用；0 为 greedy |
+| `top_p` / `--top-p` | 1.0 | 随机采样 top-p |
+| `top_k` / `--top-k` | 0 | 随机采样 top-k，0 关闭 |
+| `max_tokens` / `--max-tokens` | 128 | 离线生成的输出上限；HTTP 请求由请求体决定 |
+| `enable_thinking` / `--thinking` / `--no-thinking` | false | chat 模板是否开启 thinking（原始服务与基准里的对应旗标是 `--no-think`） |
+| `reserve_output` / `--reserve-output` | 512 | 上下文淘汰时为输出预留的 token 数 |
+| `host` / `--host`、`port` / `--port` | 0.0.0.0:8000 | 监听地址与端口 |
+| `stats_interval` / `--stats-interval` | 10.0 | `[INFO]` 聚合周期秒数，0 关闭 |
+| `web_ui` / `--ui` / `--no-ui` | true | 内置 Web 控制台开关 |
+| `api_key_env` / `--api-key-env` | `FLASHENGINE_API_KEY` | 存放密钥的**环境变量名**，密钥本身不进 argv 与状态文件 |
+
+**环境变量。** 以下变量由配置自动写入（`apply_environment()`），也可以在外部直接设置；其余开关只有环境变量入口：
+
+| 变量 | 取值 | 作用 |
+|---|---|---|
+| `FLASHENGINE_BACKEND` | `cuda`/`corex`/`ascend310p` | 后端选择 |
+| `LITEQ_DECODE_LINEAR_BACKEND` | `functional`/`selective` | 310P 解码线性层实现 |
+| `LITEQ_GREEDY_BACKEND` | `npu`/`cpu` | greedy 归约位置 |
+| `LITEQ_CPU_THREADS` | 整数 | 主机侧线程数 |
+| `FLASHENGINE_ACLGRAPH_PA_UPDATE` | `auto`/`0`/`1` | 图内 PA 元数据更新 |
+| `FLASHENGINE_GRAPH_NUMERIC_GUARD` | `0` 关闭 | 310P 图内外 logits 数值守卫，默认开 |
+| `FLASHENGINE_SPEC_GRAPH` | `0`/`1` | 投机整轮图总开关 |
+| `FLASHENGINE_GRAPH_SAMPLE` | `0`/`1` | 图内采样开关 |
+| `FLASHENGINE_310P_FLASH_OP` | `auto`/`legacy`/`v3`/`atb_v2` | 310P attention 算子选择 |
+| `FLASHENGINE_310P_DFLASH_PAGED` | `auto`/`1`/`0` | 310P 草稿 KV 的分页/稠密形态 |
+| `FLASHENGINE_CUDA_ATTENTION` | `flash_attn`/`flashinfer` | CUDA 注意力库选择 |
+| `FLASHENGINE_VLLM_GEMM` | `0`/`1` | 310P 是否注册 vllm_ascend GEMM |
+| `FLASHENGINE_RUNTIME_DIR` | 路径 | 服务状态/日志目录，默认源码根下 `runtime/` |
+
+**两处需要留意的不对称**：`scripts.benchmark` 没有 `--decode-linear-backend`、`--greedy-backend`、`--fp16-only` 这几个旗标，要测它们请用上表的环境变量（走同一段代码）；`--api-key` 明文只存在于原始服务入口，统一入口只接受环境变量名。
 
 ## 性能结果
 
