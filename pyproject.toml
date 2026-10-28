@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flashengine"
-version = "2.1.0"
+version = "1.0.0"
 description = "用于研究和学习的多后端大模型推理引擎"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
