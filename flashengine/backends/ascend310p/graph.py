@@ -53,7 +53,7 @@ class NPUGraphDecodeRunner(DecodeGraphExecutor):
         self.block_size = plan.block_size
         # greedy 归约在图外（LITEQ_GREEDY_BACKEND=cpu）时，图内 argmax 无人使用，
         # 改为图内只出 logits，省一次图内归约。
-        self.capture_greedy = capture_greedy
+        self.capture_greedy = capture_greedy and not plan.config.enable_constraints
         max_bs = plan.max_batch_size
         sizes = [x for x in ([1, 2, 4, 8] + list(range(16, max_bs + 1, 16))) if x <= max_bs]
         if not sizes or sizes[-1] != max_bs:

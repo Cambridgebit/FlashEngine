@@ -22,6 +22,9 @@ import os
 from pathlib import Path
 import warnings
 
+from flashengine.constraints import (DEFAULT_BANNED_WORDS, normalize_banned_words,
+                                     resolve_constraint_words)
+
 # 取值域：与主项目 backends / support_matrix / Config 保持一致。
 BACKENDS = ("auto", "cuda", "corex", "ascend310p")
 # auto = 不显式指定 dtype（跟随 hf config，即主项目默认行为）。
@@ -60,6 +63,9 @@ class RuntimeSettings:
     max_num_partial_prefills: int = 1
     enable_chunked_prefill: bool = True
     enable_prefix_cache: bool = True
+    enable_constraints: bool = False
+    banned_words: tuple[str, ...] = DEFAULT_BANNED_WORDS
+    constraint_ignore_spaces: bool = False
     gpu_memory_utilization: float = 0.9
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
@@ -119,9 +125,15 @@ class RuntimeSettings:
         if type(self.top_k) is not int or self.top_k < 0:
             raise ValueError("top_k 必须为非负整数")
         for name in ("fp16_only", "enable_chunked_prefill", "enable_prefix_cache",
-                     "enforce_eager", "enable_thinking", "web_ui"):
+                     "enforce_eager", "enable_thinking", "web_ui", "enable_constraints",
+                     "constraint_ignore_spaces"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"配置 {name} 必须是 JSON 布尔值")
+        # frozen dataclass：归一化后的词库经 object.__setattr__ 回写。
+        object.__setattr__(self, "banned_words", normalize_banned_words(self.banned_words))
+        resolve_constraint_words(self.enable_constraints, self.banned_words,
+                                 tensor_parallel_size=self.tensor_parallel_size,
+                                 spec_model=self.spec_model)
         for name in ("temperature", "top_p", "gpu_memory_utilization", "stats_interval"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
@@ -247,7 +259,8 @@ class RuntimeSettings:
             "recurrent_prefix_cache_bytes", "hccl_port", "shm_name", "memory_budget_bytes",
             "device_memory_reserve_bytes", "memory_workspace_bytes",
             "graph_memory_reserve_bytes", "fp16_only", "decode_linear_backend",
-            "greedy_backend",
+            "greedy_backend", "enable_constraints", "banned_words",
+            "constraint_ignore_spaces",
         )
         kwargs = {name: getattr(self, name) for name in names}
         kwargs["device_ids"] = tuple(self.device_ids)

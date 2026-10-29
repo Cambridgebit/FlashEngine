@@ -227,9 +227,29 @@ class LLMEngine(EngineRequests):
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        self._sync_constraint_states(seqs)
         self._drop_finished_spec_state(seqs)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens
+
+    def _sync_constraint_states(self, seqs):
+        """按真实生成历史回填禁词自动机状态；提交被 EOS/窗口截断或发生重算都以它为准。"""
+        masker = getattr(self.model_runner, "word_filter", None)
+        if masker is None:
+            return
+        for seq in seqs:
+            generated = seq.token_ids[seq.num_prompt_tokens:]
+            done = getattr(seq, "constraint_committed", 0)
+            base = getattr(seq, "constraint_base_state", 0)
+            restart = len(generated) < done
+            state = base if restart else getattr(seq, "constraint_state", base)
+            start = 0 if restart else done
+            for token in generated[start:]:
+                state = masker.advance(state, token)
+            seq.constraint_state = state
+            seq.constraint_committed = len(generated)
+            if seq.is_finished and masker.utf8_safe and masker._split(state)[1] != 0:
+                raise RuntimeError("约束输出在不完整 UTF-8 字符处结束，已停止返回结果")
 
     def _step_spec(self):
         seqs, is_prefill = self.scheduler.schedule()
@@ -239,6 +259,7 @@ class LLMEngine(EngineRequests):
             token_ids = self.model_runner.call("run_prefill_spec", seqs)
             self.model_runner.after_spec_prefill(seqs)
             self.scheduler.postprocess(seqs, token_ids, True)
+            self._sync_constraint_states(seqs)
             self._drop_finished_spec_state(seqs)
             return self._collect_outputs(seqs), num_tokens
         num_draft = self.model_runner.config.spec_num_tokens
@@ -258,6 +279,7 @@ class LLMEngine(EngineRequests):
         if self.observer is not None:
             self.observer.on_commit(active, committed, perf_counter())
         finished = self.scheduler.commit_spec(active, committed)
+        self._sync_constraint_states(active)
         self._drop_finished_spec_state(finished)
         num_tokens = -sum(len(tokens) for tokens in committed)
         return self._collect_outputs(capped + active), num_tokens

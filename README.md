@@ -1,4 +1,4 @@
-# FlashEngine V1.0
+# FlashEngine V1.1
 
 FlashEngine 是一个从零实现的大模型推理引擎，面向研究与学习：覆盖请求调度、KV cache 管理、模型执行与硬件后端适配，提供 Python API、OpenAI 兼容 HTTP 服务与统一命令行入口。
 
@@ -85,6 +85,7 @@ python -m flashengine stop
 | [default.json](configs/default.json) | 图模式基线 | `enforce_eager=false` |
 | [eager.json](configs/eager.json) | 关图排障、逐位对照 | `enforce_eager=true` |
 | [spec.json](configs/spec.json) | 投机解码 | `spec_model`、`spec_num_tokens` |
+| [constrained.json](configs/constrained.json) | 禁词约束示例 | 预设词库，需显式开启 |
 | [batch.json](configs/batch.json) | 多并发 + 前缀缓存 | `max_num_seqs=4`、`enable_prefix_cache=true` |
 
 ```bash
@@ -108,6 +109,7 @@ python -m flashengine benchmark --config configs/batch.json   --model /data/Qwen
 | `enable_prefix_cache`、`enable_chunked_prefill` | 前缀缓存、分块预填充开关 |
 | `enforce_eager` | 关闭图捕获（仅调试用） |
 | `spec_model`、`spec_num_tokens` | 草稿目录与草稿长度；空串关闭投机 |
+| `enable_constraints`、`banned_words` | 禁词约束开关与词库 |
 | `temperature`、`top_p`、`top_k`、`max_tokens` | 采样默认值与离线输出上限 |
 | `enable_thinking`、`reserve_output` | thinking 开关、上下文淘汰时给输出预留的 token |
 | `host`、`port`、`web_ui`、`api_key_env` | 监听地址端口、控制台开关、存放密钥的环境变量名 |
@@ -132,6 +134,17 @@ curl -s http://127.0.0.1:8000/v1/runtime | python3 -m json.tool | grep -A3 '"spe
 ```
 
 应看到 `"enabled": true` 与具体方法名，且 `engine.graph_mode` 为 `spec_graph`。请求日志里的 `path=` 字段标出实际执行路径（`spec_graph`/`eager_spec`/`decode_graph`/`eager`），是判断有无掉回 eager 最快的办法。
+
+### 禁词约束
+
+在 [constrained.json](configs/constrained.json) 中设置 `"enable_constraints": true` 和 `"banned_words": ["航空", "秘密"]`；若要同时使用投机解码，设置 `"spec_model": "/data/Qwen3-8B-ds-Dspark"`。也可临时覆盖：
+
+```bash
+python -m flashengine serve --config configs/constrained.json --model /data/Qwen3-8B \
+    --enable-constraints --spec-model /data/Qwen3-8B-ds-Dspark
+```
+
+配置默认关闭约束；关闭时设 `"enable_constraints": false`。默认按输出文本的精确子串匹配；`"constraint_ignore_spaces": true` 可忽略 ASCII 空格、制表符和换行，但不覆盖同义词、全角空格等变体。该功能仍在验证中，目前仅在 310P 的 Qwen3-8B + DSpark 上做过短样本测试，不应将其作为语义级内容过滤保证。
 
 ### Python API
 

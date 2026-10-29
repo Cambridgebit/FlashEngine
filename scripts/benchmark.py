@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import time
 
@@ -71,6 +72,12 @@ def main(argv=None):
     parser.add_argument("--spec-model", default="")
     parser.add_argument("--spec-num-tokens", type=int, default=3)
     parser.add_argument("--no-think", action="store_true")
+    parser.add_argument("--enable-constraints", action=argparse.BooleanOptionalAction,
+                        default=False, help="启用禁词约束（词表掩码，可与投机解码并存）")
+    parser.add_argument("--banned-words", default=None, metavar="JSON",
+                        help='禁词 JSON 数组，例如 ["航空", "秘密"]')
+    parser.add_argument("--constraint-ignore-spaces", action="store_true",
+                        help="禁词匹配忽略空白（堵住插空格绕过，输出质量会下降）")
     parser.add_argument("--backend", default="auto", choices=["auto", "cuda", "corex", "ascend310p"])
     parser.add_argument("--eager", action="store_true")
     parser.add_argument("--dtype", choices=("float16", "bfloat16"), help="固定实际计算类型，默认跟随模型/后端")
@@ -106,6 +113,12 @@ def main(argv=None):
                   recurrent_prefix_cache_bytes=args.recurrent_prefix_cache_mb * 1024 * 1024)
     if args.spec_model:
         kwargs.update(spec_model=args.spec_model, spec_num_tokens=args.spec_num_tokens)
+    if args.enable_constraints:
+        from flashengine.constraints import DEFAULT_BANNED_WORDS, normalize_banned_words
+        words = (normalize_banned_words(json.loads(args.banned_words))
+                 if args.banned_words else DEFAULT_BANNED_WORDS)
+        kwargs.update(enable_constraints=True, banned_words=words,
+                      constraint_ignore_spaces=args.constraint_ignore_spaces)
     if args.dtype:
         kwargs["dtype"] = args.dtype
     kwargs.update(memory_kwargs(args))

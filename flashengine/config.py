@@ -7,6 +7,7 @@ from typing import Any
 from transformers import AutoConfig
 
 from flashengine.backends import get_backend
+from flashengine.constraints import DEFAULT_BANNED_WORDS, normalize_banned_words, resolve_constraint_words
 from flashengine.models.registry import resolve_target_model
 from flashengine.precision import require_unquantized_checkpoint
 from flashengine.speculative.registry import load_draft_config, resolve_spec_method
@@ -48,6 +49,11 @@ class Config:
     num_kvcache_blocks: int = -1
     enable_prefix_cache: bool = True
     recurrent_prefix_cache_bytes: int = 256 * 1024 * 1024
+    # 禁词约束：编译成词表掩码，在采样之前生效，因此与随机采样、投机解码并存。
+    enable_constraints: bool = False
+    banned_words: tuple[str, ...] = DEFAULT_BANNED_WORDS
+    # 忽略空白匹配可堵住"航 空"式绕过，但会把模型逼到劣质 token（实测乱码），默认关闭。
+    constraint_ignore_spaces: bool = False
     spec_model: str = ""
     spec_num_tokens: int = 4
     spec_aux_layers: tuple[int, ...] = ()
@@ -76,6 +82,12 @@ class Config:
     dequant_int8_weights: bool = field(default=False, init=False)
 
     def __post_init__(self):
+        self.banned_words = normalize_banned_words(self.banned_words)
+        if type(self.constraint_ignore_spaces) is not bool:
+            raise ValueError("constraint_ignore_spaces 必须为布尔值")
+        resolve_constraint_words(self.enable_constraints, self.banned_words,
+                                 tensor_parallel_size=self.tensor_parallel_size,
+                                 spec_model=self.spec_model)
         validate_memory_options(self.gpu_memory_utilization, self.memory_budget_bytes,
                                 self.device_memory_reserve_bytes, self.memory_workspace_bytes,
                                 self.graph_memory_reserve_bytes, self.num_kvcache_blocks)

@@ -195,6 +195,7 @@ class ModelRunner:
         _env_sample = os.environ.get("FLASHENGINE_GRAPH_SAMPLE")
         self.graph_sample = (
             self.world_size == 1
+            and not config.enable_constraints
             and (self.backend.graph_sample_default if _env_sample is None
                  else _env_sample != "0")
         )
@@ -285,6 +286,22 @@ class ModelRunner:
         self.startup_stats["model_load_s"] = time.perf_counter() - model_load_t0
         self.precision_audit = self._audit_precision(config)
         self.sampler = Sampler(device_rng=self.backend.supports_device_sampling_rng)
+        # 禁词约束：只建一次掩码器，随后每步取 bias 行；关闭时不加载 tokenizer。
+        self.word_filter = None
+        if config.enable_constraints and rank == 0:
+            from transformers import AutoTokenizer
+            from flashengine.constraints import BannedWordMasker
+            constraint_tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
+            self.word_filter = BannedWordMasker.from_tokenizer(
+                constraint_tokenizer, config.banned_words,
+                vocab_size=config.model_config.vocab_size,
+                ignore_spaces=config.constraint_ignore_spaces,
+                # 严格模式把自然续写堵得更死，需要同时保证不产出非法 UTF-8（否则会输出乱码）。
+                utf8_safe=config.constraint_ignore_spaces)
+            self._constraint_bias = self.word_filter.bias_matrix(
+                device=self.device, dtype=self.dtype)
+            self._constraint_next = self.word_filter.next_state_table(
+                device=self.device)
         warmup_t0 = time.perf_counter()
         self.warmup_model()
         self.startup_stats["model_warmup_s"] = time.perf_counter() - warmup_t0
@@ -501,6 +518,10 @@ class ModelRunner:
         spec["positions"] = list(spec["positions"])
         return {
             "recurrent": self.state_runtime.snapshot() if self.state_runtime else None,
+            "constraints": (self.word_filter.snapshot() if self.word_filter is not None else
+                            {"enabled": False, "banned_words": [],
+                             "configured_banned_words": list(self.config.banned_words),
+                             "mode": "token_mask", "selection_backend": "logits_bias"}),
             "mode": self.graph_mode(),
             "precision": dict(self.precision_audit),
             "linear_validation": dict(self.linear_validation),
@@ -1074,6 +1095,8 @@ class ModelRunner:
             graph_result = self.graph_runner.try_run(seqs)
             if graph_result is not None:
                 result, sampled = graph_result
+                if sampled and self.config.enable_constraints:
+                    raise RuntimeError("图执行器返回了未经约束掩码处理的 token")
                 if self.rank == 0:
                     if sampled:
                         token_ids = result.tolist()
@@ -1090,6 +1113,8 @@ class ModelRunner:
         sample = (self.prepare_sample(seqs, is_prefill)
                   if self.rank == 0 and needs_sample else None)
         result, sampled = self.run_model(input_ids, positions, is_prefill)
+        if sampled and self.config.enable_constraints:
+            raise RuntimeError("图执行器返回了未经约束掩码处理的 token")
         if is_prefill:
             if self.state_runtime:
                 self.state_runtime.finish_prefill()
@@ -1107,7 +1132,21 @@ class ModelRunner:
 
         greedy 快路径不排序、不生成随机数、也不准备采样参数；只有需要随机采样时
         才准备参数。图内采样仍由图本身产出 token_id，不经过这里。
+        开启禁词约束时，先按各序列当前状态在 logits 上加偏置；状态的推进交给引擎在
+        提交之后按真实 token 历史回填（提交会被 EOS/窗口截断，必须以后者为准）。
         """
+        if self.word_filter is not None:
+            if logits.dim() != 2 or logits.shape[0] != len(seqs):
+                # 绝不静默放行：形状对不上说明这条路径没走掩码（图内采样/TP gather 等）。
+                raise RuntimeError(
+                    f"禁词约束要求 [请求数, 词表] 的 logits，收到 {tuple(logits.shape)}；"
+                    "该采样路径无法应用掩码，请关闭投机图或改用 greedy")
+            states = torch.tensor([getattr(seq, "constraint_state", 0) for seq in seqs],
+                                  dtype=torch.int64, device=logits.device)
+            logits = logits + self._constraint_bias.index_select(0, states)
+        return self._sample_prepared(logits, seqs, is_prefill, prepared)
+
+    def _sample_prepared(self, logits, seqs, is_prefill=False, prepared=None):
         if all(seq.temperature <= 1e-10 for seq in seqs):
             return self.backend.greedy_tokens(logits)
         sample = (prepared if prepared is not None
@@ -1214,6 +1253,12 @@ class ModelRunner:
             ctopks[i] = seq.top_k if 0 < seq.top_k < draft_vocab else draft_vocab
             ctemps[i] = seq.temperature
             ctopps[i] = seq.top_p
+        if self.word_filter is not None:
+            # 每轮开始时把各序列的自动机状态送进图内缓冲（bs 个整数，可忽略的开销）。
+            g = self._sg
+            g['cstate'][:n].copy_(torch.tensor(
+                [getattr(seq, "constraint_state", 0) for seq in seqs],
+                dtype=torch.int64, device=self.device))
         for i in range(1, k):
             for j, (seq, l) in enumerate(zip(seqs, lens)):
                 p = l + i - 2
@@ -1610,6 +1655,7 @@ class ModelRunner:
         v = g['v_input_ids'][:bs * rows].view(bs, rows)
         v[:, 0] = g['chain_tokens'][:bs]
         v[:, 1:].copy_(g['drafted_ids'][:k, :bs].t())
+        self._spec_constraint_rows(bs)
         self._sg_verify(bs, use_cuda_graph)
         self._sg_acceptance(bs)
         if self.state_runtime:
@@ -1810,6 +1856,9 @@ class ModelRunner:
             v_shift_idx=torch.cat([
                 torch.arange(1, k + 1, dtype=torch.int64),
                 torch.tensor([k], dtype=torch.int64)]),
+            # 禁词约束：每序列当前状态、verify 每行状态（掩码用 bias 表 gather）。
+            cstate=torch.zeros(max_bs, dtype=torch.int64),
+            row_state=torch.zeros(max_bs * rows, dtype=torch.int64),
         )
 
     def _sg_sample(self, logits, temps, topps, topks, use_cuda_graph: bool):
@@ -1874,6 +1923,28 @@ class ModelRunner:
                 use_cuda_graph)
             g['drafted_ids'][i][:bs] = self.draft_model.map_to_target_ids(ids)
 
+    def _spec_constraint_rows(self, bs: int):
+        """按草稿 token 在图内推进禁词自动机，得到 verify 每行的状态索引。
+
+        行 0 用已提交前缀的状态；行 j 的状态 = 前缀再吃掉 d1..d{j-1}。草稿里出现被禁
+        token 时该行沿用它上一个状态（那些行的 argmax 一定被丢弃，不影响正确性）。
+        """
+        if self.word_filter is None:
+            return
+        g = self._sg
+        k = self.config.spec_num_tokens
+        rows = k + 1
+        view = g['row_state'][:bs * rows].view(bs, rows)
+        current = g['cstate'][:bs]
+        view[:, 0] = current
+        flat = self._constraint_next
+        vocab = self.config.model_config.vocab_size
+        for step in range(k):
+            token = g['drafted_ids'][step][:bs]
+            advanced = flat.index_select(0, current * vocab + token)
+            current = torch.where(advanced >= 0, advanced.to(torch.int64), current)
+            view[:, step + 1] = current
+
     def _sg_verify(self, bs: int, use_cuda_graph: bool = True):
         g = self._sg
         rows = self.config.spec_num_tokens + 1
@@ -1891,6 +1962,10 @@ class ModelRunner:
         hidden, aux = self.model(g['v_input_ids'][:bs * rows], g['v_positions'][:bs * rows])
         logits = self.backend.linear(
             hidden, getattr(self.model.lm_head, "weight_nz", self.model.lm_head.weight))
+        if self.word_filter is not None:
+            # 采样前加偏置：gather 一次 [bs*rows, 词表]，图内完成，不经主机。
+            logits = logits + self._constraint_bias.index_select(
+                0, g['row_state'][:bs * rows])
         g['v_token_ids'][:bs * rows] = self._sg_sample(
             logits, g['v_temps'][:bs * rows], g['v_topps'][:bs * rows], g['v_topks'][:bs * rows],
             use_cuda_graph)
@@ -1954,6 +2029,7 @@ class ModelRunner:
         rows = k + 1
         self._sg_scatter(bs)
         self._sg_draft_chain(bs, use_cuda_graph)
+        self._spec_constraint_rows(bs)
         v = g['v_input_ids'][:bs * rows].view(bs, rows)
         v[:, 0] = g['chain_tokens'][:bs]
         v[:, 1:].copy_(g['drafted_ids'][:k, :bs].t())

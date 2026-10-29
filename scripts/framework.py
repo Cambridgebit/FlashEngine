@@ -15,11 +15,20 @@ import sys
 import time
 
 from flashengine.runtime import BACKENDS, PRECISIONS, QUANTIZATIONS, RuntimeSettings, create_engine
+from flashengine.constraints import normalize_banned_words
 
 
 ROOT = Path(__file__).resolve().parents[1]
 # 这个版本的统一入口用环境变量传 API key（`--api-key-env`），避免密钥出现在 argv/进程表。
 DEFAULT_API_KEY_ENV = "FLASHENGINE_API_KEY"
+
+
+def parse_banned_words(value):
+    """Parse a JSON array so words may contain spaces or punctuation."""
+    try:
+        return normalize_banned_words(json.loads(value))
+    except (ValueError, TypeError) as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def add_settings(parser):
@@ -51,6 +60,13 @@ def add_settings(parser):
     parser.add_argument("--device-ids", default=None, help="逗号分隔的设备索引，如 0,1")
     parser.add_argument("--prefix-cache", action=argparse.BooleanOptionalAction, default=None,
                         dest="enable_prefix_cache", help="前缀缓存开关（按后端能力裁决）")
+    parser.add_argument("--enable-constraints", action=argparse.BooleanOptionalAction, default=None,
+                        help="启用禁词约束；默认关闭")
+    parser.add_argument("--banned-words", type=parse_banned_words, default=None, metavar="JSON",
+                        help='禁词 JSON 数组，例如 ["航空", "秘密"]')
+    parser.add_argument("--constraint-ignore-spaces", action=argparse.BooleanOptionalAction,
+                        default=None,
+                        help="禁词匹配时忽略空白，可堵住“航 空”式绕过；代价是输出质量下降")
     parser.add_argument("--chunked-prefill", action=argparse.BooleanOptionalAction, default=None,
                         dest="enable_chunked_prefill", help="分块 Prefill 开关")
     parser.add_argument("--eager", action=argparse.BooleanOptionalAction, default=None,
@@ -122,6 +138,10 @@ def server_arguments(settings):
         "--recurrent-prefix-cache-mb", str(settings.recurrent_prefix_cache_bytes // (1024 * 1024)),
         "--api-key-env", settings.api_key_env,
         "--prefix-cache" if settings.enable_prefix_cache else "--no-prefix-cache",
+        "--enable-constraints" if settings.enable_constraints else "--no-enable-constraints",
+        "--banned-words", json.dumps(settings.banned_words, ensure_ascii=False),
+        "--constraint-ignore-spaces" if settings.constraint_ignore_spaces
+        else "--no-constraint-ignore-spaces",
     ]
     if settings.precision != "auto":
         arguments += ["--dtype", settings.precision]
@@ -188,6 +208,11 @@ def benchmark_arguments(settings, args):
                           (not settings.enable_thinking, "--no-think")):
         if enabled:
             arguments.append(flag)
+    if settings.enable_constraints:
+        arguments += ["--enable-constraints", "--banned-words",
+                      json.dumps(settings.banned_words, ensure_ascii=False)]
+        if settings.constraint_ignore_spaces:
+            arguments.append("--constraint-ignore-spaces")
     # 基准独占开关（不在 RuntimeSettings 里）：未显式给出时沿用基准自身默认。
     for name, flag in (("questions", "--questions"), ("category", "--category"),
                        ("num_prompts", "--num-prompts"), ("num_repeats", "--num-repeats"),

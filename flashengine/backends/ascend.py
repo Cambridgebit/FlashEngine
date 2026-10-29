@@ -1008,7 +1008,9 @@ class Ascend310PBackend(BackendBase):
         # greedy 归约放在 CPU 时，图内 argmax 的结果没人用，改为图内只出 logits，
         # 由 greedy_tokens() 在图外读回归约——两处口径必须同一个开关，否则
         # try_run 会把图内 argmax 当成结果返回。
-        return NPUGraphDecodeRunner(plan, capture_greedy=self.greedy_backend == "npu")
+        # 词库约束要把 logits 交回主机加偏置，图内 argmax 会绕过掩码，必须同时关闭。
+        return NPUGraphDecodeRunner(plan, capture_greedy=(
+            self.greedy_backend == "npu" and not plan.config.enable_constraints))
 
     def prefix_cache_disable_reason(self) -> str | None:
         if not self.supports_splitfuse:

@@ -566,6 +566,10 @@ def _roll_auto_context(st):
     new_seq.prefill_query_tokens = old_seq.prefill_query_tokens
     new_seq.prefill_splitfuse_used = old_seq.prefill_splitfuse_used
     new_seq.prefill_prefix_recomputed = old_seq.prefill_prefix_recomputed
+    # 禁词约束：滚动上下文换了新序列，但自动机状态必须接着上一段，否则跨段禁词会漏检。
+    new_seq.constraint_base_state = getattr(old_seq, "constraint_state", 0)
+    new_seq.constraint_state = new_seq.constraint_base_state
+    new_seq.constraint_committed = 0
 
     scheduler = engine.scheduler
     if scheduler.on_preempt is not None:
@@ -708,7 +712,25 @@ def _apply_stop(text, stop):
     return (text[:p], True) if p != -1 else (text, False)
 
 
+def _constraint_output(tokens, final=False):
+    """在发送前检查完整解码文本，拒绝可能绕过 token 掩码的输出。"""
+    text = _tokenizer.decode(tokens, skip_special_tokens=True,
+                             clean_up_tokenization_spaces=False)
+    cfg = engine.config
+    if getattr(cfg, "constraint_ignore_spaces", False):
+        text_to_check = text.translate({ord(c): None for c in " \t\n\r"})
+        words = [w.translate({ord(c): None for c in " \t\n\r"}) for w in cfg.banned_words]
+    else:
+        text_to_check, words = text, cfg.banned_words
+    if any(word and word in text_to_check for word in words):
+        raise RuntimeError("约束输出包含禁词，已停止发送")
+    if final and "\ufffd" in text:
+        raise RuntimeError("约束输出包含无效 UTF-8，已停止发送")
+    return text if final else text.rstrip("\ufffd")
+
+
 def _run_llm(st, stop, emit):
+    constrained = bool(getattr(engine.config, "enable_constraints", False))
     if emit is None and not stop:
         while not st.finished:
             if st.event.wait(timeout=0.05):
@@ -716,7 +738,8 @@ def _run_llm(st, stop, emit):
         gen = _drain(st.tokens)
         if st.error:
             raise RuntimeError(st.error)
-        text = _tokenizer.decode(gen, skip_special_tokens=True)
+        text = (_constraint_output(gen, final=True) if constrained else
+                _tokenizer.decode(gen, skip_special_tokens=True))
         return text, st.finish_reason or "stop", len(gen)
 
     if emit is None:    # non-streaming with stop strings still needs incremental checks
@@ -738,8 +761,13 @@ def _run_llm(st, stop, emit):
     while True:
         if st.finished:
             gen.extend(_drain(st.tokens))
-            final, _ = _apply_stop(
-                _tokenizer.decode(gen, skip_special_tokens=True), stop)
+            if st.error:
+                raise RuntimeError(st.error)
+            text = (_constraint_output(gen, final=True) if constrained else
+                    _tokenizer.decode(gen, skip_special_tokens=True))
+            final, _ = _apply_stop(text, stop)
+            if constrained and not final.startswith(prev_text):
+                raise RuntimeError("约束输出改写了已发送的文本前缀")
             reason = st.finish_reason or "stop"
             send(final[len(prev_text):])
             prev_text = final
@@ -750,6 +778,20 @@ def _run_llm(st, stop, emit):
         if not new:
             continue    # 无新 token：跳过解码（上一轮文本已推送）
         gen.extend(new)
+        if constrained:
+            full = _constraint_output(gen)
+            final, hit = _apply_stop(full, stop)
+            if not final.startswith(prev_text):
+                raise RuntimeError("约束输出改写了已发送的文本前缀")
+            if hit:
+                _abort(st.seq)
+                st.finished = True
+                reason = "stop"
+            send(final[len(prev_text):])
+            prev_text = final
+            if hit:
+                break
+            continue
         pending.extend(new)
         piece = ""
         keep = len(pending)
@@ -1343,6 +1385,14 @@ def _build_parser():
     parser.add_argument("--greedy-backend", choices=("npu", "cpu"), default=None,
                         help="greedy 归约位置（仅 ascend310p 生效；不指定则沿用 "
                              "LITEQ_GREEDY_BACKEND 或后端默认 npu）")
+    from scripts.framework import parse_banned_words
+    parser.add_argument("--enable-constraints", action=argparse.BooleanOptionalAction,
+                        default=False, help="启用禁词约束；默认关闭")
+    parser.add_argument("--banned-words", type=parse_banned_words, default=None, metavar="JSON",
+                        help='禁词 JSON 数组，例如 ["航空", "秘密"]')
+    parser.add_argument("--constraint-ignore-spaces", action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help="禁词匹配忽略空白，可堵住“航 空”式绕过；代价是输出质量下降")
     parser.add_argument("--fp16-only", action="store_true",
                         help="FP16 专用守卫：拒绝量化检查点并把计算参数固定为 FP16")
     parser.add_argument("--recurrent-prefix-cache-mb", type=int, default=256,
@@ -1426,9 +1476,13 @@ def main(argv=None):
         spec_num_tokens=args.spec_num_tokens,
         gpu_memory_utilization=args.gpu_mem_util,
         enable_prefix_cache=enable_prefix_cache,
+        enable_constraints=args.enable_constraints,
+        constraint_ignore_spaces=args.constraint_ignore_spaces,
         recurrent_prefix_cache_bytes=args.recurrent_prefix_cache_mb * 1024 * 1024,
         fp16_only=args.fp16_only,
     )
+    if args.banned_words is not None:
+        kwargs["banned_words"] = args.banned_words
     if args.max_num_seqs is not None:
         kwargs["max_num_seqs"] = args.max_num_seqs
     else:

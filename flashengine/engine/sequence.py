@@ -31,6 +31,10 @@ class Sequence:
         self.prefill_splitfuse_used = False
         self.prefill_prefix_recomputed = False
         self.spec_cold = True
+        # 禁词约束的自动机状态：只由已生成 token 推进，不含提示词。
+        self.constraint_state = 0
+        self.constraint_base_state = 0
+        self.constraint_committed = 0
         self.block_table = []
         self.temperature = sampling_params.temperature
         self.top_p = sampling_params.top_p
@@ -79,14 +83,16 @@ class Sequence:
                 self.block_table, self.temperature, self.top_p, self.top_k, last_state,
                 self.prefix_cache_hit_blocks, self._prefix_cache_hit_pending,
                 self.prefill_query_tokens, self.prefill_splitfuse_used,
-                self.prefill_prefix_recomputed)
+                self.prefill_prefix_recomputed, self.constraint_state,
+                self.constraint_base_state, self.constraint_committed)
 
     def __setstate__(self, state):
         (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens,
          self.block_table, self.temperature, self.top_p, self.top_k, last_state,
          self.prefix_cache_hit_blocks, self._prefix_cache_hit_pending,
          self.prefill_query_tokens, self.prefill_splitfuse_used,
-         self.prefill_prefix_recomputed) = state
+         self.prefill_prefix_recomputed, self.constraint_state,
+         self.constraint_base_state, self.constraint_committed) = state
         if isinstance(last_state, list):
             self.token_ids = last_state
             self.last_token = self.token_ids[-1]
