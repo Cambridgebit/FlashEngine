@@ -15,6 +15,52 @@ from flashengine.support_matrix import require_supported
 from flashengine.engine.memory import validate_memory_options
 
 
+def resolve_model_dtype(hf_config, model_config) -> torch.dtype:
+    """取模型计算 dtype（多模态壳 config 只在 ``thinker_config.dtype`` 里存字符串）。"""
+    thinker = getattr(hf_config, "thinker_config", None)
+    thinker_dtype = (thinker.get("dtype") if isinstance(thinker, dict)
+                     else getattr(thinker, "dtype", None))
+    for value in (getattr(model_config, "dtype", None),
+                  getattr(hf_config, "dtype", None),
+                  thinker_dtype):
+        if isinstance(value, torch.dtype):
+            return value
+        if isinstance(value, str) and isinstance(getattr(torch, value, None), torch.dtype):
+            return getattr(torch, value)
+    return torch.bfloat16
+
+
+def collect_eos_token_ids(model_dir: str, hf_config, tokenizer_eos: int | None = None) -> tuple[int, ...]:
+    """合并检查点声明的全部结束符。
+
+    Qwen3-ASR 的 config.json / generation_config.json 都声明 eos=[151643, 151645]，
+    而 tokenizer.eos_token_id 只有 151645；只认 tokenizer 会让 151643（<|endoftext|>）
+    被当成普通 token 继续生成。顺序保持「配置优先、tokenizer 兜底」，去重。
+    """
+    ids: list[int] = []
+
+    def _add(value) -> None:
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                _add(item)
+        elif isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            if value not in ids:
+                ids.append(value)
+
+    _add(getattr(hf_config, "eos_token_id", None))
+    generation_config = os.path.join(model_dir, "generation_config.json")
+    if os.path.isfile(generation_config):
+        try:
+            with open(generation_config, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            if isinstance(payload, dict):
+                _add(payload.get("eos_token_id"))
+        except (OSError, ValueError):
+            pass
+    _add(tokenizer_eos)
+    return tuple(ids)
+
+
 @dataclass(slots=True)
 class Config:
     model: str
@@ -45,6 +91,8 @@ class Config:
     shm_name: str = ""
     hf_config: AutoConfig | None = None
     eos: int = -1
+    # 检查点声明的全部结束符（Qwen3-ASR 为 {151643, 151645}）：命中任一即结束。
+    eos_ids: tuple[int, ...] = ()
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
     enable_prefix_cache: bool = True
@@ -136,8 +184,11 @@ class Config:
             raise ValueError("tensor_parallel_size must be in [1, 8]")
 
         self.hf_config = AutoConfig.from_pretrained(self.model)
+        self.eos_ids = collect_eos_token_ids(self.model, self.hf_config)
         self.target_adapter = resolve_target_model(self.hf_config)
         self.model_config = self.target_adapter.model_config(self.hf_config)
+        # 计算 dtype 必须是真正的 torch.dtype（多模态壳 config 的 None 在此兜底）。
+        self.model_config.dtype = resolve_model_dtype(self.hf_config, self.model_config)
         # 加载期浮点守卫是进程级开关，按本次配置显式设定并复位，避免同进程内
         # 先构造 fp16_only 配置后影响后续默认配置；不开 fp16_only 时等价于不校验。
         from flashengine.utils.loader import set_require_float_weights
@@ -165,6 +216,13 @@ class Config:
                 print("[FlashEngine] Recurrent 前缀快照预算为 0，关闭 prefix cache。", flush=True)
                 self.enable_prefix_cache = False
             self.max_num_batched_tokens = min(self.max_num_batched_tokens, self.max_model_len)
+        # 多模态音频输入：音频特征只在 rank 0 编码并按扁平 batch 行号注入，
+        # 跨 rank 分发音频/占位区间尚未实现，故先强制 TP=1。
+        if getattr(self.target_adapter, "audio_input", False) or self.target_adapter.name == "qwen3_asr":
+            if self.tensor_parallel_size != 1:
+                raise NotImplementedError("多模态音频输入当前要求 tensor_parallel_size=1")
+            # 音频请求跳过前缀缓存（占位 token 相同但隐层不同），纯文本请求仍可复用。
+            self.max_num_batched_tokens = max(self.max_num_batched_tokens, 1)
         self.max_model_len = min(
             self.max_model_len, self.model_config.max_position_embeddings
         )

@@ -72,6 +72,9 @@ class BlockManager:
     def can_allocate(self, seq: Sequence) -> int:
         if not self.enable_prefix_cache:
             return 0 if len(self.free_block_ids) >= seq.num_blocks else -1
+        if getattr(seq, "skip_prefix_cache", False):
+            # 多模态请求：占位 token 相同但特征不同，复用 KV 会读到别的音频的隐层。
+            return 0 if len(self.free_block_ids) >= seq.num_blocks else -1
         h = -1
         num_cached_blocks = 0
         num_new_blocks = seq.num_blocks
@@ -157,6 +160,9 @@ class BlockManager:
 
     def hash_blocks(self, seq: Sequence):
         if not self.enable_prefix_cache:
+            return
+        if getattr(seq, "skip_prefix_cache", False):
+            # 多模态请求的 token 序列不足以确定隐层，登记后会污染后续纯文本请求。
             return
         start = seq.num_cached_tokens // self.block_size
         end = (seq.num_cached_tokens + seq.num_scheduled_tokens) // self.block_size

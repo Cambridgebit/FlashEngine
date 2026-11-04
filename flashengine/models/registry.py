@@ -57,6 +57,9 @@ class TargetModelAdapter:
     # MoE（Qwen3-30B-A3B 系）标记：引擎据此走 MoE 元数据/门控与专家权重后处理。
     is_moe: bool = False
     recurrent_state: bool = False
+    # 多模态（音频输入）标记：目标模型在文本前向前需要先跑音频塔注入嵌入。
+    # 引擎据此做门控（如音频塔不走 TP / 需要 audio_processor）。
+    audio_input: bool = False
 
     def matches(self, hf_config: Any) -> bool:
         model_type = str(getattr(hf_config, "model_type", ""))
@@ -188,3 +191,19 @@ for _name, _types, _architectures, _is_moe in (
         model_config_selector=_text_model_config, aux_layer_resolver=_layer_output_aux,
         is_moe=_is_moe, recurrent_state=True,
     ))
+
+# Qwen3-ASR（音频输入 + Qwen3 文本骨干，多模态壳 config.json 用 thinker_config 包装）。
+# 调度/执行仍按纯文本目标模型处理（不投机）；dtype 等取 text_config。
+register_target_model(
+    TargetModelAdapter(
+        name="qwen3_asr",
+        model_types=("qwen3_asr",),
+        architectures=("Qwen3ASRForConditionalGeneration",),
+        module="flashengine.models.qwen3_asr",
+        class_name="Qwen3ASRForConditionalGeneration",
+        supported_spec_methods=frozenset({"none"}),
+        model_config_selector=_text_model_config,
+        aux_layer_resolver=_layer_output_aux,
+        audio_input=True,
+    )
+)

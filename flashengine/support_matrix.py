@@ -16,13 +16,14 @@
   后端：cuda / corex / ascend310p（MoE = 三后端；W8A8 仅 ascend310p）
   另加 Quark W8A8 int8 检查点（cuda/corex：加载期权重反量化，见 quant=quark_w8a8）
   Qwen3.5 dense/MoE 文本：三后端普通/DFlash，当前 fp16/bf16、TP=1。
+  Qwen3-ASR（音频输入）：三后端普通推理（无投机、无量化、TP=1）。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-TARGETS = ("qwen3", "qwen3_moe", "qwen3_5", "qwen3_5_moe")
+TARGETS = ("qwen3", "qwen3_moe", "qwen3_5", "qwen3_5_moe", "qwen3_asr")
 BACKENDS = ("cuda", "corex", "ascend310p")
 QUANTIZATIONS = ("none", "w8a8", "quark_w8a8")
 SPEC_METHODS = ("none", "eagle3", "dflash", "dspark")
@@ -41,6 +42,8 @@ _TARGET_SPEC_METHODS = {
     "qwen3_moe": frozenset({"none", "dflash"}),
     "qwen3_5": frozenset({"none", "dflash"}),
     "qwen3_5_moe": frozenset({"none", "dflash"}),
+    # 音频塔 + 文本骨干的多模态目标：当前只声明普通推理（无投机/量化）。
+    "qwen3_asr": frozenset({"none"}),
 }
 
 
@@ -89,6 +92,9 @@ def evaluate(
         )
     if target in ("qwen3_5", "qwen3_5_moe") and quantization != "none":
         return SupportDecision(False, "Qwen3.5 当前只支持 fp16/bf16，尚未接入量化检查点")
+    if target == "qwen3_asr" and quantization != "none":
+        return SupportDecision(
+            False, "Qwen3-ASR 当前只支持 fp16/bf16，尚未接入量化检查点")
     if quantization == "w8a8" and not supports_w8a8:
         return SupportDecision(
             False,

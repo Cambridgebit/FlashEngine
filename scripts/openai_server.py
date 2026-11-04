@@ -7,6 +7,8 @@ import signal
 import sys
 import threading
 import time
+from email import policy as _email_policy
+from email.parser import BytesParser
 from urllib.parse import urlsplit
 
 from collections import deque
@@ -36,6 +38,11 @@ _raw_log_path = None                 # --raw-log：模型原始输出 JSONL 落�
 _raw_log_fh = None
 _raw_log_lock = threading.Lock()
 _engine_failure = None               # 引擎线程的致命异常：就绪端点据此报告 NOT_READY
+# ---- Qwen3-ASR 音频转写 ----
+_asr_processor = None                # AsrProcessor；仅 qwen3_asr 模型初始化，其它模型保持 None
+_asr_max_tokens = 256                # 转写默认输出上限（官方推荐 256，长音频可调）
+_asr_max_upload_bytes = 32 * 1024 * 1024   # multipart 请求体上限，防超大上传打爆内存
+_asr_build_lock = threading.Lock()   # processor.build 是 CPU 侧 tokenizer/mel，串行化避免并发争用
 
 
 def _webui_html():
@@ -198,6 +205,9 @@ _metrics_total = {
     "spec_accepted_tokens": 0,
     "requests_finished": 0,
     "request_errors": 0,
+    "transcription_requests": 0,
+    "transcription_errors": 0,
+    "transcription_audio_seconds": 0.0,
     "ttft_seconds_sum": 0.0,
     "ttft_seconds_count": 0,
 }
@@ -965,6 +975,48 @@ def _chunk(req_id, model, mode, delta_text, finish_reason=None, role=False):
 
 
 
+def _parse_multipart_form(content_type, raw):
+    """解析 multipart/form-data（只依赖标准库 email）。
+
+    Python 3.12 已移除 ``cgi``，这里用 ``email.parser.BytesParser``：给原始 body
+    补一个 Content-Type 头，解析成 MIME 多段，再逐段取字段名/文件名。文本字段按
+    声明的 charset 解码（默认 utf-8），``file`` 字段（或带 filename 的段）一律
+    按原始字节保存——音频必须交给 ``decode_audio_bytes`` 解码，不能当文本。
+
+    返回 ``(fields: dict[str, str], files: dict[str, bytes])``；格式错误抛
+    ``ValueError``（调用方转 400）。
+    """
+    if not content_type:
+        raise ValueError("缺少 Content-Type（需要 multipart/form-data）")
+    if not content_type.lower().startswith("multipart/form-data"):
+        raise ValueError("Content-Type 必须是 multipart/form-data")
+    if "boundary=" not in content_type:
+        raise ValueError("multipart/form-data 缺少 boundary")
+    preamble = (f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n").encode("utf-8")
+    message = BytesParser(policy=_email_policy.default).parsebytes(preamble + raw)
+    if not message.is_multipart():
+        raise ValueError("multipart body 解析失败：不是多段内容")
+    fields, files = {}, {}
+    for part in message.iter_parts():
+        name = part.get_param("name", header="content-disposition")
+        if not name:
+            continue
+        payload = part.get_payload(decode=True) or b""
+        filename = part.get_filename()
+        if name == "file" or filename is not None:
+            files[name] = payload
+        else:
+            charset = part.get_content_charset() or "utf-8"
+            fields[name] = payload.decode(charset, "replace").strip()
+    return fields, files
+
+
+def _format_asr_transcription(text, language=None):
+    """模型输出 `language <Chinese><asr_text>正文` → (language, transcription)。"""
+    parsed = _asr_processor.parse(text, language)
+    return parsed.get("language"), (parsed.get("transcription") or "").strip()
+
+
 class Handler(BaseHTTPRequestHandler):
 
     server_version = "flashengine-openai/0.2"
@@ -1113,11 +1165,16 @@ class Handler(BaseHTTPRequestHandler):
         self._http_begin()
         try:
             path = urlsplit(self.path).path
-            if path not in ("/v1/chat/completions", "/v1/completions"):
+            if path not in ("/v1/chat/completions", "/v1/completions",
+                            "/v1/audio/transcriptions"):
                 self._error(f"unknown path: {path}", 404)
                 return
             if not self._check_auth():
                 self._error("invalid api key", 401)
+                return
+            if path == "/v1/audio/transcriptions":
+                # 音频端点吃 multipart/form-data，不能走 _read_body 的 JSON 解析。
+                self._transcribe()
                 return
             try:
                 body = self._read_body()
@@ -1128,6 +1185,131 @@ class Handler(BaseHTTPRequestHandler):
             self._generate(body, mode)
         finally:
             self._http_end()
+
+    # ------------------------------------------------------------------
+    # POST /v1/audio/transcriptions（Qwen3-ASR）
+    # ------------------------------------------------------------------
+    def _transcribe_error(self, message, code=400):
+        with _gen_lock:
+            _metrics_total["transcription_errors"] += 1
+        self._error(message, code)
+
+    def _read_multipart(self):
+        """读取 multipart 请求体并解析；超限/格式错误抛 ValueError。"""
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            raise ValueError("Content-Length 无效")
+        if n <= 0:
+            raise ValueError("请求体为空")
+        if n > _asr_max_upload_bytes:
+            raise ValueError(f"上传过大: {n} 字节 > 上限 {_asr_max_upload_bytes} 字节")
+        raw = self.rfile.read(n)
+        if len(raw) != n:
+            raise ValueError("请求体长度与 Content-Length 不一致")
+        fields, files = _parse_multipart_form(self.headers.get("Content-Type", ""), raw)
+        return fields, files
+
+    def _transcribe(self):
+        """OpenAI 兼容的语音转写：字段 file / model / language / response_format。
+
+        ``response_format`` 支持 ``json``（默认，返回 ``{"text": ...}``）与
+        ``text``（纯文本 body）。``model`` 只做展示/忽略——单模型服务不按请求
+        切换权重；``language`` 传官方语言名（如 "Chinese"/"English"）可强制语言。
+        """
+        req_id = f"transcribe-{time.time_ns()}"
+        rid = req_id[-6:]
+        self._rid = rid
+        if _asr_processor is None:
+            self._transcribe_error(
+                "current model does not support audio transcription "
+                "(only Qwen3-ASR models expose /v1/audio/transcriptions)", 400)
+            return
+        try:
+            fields, files = self._read_multipart()
+        except ValueError as exc:
+            self._transcribe_error(f"invalid multipart body: {exc}", 400)
+            return
+
+        audio_bytes = files.get("file")
+        if not audio_bytes:
+            self._transcribe_error("missing 'file' field (wav audio)", 400)
+            return
+        response_format = (fields.get("response_format") or "json").lower()
+        if response_format not in ("json", "text"):
+            self._transcribe_error(
+                f"unsupported response_format: {response_format} (json|text)", 400)
+            return
+        language = fields.get("language") or None
+        requested_model = fields.get("model") or ""
+
+        from scripts.asr_benchmark import audio_kwargs, decode_audio_bytes
+
+        try:
+            waveform = decode_audio_bytes(audio_bytes)
+        except Exception as exc:
+            self._transcribe_error(f"audio decode failed: {exc}", 400)
+            return
+        duration = len(waveform) / 16000.0
+
+        # mel + prompt 构造是 CPU 侧（tokenizer 也在这里），串行化以免并发请求争用；
+        # 计时统计只包住引擎推进（[DONE] 的 E2E 含 HTTP 与这一段）。
+        try:
+            with _asr_build_lock:
+                built = _asr_processor.build(waveform, language=language)
+            audio = audio_kwargs(built)
+        except Exception as exc:
+            self._transcribe_error(f"audio preprocessing failed: {exc}", 400)
+            return
+        prompt_ids = list(built["input_ids"])
+        remaining = _max_model_len - len(prompt_ids)
+        if remaining < 8:
+            self._transcribe_error(
+                f"prompt is {len(prompt_ids)} tokens and leaves <8 for output "
+                f"(max_model_len={_max_model_len}); split audio into shorter chunks "
+                f"(recommended <=30s)", 400)
+            return
+        max_tokens = min(_asr_max_tokens, remaining)
+
+        sampling = SamplingParams(temperature=0.0, max_tokens=max_tokens)
+        try:
+            with engine_lock:
+                seq = engine.add_request(prompt_ids, sampling, audio=audio)
+                st = _Request(seq, max_tokens, rid, t_http=self._t0)
+                st.endpoint = self.path
+                st.stream = False
+                st.client = self.client_address[0]
+                st.temperature = 0.0
+                st.thinking = "off"
+                st.preview = (f"audio={duration:.2f}s lang={language or 'auto'} "
+                              f"model={requested_model or _model_name}")
+                st.execution_path = _execution_path(0.0)
+                st.preempt0 = engine.scheduler.stats["preemptions"]
+                _active[seq.seq_id] = st
+                _wakeup.set()
+        except Exception as exc:
+            self._transcribe_error(f"audio request rejected: {exc}", 400)
+            return
+
+        try:
+            text, reason, ct = _run_llm(st, [], None)
+            _log_done(st, ct, reason, text)
+        except Exception as exc:
+            _log("ERROR", f"{rid} transcription failed: {exc}")
+            self._transcribe_error(f"transcription failed: {exc}", 500)
+            return
+
+        predicted_language, transcription = _format_asr_transcription(text, language)
+        with _gen_lock:
+            _metrics_total["transcription_requests"] += 1
+            _metrics_total["transcription_audio_seconds"] += duration
+        _log("INFO", f"{rid} asr audio={duration:.2f}s lang={language or 'auto'} "
+                     f"detected={predicted_language or 'n/a'} "
+                     f"chars={len(transcription)}")
+        if response_format == "text":
+            self._bytes(transcription.encode("utf-8"), "text/plain; charset=utf-8")
+        else:
+            self._json({"text": transcription})
 
 
     def _generate(self, body, mode):
@@ -1404,6 +1586,10 @@ def _build_parser():
     parser.add_argument("--top-k", type=int, default=0, help="默认 top-k，请求体可覆盖；0 关闭")
     parser.add_argument("--no-think", action="store_true")
     parser.add_argument("--reserve-output", type=int, default=512)
+    parser.add_argument("--asr-max-tokens", type=int, default=256,
+                        help="音频转写默认输出上限，默认 256（Qwen3-ASR 官方推荐；长音频可调大）")
+    parser.add_argument("--asr-max-upload-mb", type=int, default=32,
+                        help="POST /v1/audio/transcriptions 的请求体上限（MB），默认 32")
     parser.add_argument("--gpu-mem-util", type=float, default=0.9)
     parser.add_argument("--stats-interval", type=float, default=10.0)
     parser.add_argument("--no-ui", action="store_true")
@@ -1422,10 +1608,11 @@ def _build_parser():
 
 def main(argv=None):
     global engine, _tokenizer, _eos, _model_name, _api_key
-    global SamplingParams, Sequence, SequenceStatus
+    global SamplingParams, Sequence
     global _default_temperature, _default_top_p, _default_top_k
     global _max_model_len, _default_thinking, _default_reserve
     global TPS_INTERVAL, _ui_html_path, _engine_failure
+    global _asr_processor, _asr_max_tokens, _asr_max_upload_bytes
 
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -1447,7 +1634,7 @@ def main(argv=None):
           "may take ~20s on Ascend boards) ...", flush=True)
 
     from flashengine import LLM, SamplingParams
-    from flashengine.engine.sequence import Sequence, SequenceStatus
+    from flashengine.engine.sequence import Sequence
 
     global _ui_enabled
     # API key 优先取显式参数，其次取环境变量：托管服务不把密钥写进 argv/状态文件。
@@ -1500,6 +1687,15 @@ def main(argv=None):
     _eos = engine.scheduler.eos
     _max_model_len = engine.config.max_model_len
     _model_name = args.model.rstrip("/").rsplit("/", 1)[-1]
+    _asr_max_tokens = max(1, args.asr_max_tokens)
+    _asr_max_upload_bytes = max(1, args.asr_max_upload_mb) * 1024 * 1024
+    # 只有音频目标模型才初始化 AsrProcessor；其它模型保持端点存在但返回 400，
+    # 这样客户端探测 /v1/audio/transcriptions 时拿到明确错误而不是 404。
+    if getattr(engine.config.target_adapter, "audio_input", False):
+        from flashengine.asr_processor import AsrProcessor
+        _asr_processor = AsrProcessor.from_pretrained(args.model)
+    else:
+        _asr_processor = None
     engine.observer = _ServerObserver()
     engine.reset_measurement_stats()
     engine_thread = threading.Thread(
@@ -1515,6 +1711,14 @@ def main(argv=None):
     httpd.daemon_threads = True
     _log("INFO", f"Starting OpenAI-compatible API server on http://{args.host}:{args.port}/v1")
     _log("INFO", f"Served model: {_model_name} (source={args.model})")
+    if _asr_processor is not None:
+        _log("INFO",
+             f"ASR transcription enabled: POST /v1/audio/transcriptions "
+             f"(max_tokens={_asr_max_tokens}, upload<="
+             f"{_asr_max_upload_bytes // (1024 * 1024)}MB, response_format=json|text)")
+    else:
+        _log("INFO", "ASR transcription unavailable: target model has no audio input; "
+                     "POST /v1/audio/transcriptions returns 400")
     if _ui_enabled:
         view_host = "127.0.0.1" if args.host in ("0.0.0.0", "::", "") else args.host
         _log("INFO",

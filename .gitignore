@@ -212,3 +212,4 @@ cython_debug/
 /runtime/
 /.cc-safety-net
 /.merge_tmp
+/.archify/

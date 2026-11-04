@@ -9,7 +9,7 @@ from transformers import AutoTokenizer
 import torch.multiprocessing as mp
 import torch.distributed as dist
 
-from flashengine.config import Config
+from flashengine.config import Config, collect_eos_token_ids
 from flashengine.sampling_params import SamplingParams
 from flashengine.engine.sequence import Sequence
 from flashengine.engine.scheduler import Scheduler
@@ -75,6 +75,10 @@ class LLMEngine(EngineRequests):
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         tokenizer_load_s = perf_counter() - tokenizer_t0
         config.eos = self.tokenizer.eos_token_id
+        # 检查点可能声明多个结束符（ASR 用 {151643, 151645}），tokenizer 只给主 eos。
+        config.eos_ids = collect_eos_token_ids(
+            config.model, config.hf_config, config.eos
+        )
         self.scheduler = Scheduler(config)
         self.scheduler.block_manager.cache_hit_validator = (
             self.model_runner.prefix_cache_validator()
@@ -341,21 +345,45 @@ class LLMEngine(EngineRequests):
         """供压测边界使用，服务每步不额外同步。"""
         self.model_runner.backend.synchronize()
 
+    def _trim_stop_tokens(self, token_ids: list[int]) -> list[int]:
+        """去掉末尾的终止 token（如 <|im_end|> / <|endoftext|>），只影响文本解码。
+
+        `completion_token_ids` 本身保留终止 token（调度与统计口径不变），仅返回文本时
+        裁剪，避免把 `<|im_end|>` 之类的特殊标记写进用户可见的转写/回答里。
+        """
+        if not token_ids:
+            return token_ids
+        stops = set(getattr(self.config, "eos_ids", ()) or ())
+        stops.add(self.config.eos)
+        end = len(token_ids)
+        while end > 0 and token_ids[end - 1] in stops:
+            end -= 1
+        return token_ids[:end] if end else token_ids
+
     def generate(
         self,
         prompts: list[str] | list[list[int]],
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
+        audio: dict | list[dict | None] | None = None,
     ) -> list[dict]:
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
         if len(sampling_params) != len(prompts):
             raise ValueError("prompts 与 sampling_params 的数量必须一致")
+        if audio is None:
+            audios = [None] * len(prompts)
+        elif isinstance(audio, dict):
+            audios = [audio] * len(prompts)
+        else:
+            audios = list(audio)
+            if len(audios) != len(prompts):
+                raise ValueError("prompts 与 audio 的数量必须一致")
         pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
         submitted = []
         try:
-            for prompt, sp in zip(prompts, sampling_params):
-                submitted.append(self.add_request(prompt, sp))
+            for prompt, sp, item_audio in zip(prompts, sampling_params, audios):
+                submitted.append(self.add_request(prompt, sp, audio=item_audio))
             outputs = {}
             prefill_throughput = decode_throughput = 0.
             while not self.is_finished():
@@ -370,7 +398,7 @@ class LLMEngine(EngineRequests):
                 for seq_id, token_ids in output:
                     outputs[seq_id] = token_ids
                     pbar.update(1)
-            return [{"text": self.tokenizer.decode(outputs[s.seq_id]),
+            return [{"text": self.tokenizer.decode(self._trim_stop_tokens(outputs[s.seq_id])),
                      "token_ids": outputs[s.seq_id]} for s in submitted]
         except Exception:
             for seq in submitted:

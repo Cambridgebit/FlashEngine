@@ -31,6 +31,12 @@ class Sequence:
         self.prefill_splitfuse_used = False
         self.prefill_prefix_recomputed = False
         self.spec_cold = True
+        # 多模态音频请求：audio = {"mel", "valid_frames", "audio_span", "num_audio_tokens"}；
+        # audio_embeds 是音频塔编码缓存（设备侧），分块 prefill 时只编码一次；
+        # 带音频的序列跳过前缀缓存——占位 token 相同但音频特征不同，命中会读到别人的 KV。
+        self.audio = None
+        self.audio_embeds = None
+        self.skip_prefix_cache = False
         # 禁词约束的自动机状态：只由已生成 token 推进，不含提示词。
         self.constraint_state = 0
         self.constraint_base_state = 0
@@ -99,3 +105,7 @@ class Sequence:
         else:
             self.token_ids = []
             self.last_token = last_state
+        # 音频仅在本 rank 数据处理；TP=1 是本能力的前置条件（config 已门控）。
+        self.audio = None
+        self.audio_embeds = None
+        self.skip_prefix_cache = False

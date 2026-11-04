@@ -9,7 +9,14 @@ class RequestCapacityError(RuntimeError):
 
 
 class EngineRequests:
-    def add_request(self, prompt, sampling_params):
+    def add_request(self, prompt, sampling_params, audio=None):
+        """登记一条请求。
+
+        audio 为多模态音频的预处理产物（`AsrProcessor.build` 的返回值去掉 input_ids），
+        字段：`mel`（[num_mel_bins, frames] 的 CPU 张量/数组）、`valid_frames`（int，
+        conv 前的有效帧数）、`audio_span`（(start, end)，占位 token 在 prompt 里的区间）、
+        `num_audio_tokens`（= end - start）。带音频的请求跳过前缀缓存。
+        """
         if getattr(self, "_closed", False):
             raise RuntimeError("引擎已关闭")
         if isinstance(prompt, str):
@@ -33,9 +40,26 @@ class EngineRequests:
             raise RequestCapacityError("单请求超出实际 KV 容量；请减少上下文或输出长度")
         if len(self.scheduler.waiting) + len(self.scheduler.running) >= self.config.max_pending_requests:
             raise RequestCapacityError("请求队列已满")
+        if audio is not None:
+            audio = self.validate_audio(audio, len(prompt))
         seq = Sequence(list(prompt), sp)
+        if audio is not None:
+            seq.audio = audio
+            # 占位 token 序列相同不代表隐层相同（音频特征不同），不能被前缀缓存复用。
+            seq.skip_prefix_cache = True
         self.scheduler.add(seq)
         return seq
+
+    @staticmethod
+    def validate_audio(audio, prompt_len: int) -> dict:
+        """规整多模态请求：audio_span 是 prompt 里 <|audio_pad|> 占位符的 [start, end)。"""
+        start, end = (int(v) for v in audio["audio_span"])
+        if not 0 <= start < end <= prompt_len:
+            raise ValueError("audio_span 必须落在 prompt 的 token 区间内")
+        normalized = dict(audio)
+        normalized["audio_span"] = (start, end)
+        normalized["num_audio_tokens"] = end - start
+        return normalized
 
     def cancel_request(self, request):
         """须与 step 在同一线程串行调用；同时释放 partial prefill 和投机状态。"""
@@ -61,7 +85,8 @@ class EngineRequests:
             raise ValueError("增量 offset 无效")
         reason = getattr(seq, "finish_reason", "")
         if seq.is_finished and not reason:
-            reason = ("stop" if not seq.ignore_eos and seq.last_token == self.config.eos else "length")
+            eos_ids = getattr(self.config, "eos_ids", ()) or (self.config.eos,)
+            reason = ("stop" if not seq.ignore_eos and seq.last_token in eos_ids else "length")
         return {"request_id": seq.seq_id,
                 "token_ids": seq.token_ids[seq.num_prompt_tokens + offset:],
                 "prompt_tokens": seq.num_prompt_tokens,

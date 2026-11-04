@@ -13,6 +13,10 @@ class Scheduler:
         self.enable_chunked_prefill = config.enable_chunked_prefill
         self.max_num_partial_prefills = config.max_num_partial_prefills
         self.eos = config.eos
+        # 多值 eos（Qwen3-ASR 有 {151643, 151645} 两个结束符）：任一命中即停。
+        self.eos_ids = frozenset(getattr(config, "eos_ids", ()) or ())
+        if not self.eos_ids and self.eos is not None and self.eos >= 0:
+            self.eos_ids = frozenset({self.eos})
         self.block_size = config.kvcache_block_size
         # 越过 max_model_len 继续写 KV / 取 token 会让注意力读到从未写入的槽位，
         self.max_model_len = config.max_model_len
@@ -239,7 +243,7 @@ class Scheduler:
 
     def _maybe_finish(self, seq: Sequence, token_id: int) -> bool:
         return (
-            (not seq.ignore_eos and token_id == self.eos)
+            (not seq.ignore_eos and token_id in self.eos_ids)
             or seq.num_completion_tokens >= seq.max_tokens
             or seq.num_tokens >= self.max_model_len   # 到上下文顶：硬停，不再越界写 KV
         )

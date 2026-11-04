@@ -16,6 +16,7 @@
 | **Qwen3 dense** | ✅ cuda / corex / ascend310p | ✅ EAGLE3 / DFlash / DSpark（三后端） | ✅ W8A8，仅 ascend310p |
 | **Qwen3 MoE**（Qwen3-30B-A3B） | ✅ cuda / corex / ascend310p | ✅ DFlash（三后端） | ✅ W8A8，仅 ascend310p |
 | **Qwen3.5 dense / MoE 文本** | ✅ cuda / corex / ascend310p | ✅ DFlash（三后端） | ❌（当前 fp16/bf16） |
+| **Qwen3-ASR**（qwen3_asr，语音转写） | ✅ cuda（已实测）/ corex / ascend310p（后两者未实测；TP=1，单条音频） | ❌（仅 none） | ❌（仅 fp16/bf16） |
 
 > Qwen3 MoE 在 cuda/corex 上走纯 torch 专家前向（`BackendBase.fused_moe`：index_select +
 > bmm，形状静态、可被 CUDA Graph 捕获）；310P 覆盖为 npu grouped matmul（含 W8A8_DYNAMIC）。
@@ -53,6 +54,17 @@
 | qwen3_5 / qwen3_5_moe | cuda / corex / ascend310p | none | none / dflash |
 | qwen3_5 / qwen3_5_moe | cuda / corex / ascend310p | w8a8 / quark_w8a8 | ❌ |
 | qwen3_5 / qwen3_5_moe | cuda / corex / ascend310p | 任意 | ❌ eagle3 / dspark |
+| qwen3_asr | cuda / corex / ascend310p | none | none |
+| qwen3_asr | 任意 | w8a8 / quark_w8a8 | ❌（ASR 未接入量化） |
+| qwen3_asr | 任意 | 任意 | ❌ eagle3 / dflash / dspark（无音频投机草稿） |
+
+Qwen3-ASR（`qwen3_asr`）是**音频输入**目标模型：prompt 由
+`flashengine/asr_processor.py` 在 CPU 上渲染（mel + `<|audio_pad|>` span），
+引擎对该请求做一次音频塔前向得到音频嵌入，再按普通文本 decode。
+约束：TP=1（`audio_input` 在 `config.py` 强制）、单请求单条音频、音频请求
+`skip_prefix_cache`（音频嵌入不能跨请求复用）、仅 fp16/bf16。一次请求的音频
+建议 ≤30s（模型窗口），超长请分块。命令行入口与 OpenAI 转写端点见
+[`docs/QWEN3_ASR.md`](QWEN3_ASR.md)。
 
 Qwen3.5 当前 TP=1、仅文本，支持完整块 KV + conv/SSM 快照的 prefix cache，
 以及保留 conv/SSM 历史的分块 prefill；DFlash 另恢复草稿 KV。
@@ -82,6 +94,10 @@ CoreX/310P MoE 仍待板卡验收。图捕获失败按既有机制回退。
      口径相同——都抽残差流，故 DFlash 草稿可直接用于 MoE 目标，`target_layer_ids + 1`）。
 4. **量化 × 投机**：二者在实现上相互独立（量化改目标前向，投机加草稿与 verify），
    故组合放行；但该组合未单独实机验证（见第 4 节）。
+5. **音频目标（`qwen3_asr`）**：`supported_spec_methods` = {none}、量化仅 none；
+   `audio_input=True` 的 adapter 使 `Config` 强制 TP=1。音频请求由调用方带
+   `audio={mel, valid_frames, audio_span, num_audio_tokens}` 提交，引擎校验
+   span/token 数后对该序列关闭前缀缓存；chat/文本请求不受影响。
 
 ## 4. 待实机验收（cuda MoE 已冒烟；corex / 310P 无硬件未运行）
 
@@ -97,6 +113,10 @@ CoreX/310P MoE 仍待板卡验收。图捕获失败按既有机制回退。
 | qwen3_moe quark_w8a8（cuda） | 已实机：`amd/tiny-qwen3-moe-w8a8-int8`（8 专家/top-2/2 层）跑通 benchmark，decode 图 100% 捕获；与 HF 用同批反量化权重贪心生成 **32/32 逐 token 全等** |
 | qwen3_moe quark_w8a8（corex） | 与 cuda 同源的加载期反量化；待 CoreX 实机 |
 | 量化 + 投机 | 组合冒烟（未单独验证） |
+| qwen3_asr 普通（cuda） | ✅ 已实测（2026-11-04，4070 8GB）：CPU processor `build()` + 音频塔 vs HF fp32 位等（max_abs_err=0.0）+ 端到端转写 asr_zh/asr_en 文本正确、**CER 0.0%/0.0%**（字符级口径）、TTFT 均值 78.8–90.8ms、RTF 聚合 0.114–0.133、TPS 聚合 22.6–26.4（eager/mml1024/ms1/bf16）；非 eager 稳态 zh RTF 0.0588 / en 0.0522。细节见 [`docs/QWEN3_ASR.md`](QWEN3_ASR.md) §4.1 |
+| qwen3_asr 普通（corex） | ❌ 未在真机验证（用户已确认本轮 CoreX 不可用，只加代码路径：音频塔纯 torch、无特定 attention 依赖、无新依赖；等机器可用时按 `--backend corex` 跑同一条 `scripts.asr_benchmark`） |
+| qwen3_asr 普通（310P） | ❌ 未在真机验证（用户已确认本轮 310P 不可用，只加代码路径；310P 硬约束照旧适用：fp16、block{64,128}、TP=1） |
+| qwen3_asr server `/v1/audio/transcriptions` | ✅ 已实测（CUDA）：multipart 单测 + curl json/text/语言自动检测/401 鉴权/非 ASR 模型 400；`flashengine_transcription_requests_total 3`、`errors 0`、`audio_seconds_total 23.459125`；chat 路径不受影响 |
 
 ## 5. 使用示例
 
@@ -123,6 +143,11 @@ python3 -m scripts.benchmark /models/Qwen3-30B-A3B-W8A8 --backend ascend310p ...
 # INT8 Quark W8A8 检查点（cuda/corex：config.json quant_method=quark 即自动识别，加载期反量化）
 python3 -m scripts.benchmark /models/tiny-qwen3-moe-w8a8-int8 --backend cuda \
   --max-model-len 2048 --max-num-seqs 4
+
+
+# Qwen3-ASR 语音转写（TP=1、单条音频、仅 none 投机/量化）
+python3 -m scripts.asr_benchmark /models/Qwen3-1.7B-ASR --backend cuda \\
+  --wav-dir bench_data/asr --reference-jsonl bench_data/asr/reference.jsonl
 
 # Qwen3 MoE + DFlash（310P）
 python3 -m scripts.benchmark /models/Qwen3-30B-A3B --backend ascend310p \

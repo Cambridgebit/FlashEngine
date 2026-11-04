@@ -832,6 +832,22 @@ class ModelRunner:
         buf[i, :len(table)] = torch.tensor(table, dtype=torch.int64)
         buf[i, len(table):] = pad
 
+    def _audio_embeds_for(self, seq: Sequence) -> torch.Tensor:
+        """编码本序列的音频并缓存在 seq 上：分块 prefill / 抢占重算只编码一次。"""
+        cached = getattr(seq, "audio_embeds", None)
+        if cached is not None:
+            return cached
+        encoder = getattr(self.model, "encode_audio", None)
+        if encoder is None:
+            raise RuntimeError("当前模型不支持音频输入，但请求携带了 audio")
+        mel = seq.audio["mel"]
+        if not torch.is_tensor(mel):
+            mel = torch.as_tensor(mel)
+        mel = mel.to(device=self.device, dtype=self.dtype).contiguous()
+        with torch.inference_mode():
+            seq.audio_embeds = encoder(mel, int(seq.audio["valid_frames"]))
+        return seq.audio_embeds
+
     def prepare_prefill(self, seqs: list[Sequence]):
         input_ids = []
         positions = []
@@ -841,11 +857,28 @@ class ModelRunner:
         max_seqlen_k = 0
         slot_mapping = []
         block_tables = None
+        # 多模态：把各序列音频区间与本步 query 区间求交，压平成「扁平批行号 → 音频隐层」。
+        audio_embeds = None
+        audio_slots: list[int] = []
+        flat_offset = 0
         for seq in seqs:
             start = seq.num_cached_tokens
             seqlen_q = seq.num_scheduled_tokens
             end = start + seqlen_q
             seqlen_k = end
+            if getattr(seq, "audio", None) is not None:
+                embeds = self._audio_embeds_for(seq)
+                audio_start, audio_end = seq.audio["audio_span"]
+                lo = max(start, audio_start)
+                hi = min(end, audio_end)
+                if hi > lo:
+                    if audio_embeds is None:
+                        audio_embeds = []
+                    audio_embeds.append(embeds[lo - audio_start:hi - audio_start])
+                    audio_slots.extend(
+                        range(flat_offset + (lo - start), flat_offset + (hi - start))
+                    )
+            flat_offset += seqlen_q
             input_ids.extend(seq[start:end])
             positions.extend(range(start, end))
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
@@ -922,6 +955,14 @@ class ModelRunner:
             prefix_reused_tokens=prefix_reused_tokens,
             prefix_recomputed=prefix_recomputed,
         )
+        if audio_embeds:
+            audio_embeds = torch.cat(audio_embeds, dim=0)
+            audio_slots = torch.tensor(
+                audio_slots, dtype=torch.int64, device="cpu", pin_memory=True
+            ).to(self.device, non_blocking=True)
+            self._prefill_audio = (audio_embeds, audio_slots)
+        else:
+            self._prefill_audio = None
         if self.state_runtime:
             self.state_runtime.bind_prefill(get_context(), seqs)
         return input_ids, positions
@@ -1051,19 +1092,39 @@ class ModelRunner:
                     blob.f32[M:M + n].to(self.device, non_blocking=True),
                     blob.i64[off:off + n].to(self.device, non_blocking=True))
 
+    def _model_forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        audio_embeds: torch.Tensor | None = None,
+        audio_slots: torch.Tensor | None = None,
+    ):
+        """统一前向入口：无音频时与原签名完全一致，不改变既有模型调用路径。"""
+        if audio_embeds is None:
+            return self.model(input_ids, positions)
+        return self.model(
+            input_ids, positions, audio_embeds=audio_embeds, audio_slots=audio_slots
+        )
+
     @torch.inference_mode()
     def run_model(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         is_prefill: bool,
+        audio_embeds: torch.Tensor | None = None,
+        audio_slots: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, bool]:
         if is_prefill or self.enforce_eager or input_ids.size(0) > self._graph_max_bs:
-            return self.model.compute_logits(self.model(input_ids, positions)), False
+            return self.model.compute_logits(
+                self._model_forward(input_ids, positions, audio_embeds, audio_slots)
+            ), False
         if self.graphs is None:    # 捕获失败降级：decode 全部走 eager 前向
             if self.graph_capture_attempted:
                 self.decode_graph_stats["fallback"] += 1
-            return self.model.compute_logits(self.model(input_ids, positions)), False
+            return self.model.compute_logits(
+                self._model_forward(input_ids, positions, audio_embeds, audio_slots)
+            ), False
 
         bs = input_ids.size(0)
         gv = self.graph_vars
@@ -1071,10 +1132,14 @@ class ModelRunner:
         graph_bs = _bucket(self.graph_bs, bs)
         if graph_bs is None:
             self.decode_graph_stats["fallback"] += 1
-            return self.model.compute_logits(self.model(input_ids, positions)), False
+            return self.model.compute_logits(
+                self._model_forward(input_ids, positions, audio_embeds, audio_slots)
+            ), False
         if input_ids.data_ptr() != gv["input_ids"].data_ptr():
             self.decode_graph_stats["fallback"] += 1
-            return self.model.compute_logits(self.model(input_ids, positions)), False
+            return self.model.compute_logits(
+                self._model_forward(input_ids, positions, audio_embeds, audio_slots)
+            ), False
 
         self._dblob.h2d()
         greedy = self._decode_batch_greedy and graph_bs in self.decode_greedy_graphs
@@ -1107,12 +1172,20 @@ class ModelRunner:
                     token_ids = None
                 reset_context()
                 return token_ids
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        audio_embeds = audio_slots = None
+        if is_prefill:
+            input_ids, positions = self.prepare_prefill(seqs)
+            audio_embeds, audio_slots = getattr(self, "_prefill_audio", None) or (None, None)
+        else:
+            input_ids, positions = self.prepare_decode(seqs)
         # 纯 greedy 批无需采样参数（图内采样仍需要，故 graph_sample 保留准备）。
         needs_sample = self.graph_sample or any(seq.temperature > 1e-10 for seq in seqs)
         sample = (self.prepare_sample(seqs, is_prefill)
                   if self.rank == 0 and needs_sample else None)
-        result, sampled = self.run_model(input_ids, positions, is_prefill)
+        result, sampled = self.run_model(
+            input_ids, positions, is_prefill,
+            audio_embeds=audio_embeds, audio_slots=audio_slots,
+        )
         if sampled and self.config.enable_constraints:
             raise RuntimeError("图执行器返回了未经约束掩码处理的 token")
         if is_prefill:
