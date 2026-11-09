@@ -153,6 +153,14 @@ class ModelRunner:
         self.event = event
         self.backend = config.backend_impl
         self.dflash_paged = config.use_paged_draft
+        # NARROW_CTX_CANDIDATE: 块草稿稠密路径的窄列宽整轮图（默认开，=0 关闭）。
+        self._df_narrow_ctx = 0
+        self._df_ctx_active = None
+        self._df_replay_narrow = False
+        self._df_narrow_pools = {}
+        if (config.spec_is_block_draft and not config.use_paged_draft
+                and os.environ.get("FLASHENGINE_DFLASH_NARROW_CTX", "1") != "0"):
+            self._df_narrow_ctx = min(256, int(config.max_model_len))
         self.paged_context_attn = self.backend.supports_paged_context_attn
         draft_rows = (
             config.spec_num_tokens
@@ -773,7 +781,9 @@ class ModelRunner:
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
         )
-        self.kv_cache = torch.empty(shape)
+        # 按后端能力要求初始化 KV 池，避免未初始化内容造成数值异常。
+        alloc_kv = torch.zeros if self.backend.zero_init_kv_cache else torch.empty
+        self.kv_cache = alloc_kv(shape)
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
@@ -791,7 +801,7 @@ class ModelRunner:
                 num_kv_heads=draft_kv_heads,
                 head_dim=draft_head_dim,
             )
-            self.draft_kv_cache = torch.empty(draft_shape)
+            self.draft_kv_cache = alloc_kv(draft_shape)
             attn = self.draft_model.midlayer.self_attn.attn
             attn.k_cache = self.draft_kv_cache[0, 0]
             attn.v_cache = self.draft_kv_cache[1, 0]
@@ -1598,6 +1608,7 @@ class ModelRunner:
     def _df_round_eager(self, seqs: list[Sequence]) -> list[list[int]]:
         if not seqs:
             return []
+        self._df_ctx_active = None
         self.spec_graph_stats['eager_rounds'] += 1
         size = self._fill_spec_meta(seqs)
         self._fill_df_meta(seqs)
@@ -1696,7 +1707,7 @@ class ModelRunner:
         logits = self.draft_model.forward_block(
             g['chain_tokens'][:bs], block_pos,
             blob.device_view_i64('df_ctxslot')[:bs], l1,
-            self.config.max_model_len, query_rows,
+            self._df_ctx_active or self.config.max_model_len, query_rows,
             query_slots=query_slots,
             block_tables=(g['v_btables'][:bs] if self.dflash_paged else None),
             total_lens=(g['df_total_lens'][:bs]
@@ -1758,6 +1769,27 @@ class ModelRunner:
                 graph.replay()
                 self.backend.synchronize()
                 self.spec_graph_stats["capture_success"] += 1
+            # NARROW_CTX_CANDIDATE: 窄列宽整轮图，独立 graph pool，按 bs 各一张。
+            if self._df_narrow_ctx:
+                self._df_ctx_active = self._df_narrow_ctx
+                for bs in reversed(self.spec_graph_bs):
+                    for _ in range(self.backend.graph_warmup_iters()):
+                        body(bs)
+                        reset_context()
+                        self.backend.synchronize()
+                    graph = self.backend.new_graph()
+                    pool = self._df_narrow_pools.get(bs)
+                    with self.backend.graph_ctx(graph, pool=pool):
+                        body(bs)
+                    if pool is None:
+                        self._df_narrow_pools[bs] = self.backend.graph_pool(graph)
+                    self.spec_graphs[(bs, 'narrow')] = graph
+                    reset_context()
+                    self._push_spec_meta()
+                    graph.replay()
+                    self.backend.synchronize()
+                    self.spec_graph_stats['capture_success'] += 1
+                self._df_ctx_active = None
             # 保留原随机采样图；另捕获纯 argmax 图，不在 replay 中读取设备标量。
             if (self.graph_sample and self.backend.supports_greedy_graph_variants
                     and os.getenv("FLASHENGINE_SPEC_GREEDY_GRAPH", "1") != "0"):
@@ -1867,9 +1899,13 @@ class ModelRunner:
     def _replay_spec_graph(self, bucket: int):
         self._spec_graph_active = bucket
         self._push_spec_meta()
-        greedy = self._spec_batch_greedy and bucket in self.spec_greedy_graphs
+        # NARROW_CTX_CANDIDATE: 短上下文优先用窄列宽图。
+        narrow = (self._df_replay_narrow
+                  and (bucket, 'narrow') in self.spec_graphs)
+        greedy = (self._spec_batch_greedy and not narrow
+                  and bucket in self.spec_greedy_graphs)
         graphs = self.spec_greedy_graphs if greedy else self.spec_graphs
-        graphs[bucket].replay()
+        graphs[(bucket, 'narrow') if narrow else bucket].replay()
         if greedy:
             self.spec_graph_stats["greedy_replays"] += 1
         self.spec_graph_stats["replay"] += 1
@@ -1878,6 +1914,10 @@ class ModelRunner:
 
     @torch.inference_mode()
     def _df_round_graph(self, seqs: list[Sequence], bucket: int) -> list[list[int]]:
+        # NARROW_CTX_CANDIDATE: 本批最长序列放得进窄桶才用窄图。
+        self._df_replay_narrow = bool(
+            self._df_narrow_ctx and max(len(seq) for seq in seqs) <= self._df_narrow_ctx)
+        self._df_ctx_active = self._df_narrow_ctx if self._df_replay_narrow else None
         n = self._fill_spec_meta(seqs)
         self._fill_df_meta(seqs)
         self._reset_spec_padding(n, bucket, True)

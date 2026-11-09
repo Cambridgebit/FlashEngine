@@ -45,6 +45,8 @@
   decode 收益显著；w8a8 暂不支持投机（E≈1.0，见已知问题）
 
 **Qwen3.5 系（GDN 线性注意力）**
+- **2026-10-30 复测（含草稿注意力窄列宽优化）见下方专节**：4B 最优 k=7 为 **34.6 tok/s**（2.18×），
+  9B 最优 k=10 为 **24.9 tok/s**（2.62×）；下表为 10-16 基线，保留作对照。
 - 4B：15.8 → +DFlash(k7) **32.8**（2.08×，E=4.283）；注：10-15 分页草稿路径时代为 36.8，
   滑窗草稿语义修正后走稠密掩码路径（-11%）
 - 9B：9.5 → +DFlash(k15) **22.5**（2.37×，**E=5.100** 为 Qwen3.5 系最高）
@@ -114,6 +116,74 @@
 
 **判读提醒**：`configs/*.json` 里的 `model` 是占位路径 `/models/qwen3-8b`，板卡实际模型在
 `/data`，**必须用 `--model /data/Qwen3-8B` 覆盖**（`config` 子命令只回显不校验路径）。
+
+## Qwen3.5 系列全量复测（2026-10-30，含草稿注意力窄列宽优化）
+
+本轮把「草稿注意力按实际上下文缩窄列宽」合入 `flashengine/engine/model_runner.py`
+（默认开，`FLASHENGINE_DFLASH_NARROW_CTX=0` 关闭），并按上表同口径重测 Qwen3.5-4B / 9B 的
+普通解码与 DFlash 各档草稿长度。板卡 `/data2/FlashEngine_integrated` 的
+`model_runner.py` 与本地合入文件 SHA-256 一致（`dc7ae2de…`）。
+
+口径：310P / `vllm018` / t5 venv（transformers 5.16、`FLASHENGINE_VLLM_GEMM=0`）、
+`scripts.benchmark` 3 题（seed=0 洗牌）、64 token/题、warmup 1、贪心、think-off、
+无前缀缓存、`--max-model-len 2048 --max-num-seqs 1 --gpu-mem-util 0.5`。
+指标同前：稳态解码 TPS（排除 TTFT/prefill）、E、TTFT、TPOT、agg = 含 prefill 的输出吞吐。
+
+### Qwen3.5-4B（普通 + DFlash 全 k 扫描）
+
+| 模式 | 稳态 TPS | 加速比 | E | TTFT med (ms) | TTFT mean (ms) | TPOT med (ms) | agg TPS |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 普通 decode | 15.9 | 1× | — | 759 | 758 | 63.0 | 13.5 |
+| DFlash k=2 | 25.5 | 1.60× | 2.595 | 785 | 784 | 39.7 | 19.6 |
+| DFlash k=5 | 33.1 | 2.08× | 3.863 | 769 | 766 | 28.4 | 23.9 |
+| **DFlash k=7** | **34.6** | **2.18×** | 4.283 | 790 | 787 | 30.2 | 24.5 |
+| DFlash k=10 | 32.9 | 2.07× | 4.545 | 778 | 776 | 33.1 | 23.7 |
+| DFlash k=15 | 29.5 | 1.86× | 4.767 | 781 | 784 | 37.8 | 21.9 |
+
+### Qwen3.5-9B（普通 + DFlash 全 k 扫描）
+
+| 模式 | 稳态 TPS | 加速比 | E | TTFT med (ms) | TTFT mean (ms) | TPOT med (ms) | agg TPS |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 普通 decode | 9.5 | 1× | — | 773 | 774 | 105.6 | 8.6 |
+| DFlash k=2 | 17.0 | 1.79× | 2.694 | 792 | 794 | 61.3 | 14.2 |
+| DFlash k=5 | 23.8 | 2.51× | 4.021 | 775 | 774 | 44.7 | 18.7 |
+| DFlash k=7 | 23.7 | 2.49× | 4.370 | 796 | 798 | 44.1 | 18.5 |
+| **DFlash k=10** | **24.9** | **2.62×** | 5.000 | 832 | 830 | 41.1 | 19.0 |
+| DFlash k=15 | 23.1 | 2.43× | 5.100 | 854 | 853 | 45.6 | 17.8 |
+
+### 结论与判读
+
+- **甜点 k 因模型而异**：4B 仍是 k=7 最快（34.6，2.18×），与历史一致；**9B 在本负载下
+  k=10 最快（24.9，2.62×）**，k=15 只有 23.1。E 随 k 单调上升（9B k15 的 E=5.100 最高），
+  但每轮验证成本上升更快，E 最高不等于吞吐最高。业务上线应按自身负载扫 k。
+- 全部 12 组均为 `captures_ok=2`、`replay_rate=100%`、`eager_rounds=0`、`sampling_fallbacks=0`：
+  `captures_ok=2` 是窄列宽优化多捕获的一张 256 列图，短序列走它、长序列回落整宽图。
+- **与 2026-10-16 表对比**：4B +DFlash(k7) 32.8 → **34.6**（+5.5%）；9B +DFlash(k15)
+  22.5 → **23.1**（+2.7%）。差异与 `docs/QWEN35_OPT.md` 里三组配对 A/B 的中位 +5.5% 一致，
+  9B 绝对增量小于 4B，因为其每轮时间更多被权重读取占据。
+- TTFT 仍在 759–854 ms：本轮改动只影响 DFlash 轮内的草稿注意力，**不改善 GDN 预填充**，
+  TTFT 由 `chunk_gated_delta_rule` 参考路径主导（见 `docs/QWEN35_OPT.md`）。
+- **为什么 Qwen3.5 的 DFlash 加速比低于 Qwen3 系**（3.45× vs 2.2–2.6×）：主因是 GDN 多行验证
+  必须逐行推进递归状态、状态读写随行数线性增长；310P 缺融合行核与窗口草稿注意力进一步放大。
+  分解与公开证据见 [`QWEN35_OPT.md`](QWEN35_OPT.md#为什么-qwen35-的-dflash-加速比低于-qwen3架构-vs-310p)。
+- 边界：单序列、无前缀缓存、64 token 输出；窄列宽只对 ≤256 token 的序列生效（更长序列回落，
+  无收益也不受损）；同会话内重复测量有约 ±1% 波动，跨会话数字不宜直接比较。
+  板卡上**没有 Qwen3.5 MoE 检查点**，因此本表不含 Qwen3.5 MoE；Qwen3 系（8B/30B/Coder）
+  与量化结果见上表，本轮未重测。
+
+复现（板卡容器内）：
+
+```bash
+cd /data2/FlashEngine_integrated
+bash /data2/fe_py_t5.sh -m scripts.benchmark /data/Qwen3.5-4B \
+  --backend ascend310p --no-think --gpu-mem-util 0.5 --max-model-len 2048 \
+  --max-num-seqs 1 --warmup 1 --num-prompts 3 --max-tokens 64 \
+  --questions bench_data/question.jsonl --no-prefix-cache \
+  --spec-model /data/Qwen3.5-4B-Dflash --spec-num-tokens 7
+```
+
+9B 把模型/草稿换成 `/data/Qwen3.5-9B`、`/data/Qwen3.5-9B-DFlash`，`--spec-num-tokens` 取 2/5/7/10/15。
+原始日志：板卡 `/data2/q35opt/full_matrix/{4b,9b}_{base,k2,k5,k7,k10,k15}.log`。
 
 **同步方式与完整性**：板卡仓库（`/data2/FlashEngine`）的 `main` 与本机 `main` 是两条独立提交
 谱系（板卡 HEAD `ce94022`「Qwen3.5 及 DFlash 前缀缓存」，无本地 `ea3543f` 对象），但两条谱系

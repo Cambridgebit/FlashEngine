@@ -213,3 +213,6 @@ cython_debug/
 /.cc-safety-net
 /.merge_tmp
 /.archify/
+/scratch/
+/.dsh-ssh/
+board.sh

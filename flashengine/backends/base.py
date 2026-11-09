@@ -41,6 +41,8 @@ class BackendBase(ABC):
     supports_dflash_dense_varlen = False
     supports_async_prefix_snapshots = False
     spec_graph_try_default = True
+    # 后端是否需要零初始化 KV 池；避免未初始化内容引发设备算子的数值问题。
+    zero_init_kv_cache = False
 
     def normalize_config(self, config) -> None:
         # flash-attn 类算子仅支持 fp16/bf16：fp32 检查点自动降 bf16（加载期转换），
