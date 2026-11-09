@@ -249,24 +249,69 @@ curl -s -H "Authorization: Bearer sk-test" http://127.0.0.1:8000/v1/audio/transc
 OOM 时依次降 `--gpu-mem-util 0.8`、加 `--eager`、`--batch-size 1`。桌面/WSL 显存波动
 导致 KV 块数漂移属预期（本次 eager 配置 KV 55×256、非 eager 46×256）。
 
-### 4.2 Ascend 310P——**代码路径已具备，未在真机验证**
+### 4.2 Ascend 310P——✅ 已实测（2026-11-09，Atlas 300I Duo / 容器 vllm018）
 
-用户已明确 **310P 与 CoreX 当前都不可用**，本轮只保证代码路径齐全、不做真机验收；
-因此本节不给任何主机名/路径占位，也不声称已跑过。就代码而言：
+前置：容器 `vllm018`（`vllm-ascend:dev-26.0.0.poc…300I-Duo-py311`）内先
+`source /usr/local/Ascend/ascend-toolkit/set_env.sh`；venv 为 `/data2/fe-t5-venv`
+（transformers 5.16），`HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 FLASHENGINE_VLLM_GEMM=0`。
+模型在 `/data/Qwen3-1.7B-ASR`（bf16 checkpoint，引擎加载期转 fp16）。
 
-- `qwen3_asr` 的音频塔是**纯 torch 前向**（不调用 NPU 专用算子），mel/prompt 由 CPU 侧
-  `asr_processor` 生成；引擎侧每请求一次音频塔前向 + 普通文本 decode，与后端无关。
-- 整条链路不依赖 flash-attn / ixformer / SDPA 等特定 attention 实现，也没有新增第三方
-  依赖（asr_processor 顶层只 import numpy）；后端差异全部走既有能力位。
-- 310P 的既有硬约束照旧适用于该请求：仅 fp16；`kvcache_block_size` 只接受 {64,128}
-  （脚本默认 256，后端 `normalize_config` 会覆盖并打印）；TP=1；显存按 util 贴地分配，
-  需要给图捕获留余量。
-- ASR 无投机、无量化，不需要 `--spec-model` / W8A8 相关参数；前缀缓存对该请求被
-  `skip_prefix_cache` 关闭，因此不依赖 SplitFuse 前缀命中路径。
-- 机器可用时直接跑同一条 `scripts.asr_benchmark`（模型目录换 Qwen3-ASR、加
-  `--backend ascend310p` 和 `--wav`，其余参数不变）；**本轮未执行**。
+```bash
+cd /data2/FlashEngine
+/data2/fe-t5-venv/bin/python3 -B -u -m scripts.asr_benchmark /data/Qwen3-1.7B-ASR \
+  --backend ascend310p --gpu-mem-util 0.3 --max-model-len 2048 \
+  --wav bench_data/asr/asr_en.wav bench_data/asr/asr_zh.wav
+```
 
-**状态：未在真机验证**（用户已确认本轮 310P/CoreX 都不可用，只加代码路径；文档不填未产生过的数字）。
+实测（`max_model_len=2048` / `max_num_seqs=1` / fp16 / GEMM=torch-fallback；`--backend auto`
+同样解析为 ascend310p）：
+
+| 模式 | TTFT mean/p95 | 单条墙钟（en/zh） | RTF 聚合 | TPS 聚合 | 转写 | CER |
+|---|---|---|---|---|---|---|
+| `--eager` | 185.9 / 194.9 ms | 3.965 s / 0.970 s | 0.2563 | 11.75 | 两条均正确 | **0.0% / 0.0%** |
+| 图（默认） | 185.7 / 196.5 ms | 1.297 s / 0.402 s | **0.0882** | **34.15** | 两条均正确 | **0.0% / 0.0%** |
+
+- 图路径收益明显（RTF 0.2563→0.0882，TPS 11.75→34.15）：310P 上 eager 的逐算子 launch 税占主导，
+  与文本模型结论一致；`Graph: decode_graph buckets=(1,)`、图捕获 0.504 s、Engine ready 17.35 s。
+- 逐条：eager en TTFT 195.8 ms / RTF 0.2635 / TPS 12.10，zh TTFT 175.9 ms / RTF 0.2308 / TPS 10.31；
+  图模式 en TTFT 197.7 ms / RTF 0.0862 / TPS 37.01，zh TTFT 173.6 ms / RTF 0.0955 / TPS 24.90。
+- 转写文本与 CUDA 验收逐字一致（en 的 `social`/`solo` 等与参考只差逗号→句号，归一化后 CER=0）。
+- **音频塔是整条链路最慢的一段**：两条请求 TTFT 都在 ~175–198 ms，而 CUDA 4070 是 78.8–96.0 ms；
+  音频塔为纯 torch（无 NPU 融合算子），310P 上已是全局瓶颈，但只付一次、不进 decode 稳态。
+
+服务端同一模型：
+
+```bash
+/data2/fe-t5-venv/bin/python3 -B -u -m scripts.openai_server /data/Qwen3-1.7B-ASR \
+  --backend ascend310p --gpu-mem-util 0.3 --max-model-len 2048 \
+  --port 8011 --api-key sk-test --no-ui &
+curl -s -H "Authorization: Bearer sk-test" http://127.0.0.1:8011/v1/audio/transcriptions \
+  -F file=@bench_data/asr/asr_zh.wav -F model=/data/Qwen3-1.7B-ASR
+```
+
+实测：json 返回 `{"text": "甚至出现交易几乎停滞的情况。"}`；`response_format=text` 返回英文正文；
+无鉴权 401；`/metrics` 记 `transcription_requests_total 2`、`errors_total 0`、
+`audio_seconds_total 19.255`。启动到可服务 41 s（含权重加载与图捕获）。
+
+#### 310P 上必须修的三个点（已在引擎侧修掉，勿回退）
+
+1. **`torch.tensor` 整数算子在构建期落到 NPU**：`feat_extract_output_lengths` 与
+   `Qwen3ASRAudioEncoder.__init__` 原先用 `_post_cnn_length(torch.tensor([chunk_len]))[0].item()`
+   求 `time_steps`。引擎建模型时默认设备已是 NPU，该整数 `FloorDiv` 走 **AICPU**，
+   在 310P 旧驱动上直接 `aicpu exception` → `507018`，且**流被污染**导致后续所有初始化失败。
+   现改为纯 Python `(chunk_len + 7) // 8`（= 三次 `(L-1)//2+1` 的闭式解，已逐值验证
+   0–2000 帧与原实现 `torch.equal` 全等）。
+2. **NPU 侧随机初始化必崩**：音频塔/投影的 `nn.Linear`、`nn.Conv2d` 默认 `reset_parameters`
+   在 NPU 上走 `aclnnInplaceUniform`（同一 AICPU 路径）→ 构建即报错。现在音频塔与多模态投影
+   在 `with torch.device("cpu")` 里构造、再 `.to(torch.get_default_device())`，权重随后由
+   checkpoint 覆盖（与 `qwen3_5.py` 的 conv1d、dspark 草稿的「CPU 建权重」同款模式）。
+3. **长度类整数运算留在主机侧**：`input_features_mask` 在 `forward` 里先转 CPU int64 再
+   求 `feature_lens`/`chunk_lengths`/`cu_seqlens`（这些只用于窗口切分与 host 侧索引构造），
+   避免 310P 上再出现整数算子落 AICPU。卷积/注意力本身仍在设备上。
+
+其余 310P 硬约束照旧：仅 fp16；`kvcache_block_size` 由 256 覆盖为 128；TP=1；显存按 util
+贴地分配（本轮 `--gpu-mem-util 0.3`，KV 460–479×128 token）。ASR 无投机、无量化，前缀缓存
+对该请求由 `skip_prefix_cache` 关闭，不依赖 SplitFuse 前缀命中路径。
 
 ### 4.3 CoreX（Iluvatar）——**代码路径已具备，未在真机验证**
 
@@ -329,7 +374,7 @@ OOM 时依次降 `--gpu-mem-util 0.8`、加 `--eager`、`--batch-size 1`。桌�
 | CPU processor `build()`（asr_en/asr_zh） | ✅ 已自测 | prompt/span/num_tokens/mel 形状与 pad run 均符合契约（2026-11-04） |
 | CUDA 端到端转写（asr_en/asr_zh） | ✅ 已实测 | 2026-11-04 本机 4070 8GB：TTFT mean 78.8–96.0ms、RTF 聚合 0.114–0.141、TPS 聚合 21.4–26.4、**CER 0.0%/0.0%（mean/corpus）**；数字与口径见 §4.1 |
 | CUDA server `/v1/audio/transcriptions` curl | ✅ 已实测 | json/text/自动检测/401 鉴权/非 ASR 模型 400 全通过；`flashengine_transcription_requests_total 3`、`errors 0`、`audio_seconds_total 23.459125` |
-| Ascend 310P | ❌ 未在真机验证 | 代码路径已具备（纯 torch 音频塔 + 通用引擎路径）；310P/CoreX 本轮不可用，未产生任何真机数字 |
+| Ascend 310P | ✅ 已实测（2026-11-09） | 容器 vllm018 / Atlas 300I Duo / fp16：eager 与图两种模式转写均正确、**CER 0.0%/0.0%**；图模式 RTF 0.088 / TPS 34.15、eager RTF 0.256 / TPS 11.75；server `/v1/audio/transcriptions` json/text/401/metrics 全通过。本轮修掉 3 个 310P 专属构建期问题（整数算子落 AICPU、NPU 侧随机初始化、长度运算留主机），见 §4.2 |
 | CoreX | ❌ 未在真机验证 | 代码路径已具备（同上）；无 CoreX 机器，未产生任何真机数字 |
 
 详细设计（processor 契约、引擎集成点、分工）见

@@ -115,8 +115,8 @@ CoreX/310P MoE 仍待板卡验收。图捕获失败按既有机制回退。
 | 量化 + 投机 | 组合冒烟（未单独验证） |
 | qwen3_asr 普通（cuda） | ✅ 已实测（2026-11-04，4070 8GB）：CPU processor `build()` + 音频塔 vs HF fp32 位等（max_abs_err=0.0）+ 端到端转写 asr_zh/asr_en 文本正确、**CER 0.0%/0.0%**（字符级口径）、TTFT 均值 78.8–90.8ms、RTF 聚合 0.114–0.133、TPS 聚合 22.6–26.4（eager/mml1024/ms1/bf16）；非 eager 稳态 zh RTF 0.0588 / en 0.0522。细节见 [`docs/QWEN3_ASR.md`](QWEN3_ASR.md) §4.1 |
 | qwen3_asr 普通（corex） | ❌ 未在真机验证（用户已确认本轮 CoreX 不可用，只加代码路径：音频塔纯 torch、无特定 attention 依赖、无新依赖；等机器可用时按 `--backend corex` 跑同一条 `scripts.asr_benchmark`） |
-| qwen3_asr 普通（310P） | ❌ 未在真机验证（用户已确认本轮 310P 不可用，只加代码路径；310P 硬约束照旧适用：fp16、block{64,128}、TP=1） |
-| qwen3_asr server `/v1/audio/transcriptions` | ✅ 已实测（CUDA）：multipart 单测 + curl json/text/语言自动检测/401 鉴权/非 ASR 模型 400；`flashengine_transcription_requests_total 3`、`errors 0`、`audio_seconds_total 23.459125`；chat 路径不受影响 |
+| qwen3_asr 普通（310P） | ✅ 已实测（2026-11-09，容器 vllm018 / Atlas 300I Duo / fp16）：eager 与 NPUGraph 两模式转写均正确、**CER 0.0%/0.0%**；图模式 RTF 聚合 0.0882 / TPS 聚合 34.15、eager 0.2563 / 11.75（mml2048/ms1/GEME=torch-fallback）；server `/v1/audio/transcriptions` json/text/401/metrics 全通过。修掉 3 个构建期 AICPU 问题（整数 FloorDiv、NPU 侧随机初始化、长度运算留主机）。细节见 [`docs/QWEN3_ASR.md`](QWEN3_ASR.md) §4.2 |
+| qwen3_asr server `/v1/audio/transcriptions` | ✅ 已实测（CUDA + 310P 2026-11-09）：multipart 单测 + curl json/text/语言自动检测/401 鉴权/非 ASR 模型 400；CUDA `flashengine_transcription_requests_total 3`、`errors 0`、`audio_seconds_total 23.459125`，310P `requests 2`、`errors 0`、`audio_seconds_total 19.255`；chat 路径不受影响 |
 
 ## 5. 使用示例
 

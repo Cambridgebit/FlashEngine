@@ -170,12 +170,18 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
        listening to him. But and his solo music didn't do overly well. ...`
    - 分块 prefill（`max_num_batched_tokens=64`，prompt 被切成多块）/ 同批多音频 / 音频与纯文本
      混批三种路径均与单块结果一致（见 §4.5）。
-3. **三后端**：用户已确认 310P 与 CoreX 机器当前都不可用，本轮**只交付代码路径**。
+3. **三后端**：初版（2026-11-04）只有 CUDA 真机，310P/CoreX 仅交付代码路径；
+   **310P 已于 2026-11-09 补测通过**（见下），CoreX 仍无机器。
    - `cuda`：本机 4070 端到端实测通过（上述数字）。
-   - `ascend310p` / `corex`：音频塔为纯 torch 算子（显式 matmul+softmax，**不用**
-     `F.scaled_dot_product_attention`、不依赖 flash-attn / ixformer / triton），权重加载与
-     `index_copy` 走通用路径，因此代码在两条后端上应当可跑，但**未在任何真机验证**；
-     `docs/SUPPORT_MATRIX.md` 与 `docs/QWEN3_ASR.md` 必须保持"未验证"标注。
+   - `ascend310p`：✅ 已实测（容器 vllm018 / Atlas 300I Duo / fp16）——eager 与 NPUGraph
+     两模式转写均正确、CER 0.0%/0.0%，图模式 RTF 0.0882 / TPS 34.15。构建期需避开
+     310P 的 AICPU 陷阱（整数 `FloorDiv`、`uniform_`/`kaiming` 随机初始化在 NPU 上会
+     `aicpu exception` 并污染流），已在 `qwen3_asr.py` 内修掉：`time_steps` 改闭式常量、
+     音频塔/投影在 CPU 构造后搬设备、长度类 int 运算留主机。数字与命令见
+     [`docs/QWEN3_ASR.md`](QWEN3_ASR.md) §4.2。
+   - `corex`：音频塔为纯 torch 算子（显式 matmul+softmax，**不用** `F.scaled_dot_product_attention`、
+     不依赖 flash-attn / ixformer / triton），权重加载与 `index_copy` 走通用路径，因此代码应当可跑，
+     但**仍未在真机验证**；`docs/SUPPORT_MATRIX.md` 里 CoreX 行保持"未验证"标注。
 4. **纯文本回归**：Qwen3-1.7B 文本模型 smoke 通过（`'我叫李明，是某大学的计算机专业学生…'`，
    `eos_ids=(151645,151643)`），ASR 改动对纯文本路径零影响（`_model_forward` 无音频时按原签名调用）。
 5. **分块/批量回归**（`C:\Users\yjq040828\AppData\Local\Temp\fe_asr_chunk.py`，单进程一次启动，

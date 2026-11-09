@@ -204,7 +204,7 @@ def feat_extract_output_lengths(input_lengths: torch.Tensor, n_window: int = 50)
     其中 `time_steps` = 100 帧经三次 stride-2 conv 后的长度（=13）。
     """
     chunk_len = n_window * 2
-    extra = _post_cnn_length(torch.tensor([chunk_len]))[0].item()
+    extra = (chunk_len + 7) // 8
     input_lengths_leave = input_lengths % chunk_len
     feat_lengths = (input_lengths_leave - 1) // 2 + 1
     return ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // chunk_len) * extra
@@ -228,7 +228,7 @@ class Qwen3ASRAudioEncoder(nn.Module):
         for _ in range(3):
             freq_bins = (freq_bins + 1) // 2
         self.num_freq_bins = freq_bins
-        self.time_steps = _post_cnn_length(torch.tensor([chunk_len]))[0].item()
+        self.time_steps = (chunk_len + 7) // 8
         self.downsample_hidden_size = config.downsample_hidden_size
 
         self.conv2d1 = nn.Conv2d(1, config.downsample_hidden_size, 3, 2, padding=1)
@@ -294,7 +294,8 @@ class Qwen3ASRAudioEncoder(nn.Module):
 
         # 计算 dtype 跟随卷积权重（引擎统一 dtype；parity 脚本显式给 fp32/bf16）。
         input_features = input_features.to(self.conv2d1.weight.dtype)
-        input_features_mask = input_features_mask.to(torch.long)
+        # 长度和窗口边界仅供主机调度，避免 310P 上整数 FloorDiv AICPU 算子。
+        input_features_mask = input_features_mask.to(device="cpu", dtype=torch.long)
 
         feature_lens = input_features_mask.sum(-1)
         chunk_lengths = (
@@ -426,9 +427,17 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
         self.audio_token_id = int(
             getattr(hf_config, "audio_token_id", AUDIO_PAD_ID))
 
-        # 音频塔 + 投影（纯 torch）
-        self.audio_tower = Qwen3ASRAudioEncoder(self.audio_config)
-        self.multi_modal_projector = Qwen3ASRMultiModalProjector(self.audio_config)
+        # 音频塔 + 投影（纯 torch）。**必须在 CPU 上构造**：引擎建模型时默认设备已是
+        # NPU，而 nn.Linear/nn.Conv2d 的默认 reset_parameters（uniform_/kaiming）在 310P
+        # 旧驱动上走 AICPU 会直接报 `aicpu exception` 并污染流（507018）。此处 init 在
+        # CPU 执行，随后搬到默认设备，权重立刻由 checkpoint 覆盖（同 qwen3_5.py conv1d
+        # 与 dspark 草稿的「CPU 建权重」模式）。
+        with torch.device("cpu"):
+            self.audio_tower = Qwen3ASRAudioEncoder(self.audio_config)
+            self.multi_modal_projector = Qwen3ASRMultiModalProjector(self.audio_config)
+        default_device = torch.get_default_device()
+        self.audio_tower = self.audio_tower.to(default_device)
+        self.multi_modal_projector = self.multi_modal_projector.to(default_device)
 
         # 文本骨干沿用 qwen3.py（层 / RoPE / RMSNorm / qk_norm 全复用）
         self.model = Qwen3Model(self.text_config)
