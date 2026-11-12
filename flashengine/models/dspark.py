@@ -59,9 +59,14 @@ class DSparkDraftModel(DFlashDraftModel):
         super().__init__(config, target_embed_tokens, target_lm_head_weight,
                          max_position=max_position)
         self.sample_from_anchor = getattr(config, "sample_from_anchor", True)
-        rank = int(config.markov_rank)
+        rank = getattr(config, "markov_rank", None)
+        rank = int(rank) if rank is not None else 0
         if rank <= 0:
-            raise ValueError("DSpark markov_rank must be positive")
+            raise ValueError(
+                "DSpark checkpoint config must provide a positive markov_rank; "
+                f"got {getattr(config, 'markov_rank', None)!r}. Flat "
+                "speculators configs keep it at the top level of config.json."
+            )
         self.markov_head = _MarkovHead(config.vocab_size, rank, device=self.fc.weight.device)
         self.confidence_head = None
         if getattr(config, "enable_confidence_head", False):

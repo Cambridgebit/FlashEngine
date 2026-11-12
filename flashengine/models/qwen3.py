@@ -185,6 +185,8 @@ class Qwen3DecoderLayer(nn.Module):
                 config, "_liteq_max_position_embeddings", config.max_position_embeddings),
             rms_norm_eps=config.rms_norm_eps,
             qkv_bias=getattr(config, 'attention_bias', True),
+            # Llama 系没有 q/k norm，只能由 config 显式关闭；Qwen3 缺省仍按 qkv_bias 推断。
+            qk_norm=getattr(config, "qk_norm", None),
             head_dim=getattr(config, 'head_dim', None),
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),

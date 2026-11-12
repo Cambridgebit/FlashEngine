@@ -6,6 +6,28 @@ from importlib import import_module
 from typing import Any
 
 
+# speculators 平铺 config 里允许透传的顶层字段。DFlash 需要块宽/mask/aux 层号/缩减
+# 词表；DSpark 还要 Markov 头（rank 决定 markov_w1 形状、head_type 决定实现）与
+# confidence 头开关（决定是否建模块，漏掉会让加载器报未知权重）。
+_FLAT_CONFIG_FIELDS = (
+    "block_size",
+    "mask_token_id",
+    "draft_vocab_size",
+    "aux_hidden_state_layer_ids",
+    "target_layer_ids",
+    "speculators_model_type",
+    # DSpark 专属
+    "markov_rank",
+    "markov_head_type",
+    "sample_from_anchor",
+    "enable_confidence_head",
+    "confidence_head_with_markov",
+    "confidence_head_alpha",
+    "projector_type",
+    "num_target_layers",
+)
+
+
 def _noop_normalizer(draft_config: Any) -> None:
     return None
 
@@ -62,6 +84,11 @@ def _normalize_dspark(draft_config: Any) -> None:
     _normalize_block_draft(draft_config)
     if getattr(draft_config, "markov_head_type", "vanilla") != "vanilla":
         raise NotImplementedError("Only vanilla DSpark Markov heads are supported.")
+    if getattr(draft_config, "markov_rank", None) is None:
+        raise ValueError(
+            "DSpark draft config must provide markov_rank; flat speculators "
+            "configs keep it at the top level (check config.json)."
+        )
     draft_vocab = getattr(draft_config, "draft_vocab_size", None)
     if (draft_vocab or draft_config.vocab_size) != draft_config.vocab_size:
         raise NotImplementedError(
@@ -98,11 +125,13 @@ def load_draft_config(path: str) -> Any:
         config = PretrainedConfig(**layer_config)
         config.architectures = list(
             data.get("architectures") or ["DFlashDraftModel"])
-        config.block_size = data.get("block_size")
-        config.mask_token_id = data.get("mask_token_id")
-        config.draft_vocab_size = data.get("draft_vocab_size")
-        config.aux_hidden_state_layer_ids = data.get("aux_hidden_state_layer_ids")
-        config.speculators_model_type = data.get("speculators_model_type")
+        # 平铺格式的模型几何在 transformer_layer_config 里，草稿专属字段留在顶层。
+        # 只透传 DFlash 用到的五个字段会让 speculators 导出的 DSpark 检查点在建
+        # 模型时丢 markov_rank（AttributeError），并静默丢掉 confidence 头开关
+        # （随后加载器报未知权重），故此处统一白名单透传。
+        for key in _FLAT_CONFIG_FIELDS:
+            if key in data:
+                setattr(config, key, data[key])
         return config
 
 

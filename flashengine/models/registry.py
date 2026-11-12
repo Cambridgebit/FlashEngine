@@ -23,6 +23,18 @@ def _text_model_config(hf_config: Any) -> Any:
     return getattr(hf_config, "text_config", hf_config)
 
 
+def _llama_model_config(hf_config: Any) -> Any:
+    """Llama 架构（MiniCPM5 等）复用 qwen3 文本骨干所需的两个开关。
+
+    Llama 的 q/k/v/o 投影都没有 bias，也没有 Qwen3 的 q/k RMSNorm；而 qwen3.py 的
+    oracle 逻辑是「无 qkv_bias ⇒ 有 qk_norm」，两者会各自多出随机初始化的参数且
+    **装载时不报错**（checkpoint 里没有对应键）。这里在 config 上显式钉死。
+    """
+    hf_config.attention_bias = False
+    hf_config.qk_norm = False
+    return hf_config
+
+
 def _layer_output_aux(method, draft_config, explicit_layers, model_config):
     if explicit_layers:
         return tuple(explicit_layers)
@@ -205,5 +217,20 @@ register_target_model(
         model_config_selector=_text_model_config,
         aux_layer_resolver=_layer_output_aux,
         audio_input=True,
+    )
+)
+
+# Llama 架构（MiniCPM5-2B 等）：模型实现直接复用 qwen3 骨干，仅关掉 qk_norm / bias。
+register_target_model(
+    TargetModelAdapter(
+        name="llama",
+        model_types=("llama",),
+        architectures=("LlamaForCausalLM",),
+        module="flashengine.models.qwen3",
+        class_name="Qwen3ForCausalLM",
+        supported_spec_methods=supported_spec_methods("llama") - {"none"},
+        model_config_selector=_llama_model_config,
+        # 捕获钩子是「层输入」口径，块草稿的 target_layer_ids 是 0-based 层输出 → +1。
+        aux_layer_resolver=_qwen3_aux_layers,
     )
 )
