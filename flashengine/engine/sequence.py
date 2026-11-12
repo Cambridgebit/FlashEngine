@@ -41,6 +41,10 @@ class Sequence:
         self.constraint_state = 0
         self.constraint_base_state = 0
         self.constraint_committed = 0
+        # 结构化约束（JSON Schema / 工具调用语法）：状态同样是"生成历史"的函数。
+        self.path_constraint = None
+        self.path_state = None
+        self.path_committed = 0
         self.block_table = []
         self.temperature = sampling_params.temperature
         self.top_p = sampling_params.top_p

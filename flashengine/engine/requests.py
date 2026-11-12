@@ -9,16 +9,24 @@ class RequestCapacityError(RuntimeError):
 
 
 class EngineRequests:
-    def add_request(self, prompt, sampling_params, audio=None):
+    def add_request(self, prompt, sampling_params, audio=None, constraint=None):
         """登记一条请求。
 
         audio 为多模态音频的预处理产物（`AsrProcessor.build` 的返回值去掉 input_ids），
         字段：`mel`（[num_mel_bins, frames] 的 CPU 张量/数组）、`valid_frames`（int，
         conv 前的有效帧数）、`audio_span`（(start, end)，占位 token 在 prompt 里的区间）、
         `num_audio_tokens`（= end - start）。带音频的请求跳过前缀缓存。
+
+        constraint 为结构化约束（`flashengine.structured.PathConstraint`），需要引擎开启
+        `enable_path_constraints`：掩码在主机侧按语法状态生成，图内采样会绕过它。
         """
         if getattr(self, "_closed", False):
             raise RuntimeError("引擎已关闭")
+        if constraint is not None and not getattr(
+                self.config, "enable_path_constraints", False):
+            raise ValueError(
+                "请求带结构化约束，但引擎未开启 enable_path_constraints；"
+                "请用 enable_path_constraints=True 构造引擎")
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         if (not isinstance(prompt, (list, tuple)) or not prompt
@@ -47,6 +55,10 @@ class EngineRequests:
             seq.audio = audio
             # 占位 token 序列相同不代表隐层相同（音频特征不同），不能被前缀缓存复用。
             seq.skip_prefix_cache = True
+        if constraint is not None:
+            seq.path_constraint = constraint
+            seq.path_state = constraint.initial_state()
+            seq.path_committed = 0
         self.scheduler.add(seq)
         return seq
 

@@ -242,6 +242,8 @@ class FlashInferDecodeGraphRunner(DecodeGraphExecutor):
         self.stats["replay"] += 1
         hits = self.stats["bucket_hits"]
         hits[bs] = hits.get(bs, 0) + 1
-        if all(seq.temperature <= 1e-10 for seq in seqs) and not self.plan.config.enable_constraints:
+        if (all(seq.temperature <= 1e-10 for seq in seqs)
+                and not self.plan.config.enable_constraints
+                and not self.plan.config.enable_path_constraints):
             return entry.tokens[:n], True
         return entry.logits[:n], False

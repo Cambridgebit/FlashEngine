@@ -66,6 +66,12 @@ class RuntimeSettings:
     enable_constraints: bool = False
     banned_words: tuple[str, ...] = DEFAULT_BANNED_WORDS
     constraint_ignore_spaces: bool = False
+    # 结构化约束（工具调用 / JSON Schema）默认关闭：开启会关掉图内采样，纯性能场景不需要。
+    # 由 framework 起的 server 会把它翻译成 --no-path-constraints（关闭）/ 不传（开启）。
+    enable_path_constraints: bool = False
+    # 工具调用协议与 tools 数量上限（只属于 HTTP 服务，不进引擎构造器）。
+    tool_protocol: str = "auto"
+    max_tools: int = 64
     gpu_memory_utilization: float = 0.9
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
@@ -103,13 +109,16 @@ class RuntimeSettings:
     def __post_init__(self):
         for name in ("model", "backend", "precision", "quantization", "decode_linear_backend",
                      "greedy_backend", "pa_graph_update", "spec_model", "host", "api_key_env",
-                     "shm_name"):
+                     "shm_name", "tool_protocol"):
             if not isinstance(getattr(self, name), str):
                 raise ValueError(f"配置 {name} 必须为字符串")
+        if self.tool_protocol not in ("auto", "xml_function", "hermes", "deepseek_v3"):
+            raise ValueError(
+                "tool_protocol 仅支持 auto/xml_function/hermes/deepseek_v3")
         for name in ("max_model_len", "max_num_seqs", "max_num_batched_tokens",
                      "max_num_partial_prefills", "kvcache_block_size", "cpu_threads",
                      "spec_num_tokens", "port", "max_tokens", "reserve_output",
-                     "tensor_parallel_size", "max_pending_requests"):
+                     "tensor_parallel_size", "max_pending_requests", "max_tools"):
             value = getattr(self, name)
             if type(value) is not int or value < 1:
                 raise ValueError(f"配置 {name} 必须为正整数")
@@ -126,7 +135,7 @@ class RuntimeSettings:
             raise ValueError("top_k 必须为非负整数")
         for name in ("fp16_only", "enable_chunked_prefill", "enable_prefix_cache",
                      "enforce_eager", "enable_thinking", "web_ui", "enable_constraints",
-                     "constraint_ignore_spaces"):
+                     "constraint_ignore_spaces", "enable_path_constraints"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"配置 {name} 必须是 JSON 布尔值")
         # frozen dataclass：归一化后的词库经 object.__setattr__ 回写。
@@ -260,7 +269,7 @@ class RuntimeSettings:
             "device_memory_reserve_bytes", "memory_workspace_bytes",
             "graph_memory_reserve_bytes", "fp16_only", "decode_linear_backend",
             "greedy_backend", "enable_constraints", "banned_words",
-            "constraint_ignore_spaces",
+            "constraint_ignore_spaces", "enable_path_constraints",
         )
         kwargs = {name: getattr(self, name) for name in names}
         kwargs["device_ids"] = tuple(self.device_ids)

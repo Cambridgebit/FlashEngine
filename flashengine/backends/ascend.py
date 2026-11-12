@@ -1010,7 +1010,8 @@ class Ascend310PBackend(BackendBase):
         # try_run 会把图内 argmax 当成结果返回。
         # 词库约束要把 logits 交回主机加偏置，图内 argmax 会绕过掩码，必须同时关闭。
         return NPUGraphDecodeRunner(plan, capture_greedy=(
-            self.greedy_backend == "npu" and not plan.config.enable_constraints))
+            self.greedy_backend == "npu" and not plan.config.enable_constraints
+            and not plan.config.enable_path_constraints))
 
     def prefix_cache_disable_reason(self) -> str | None:
         if not self.supports_splitfuse:
