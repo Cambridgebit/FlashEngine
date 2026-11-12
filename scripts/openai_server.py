@@ -15,6 +15,14 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from flashengine.engine.observer import EngineObserver
+from flashengine.lora import LoRARequest
+from flashengine.protocol import (
+    PROTOCOLS,
+    normalize_messages,
+    parse_output,
+    render_chat,
+    resolve_protocol,
+)
 from flashengine.version import SERVICE_NAME, VERSION
 
 
@@ -34,6 +42,14 @@ _lora_slots: dict[str, int] = {}
 
 _default_thinking = None
 _default_reserve = 512
+# ---- OpenAI 工具调用 / 结构化输出 ----
+_tool_protocol = "auto"          # --tool-protocol：auto = 按 chat template 探测
+_resolved_protocol = "hermes"    # 启动时解析一次的协议名，请求路径只读
+_enable_path_constraints = True  # --no-path-constraints 关闭（工具请求退化为只解析）
+_max_tools = 64                  # --max-tools：单请求 tools 数量上限
+# 协议标记之外的 special token 文本（解码时剥掉，例如 <|im_end|> / </s>）。工具调用
+# 标记本身（<function>、<tool_call>…）必须保留给协议解析，不能一起剥。
+_strip_special_texts = ()
 _ui_enabled = True
 _ui_html_path = None
 _ui_html_cache = None
@@ -136,6 +152,9 @@ def _log_raw(st, output, ct, reason):
         "ctx_tokens": st.seq.num_tokens,
         "max_model_len": _max_model_len,
         "prefix_hit_blocks": st.seq.prefix_cache_hit_blocks,
+        "tools": st.tools,
+        "tool_choice": st.tool_mode,
+        "constraint": st.constraint,
         # 模型完整生成文本（含思考段；仅剔除 eos 与已命中的 stop 串）
         "output": output,
     }
@@ -253,6 +272,12 @@ class _Request:
         self.preview = ""
         self.execution_path = "eager"
         self.preempt0 = 0
+        # 带 tools / response_format 的请求要按模型原生协议解析，解码时不能使用
+        # skip_special_tokens=True（会把 <function>/<param> 这类标记一起剥掉）。
+        self.protocol_aware = False
+        self.tools = 0              # 本请求带的 tools 数量（[REQ] / --raw-log 用）
+        self.tool_mode = "none"     # auto / none / required
+        self.constraint = None      # 结构化约束短名（None = 不约束）
 
 
 def _bump_tokens(n):
@@ -372,6 +397,9 @@ def _engine_info():
         "default_top_k": _default_top_k,
         "default_thinking": "off" if _default_thinking is False else "template",
         "reserve_output": _default_reserve,
+        "tool_protocol": _resolved_protocol,
+        "path_constraints": bool(_enable_path_constraints),
+        "max_tools": _max_tools,
         "execution_path": _execution_path(_default_temperature),
     }
     _engine_info_cache = info
@@ -476,11 +504,14 @@ def _abort(seq):
 def _log_request(st):
     wait_ms = (st.t_started - st.t_add) * 1000
     max_out = "auto(EOS)" if st.auto_continue else f"{st.max_tokens}tok"
+    tool_text = (f" tools={st.tools} choice={st.tool_mode}"
+                 f" constraint={st.constraint or '-'}"
+                 if (st.tools or st.constraint) else "")
     _log("REQ", f"{st.rid} {st.endpoint} stream={'on' if st.stream else 'off'} "
                 f"client={st.client} prompt={st.prompt_tokens}tok max_out={max_out} "
                 f"temp={st.temperature:g} top_p={st.top_p:g} top_k={st.top_k} "
                 f"think={st.thinking} path={st.execution_path} evict={st.evicted} "
-                f"queue={wait_ms:.0f}ms | {st.preview}")
+                f"queue={wait_ms:.0f}ms{tool_text} | {st.preview}")
 
 
 def _log_done(st, ct, reason, output=""):
@@ -584,6 +615,14 @@ def _roll_auto_context(st):
     new_seq.constraint_base_state = getattr(old_seq, "constraint_state", 0)
     new_seq.constraint_state = new_seq.constraint_base_state
     new_seq.constraint_committed = 0
+    # 结构化约束同样要跨段续写：窗口截断时语法可能还没到接受态，状态必须接着上一段，
+    # 否则续写的 JSON/工具调用会从语法起点重新开始，掩码与已生成文本对不上。
+    path_constraint = getattr(old_seq, "path_constraint", None)
+    if path_constraint is not None:
+        new_seq.path_constraint = path_constraint
+        new_seq.path_state = getattr(old_seq, "path_state",
+                                     path_constraint.initial_state())
+        new_seq.path_committed = 0
 
     scheduler = engine.scheduler
     if scheduler.on_preempt is not None:
@@ -743,6 +782,57 @@ def _constraint_output(tokens, final=False):
     return text if final else text.rstrip("\ufffd")
 
 
+_PROTOCOL_MARKERS = {
+    "xml_function": ("<function", "</function>", "<param", "</param>"),
+    "hermes": ("<tool_call>", "</tool_call>"),
+    "deepseek_v3": ("<｜｜tool▁calls▁begin｜｜>", "<｜｜tool▁call▁begin｜｜>",
+                    "<｜｜tool▁sep｜｜>", "<｜｜tool▁call▁end｜｜>",
+                    "<｜｜tool▁calls▁end｜｜>"),
+}
+
+
+def _configure_special_stripping(tokenizer, protocol):
+    """准备"解码时剥掉哪些 special token 文本"。
+
+    带 tools 的请求必须保留协议标记（``<function`` / ``<tool_call>`` / DeepSeek 专用分隔
+    符）给协议解析，只剥掉会话控制标记（``<|im_end|>`` / ``</s>`` 等）。普通请求仍然走
+    ``skip_special_tokens=True``，行为不变。
+    """
+    global _strip_special_texts
+    keep = _PROTOCOL_MARKERS.get(protocol, ())
+    pieces = set()
+    added = getattr(tokenizer, "added_tokens_decoder", {}) or {}
+    for entry in added.values():
+        if not getattr(entry, "special", False):
+            continue
+        content = getattr(entry, "content", None)
+        if not content:
+            continue
+        if any(content.startswith(marker) for marker in keep):
+            continue
+        pieces.add(content)
+    _strip_special_texts = tuple(sorted(pieces, key=len, reverse=True))
+
+
+def _decode_protocol_aware(tokens):
+    """保留协议标记的解码：special token 先按字面解出，再剥掉会话控制标记。"""
+    text = _tokenizer.decode(tokens, skip_special_tokens=False,
+                             clean_up_tokenization_spaces=False)
+    for piece in _strip_special_texts:
+        if piece in text:
+            text = text.replace(piece, "")
+    return text
+
+
+def _final_generated_text(st, tokens, constrained):
+    """按请求种类选择解码口径：禁词约束 > 协议解析 > 普通文本。"""
+    if constrained:
+        return _constraint_output(tokens, final=True)
+    if getattr(st, "protocol_aware", False):
+        return _decode_protocol_aware(tokens)
+    return _tokenizer.decode(tokens, skip_special_tokens=True)
+
+
 def _run_llm(st, stop, emit):
     constrained = bool(getattr(engine.config, "enable_constraints", False))
     if emit is None and not stop:
@@ -752,8 +842,7 @@ def _run_llm(st, stop, emit):
         gen = _drain(st.tokens)
         if st.error:
             raise RuntimeError(st.error)
-        text = (_constraint_output(gen, final=True) if constrained else
-                _tokenizer.decode(gen, skip_special_tokens=True))
+        text = _final_generated_text(st, gen, constrained)
         return text, st.finish_reason or "stop", len(gen)
 
     if emit is None:    # non-streaming with stop strings still needs incremental checks
@@ -777,8 +866,7 @@ def _run_llm(st, stop, emit):
             gen.extend(_drain(st.tokens))
             if st.error:
                 raise RuntimeError(st.error)
-            text = (_constraint_output(gen, final=True) if constrained else
-                    _tokenizer.decode(gen, skip_special_tokens=True))
+            text = _final_generated_text(st, gen, constrained)
             final, _ = _apply_stop(text, stop)
             if constrained and not final.startswith(prev_text):
                 raise RuntimeError("约束输出改写了已发送的文本前缀")
@@ -836,31 +924,222 @@ def _run_llm(st, stop, emit):
     return prev_text, reason, len(gen)
 
 
-def _normalize_messages(messages):
-    normalized = []
-    for msg in messages:
-        role = msg.get("role")
-        content = msg.get("content")
-        if isinstance(content, list):
-            parts = []
-            for item in content:
-                if isinstance(item, dict) and item.get("type") == "text":
-                    parts.append(item.get("text", ""))
-            content = "".join(parts)
-        if content is None:
-            content = ""
-        normalized.append({"role": role, "content": content})
-    return normalized
+# ---------------------------------------------------------------------------
+# 工具调用 / 结构化输出：请求字段解析与校验
+# ---------------------------------------------------------------------------
+
+def _parse_tools(body):
+    """校验请求里的 ``tools``；返回列表或 None（未提供/空数组）。
+
+    形状校验交给 :func:`flashengine.structured.protocols.tool_pairs`：约束语法与响应
+    解析必须吃同一份工具定义，server 不能自己放宽或收紧。工具定义本身要占上下文预算，
+    所以这里只做校验，渲染时把整份 ``tools`` 一起交给 chat template。
+    """
+    tools = body.get("tools")
+    if tools is None:
+        return None
+    if not isinstance(tools, list):
+        raise ValueError("'tools' 必须是数组")
+    if not tools:
+        return None
+    if len(tools) > _max_tools:
+        raise ValueError(f"'tools' 数量 {len(tools)} 超过服务上限 {_max_tools}"
+                         f"（启动参数 --max-tools）")
+    from flashengine.structured.protocols import tool_pairs
+
+    tool_pairs(tools)       # 只做形状/重名校验，返回的 pairs 在约束构建时再取
+    return tools
 
 
-def _template_ids(normalized, enable_thinking=None):
-    think_kwargs = {} if enable_thinking is None else {"enable_thinking": enable_thinking}
-    out = _tokenizer.apply_chat_template(
-        normalized, tokenize=True, add_generation_prompt=True, **think_kwargs)
-    return out if isinstance(out, (list, tuple)) else out["input_ids"]
+def _parse_tool_choice(body, tools):
+    """解析 ``tool_choice``；返回 ``(mode, choice_name)``。
+
+    mode 只有 ``auto`` / ``none`` / ``required``；``{"type":"function",...}`` 等价于
+    ``required`` + 指定函数名。未提供时按 OpenAI 语义：有 tools 则 auto，否则 none。
+    """
+    raw = body.get("tool_choice")
+    names = {((tool or {}).get("function") or {}).get("name")
+             for tool in (tools or []) if isinstance(tool, dict)}
+    if raw is None:
+        return ("auto" if tools else "none"), None
+    if isinstance(raw, str):
+        value = raw.strip().lower()
+        if value == "none":
+            return "none", None
+        if value == "auto":
+            return "auto", None
+        if value == "required":
+            if not tools:
+                raise ValueError("tool_choice=\"required\" 需要同时提供非空 tools")
+            return "required", None
+        raise ValueError(f"不支持的 tool_choice：{raw!r}（可选 auto/none/required，"
+                         f"或 {{\"type\":\"function\",\"function\":{{\"name\":...}}}}）")
+    if isinstance(raw, dict):
+        if raw.get("type") != "function":
+            raise ValueError(f"不支持的 tool_choice.type：{raw.get('type')!r}"
+                             f"（只支持 function）")
+        function = raw.get("function")
+        if not isinstance(function, dict):
+            raise ValueError("tool_choice.function 必须是对象")
+        name = function.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError("tool_choice.function.name 必须是非空字符串")
+        if not tools:
+            raise ValueError(f"tool_choice 指定了函数 {name!r}，但请求没有 tools")
+        if name not in names:
+            raise ValueError(f"tool_choice 指定的函数 {name!r} 不在 tools 里"
+                             f"（现有：{sorted(n for n in names if n)}）")
+        return "required", name
+    raise ValueError("'tool_choice' 必须是字符串或 {type:function,...} 对象")
 
 
-def _truncate_last(messages, enable_thinking, prompt_cap):
+def _parse_parallel_tool_calls(body):
+    """校验 ``parallel_tool_calls``；它只是客户端意图，不改变约束语法。
+
+    调用数量由语法决定（hermes 语法本身允许多个连续调用）。为 ``false`` 去改写语法会让
+    「约束」与「--no-path-constraints 只解析」两条路径行为分叉，故这里只校验与记录。
+    """
+    raw = body.get("parallel_tool_calls")
+    if raw is None:
+        return True
+    if not isinstance(raw, bool):
+        raise ValueError("'parallel_tool_calls' 必须是布尔值")
+    return raw
+
+
+def _parse_response_format(body):
+    """解析 ``response_format``；返回 ``{"name","schema"}`` 或 None。
+
+    - ``{"type":"text"}``：普通文本，等价于不传；
+    - ``{"type":"json_schema","json_schema":{"name","schema"}}``：整段输出约束为一个
+      符合 schema 的 JSON 值；
+    - ``json_object`` 暂不支持：没有 schema 就无法约束，只能算提示词约定，不属于
+      "约束解码"语义，明确 400 让客户端改用 json_schema。
+    """
+    raw = body.get("response_format")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("'response_format' 必须是对象")
+    kind = raw.get("type")
+    if kind == "text":
+        return None
+    if kind == "json_object":
+        raise ValueError(
+            "暂不支持 response_format=json_object：请改用 "
+            "{\"type\":\"json_schema\",\"json_schema\":{\"name\":...,\"schema\":{...}}}")
+    if kind != "json_schema":
+        raise ValueError(f"不支持的 response_format.type：{kind!r}"
+                         f"（可选 text/json_schema）")
+    definition = raw.get("json_schema")
+    if not isinstance(definition, dict):
+        raise ValueError("response_format.json_schema 必须是对象")
+    schema = definition.get("schema")
+    if not isinstance(schema, dict):
+        raise ValueError("response_format.json_schema.schema 必须是 JSON 对象")
+    name = definition.get("name") or "response"
+    if not isinstance(name, str) or not name:
+        raise ValueError("response_format.json_schema.name 必须是非空字符串")
+    return {"name": name, "schema": schema}
+
+
+def _reject_tool_fields(body, mode):
+    """工具字段只属于 chat/completions；completions 端点明确 400 而不是静默忽略。"""
+    if mode == "chat":
+        return
+    for field in ("tools", "tool_choice", "parallel_tool_calls"):
+        if body.get(field) is not None:
+            raise ValueError(f"'{field}' 只支持 /v1/chat/completions")
+
+
+def _request_tool_fields(body, mode):
+    """一次解析全部工具/结构化输出字段（非法组合抛 ValueError，由调用方转 400）。"""
+    _reject_tool_fields(body, mode)
+    tools = _parse_tools(body) if mode == "chat" else None
+    tool_mode, choice_name = _parse_tool_choice(body, tools)
+    parallel_calls = _parse_parallel_tool_calls(body)
+    response_format = _parse_response_format(body)
+    return tools, tool_mode, choice_name, response_format, parallel_calls
+
+
+def _chat_template_kwargs(body):
+    """``chat_template_kwargs`` 必须原样透传给模板；这里只做类型校验。"""
+    kwargs = body.get("chat_template_kwargs") or {}
+    if not isinstance(kwargs, dict):
+        raise ValueError("'chat_template_kwargs' 必须是对象")
+    return dict(kwargs)
+
+
+def _constraint_kind(tools, tool_mode, response_format):
+    """判定要挂哪种结构化约束：``"tool"`` / ``"json"`` / None。
+
+    只在引擎开启 ``enable_path_constraints`` 时返回非 None；``--no-path-constraints``
+    下工具/JSON 请求退化为「不约束、只解析」，但字段语义（400 校验）保持一致。
+    """
+    if not _enable_path_constraints:
+        return None
+    if response_format is not None:
+        if tools and tool_mode == "required":
+            raise ValueError("response_format=json_schema 与 tool_choice=required "
+                             "不能同时使用（两者的约束语法互斥）")
+        return "json"
+    if tools and tool_mode == "required":
+        return "tool"
+    return None
+
+
+def _resolve_enable_thinking(body, template_kwargs, constrained):
+    """决定 ``enable_thinking``；受约束的请求必须关闭思考。
+
+    约束语法从第一个 token 开始匹配，思考段会和它冲突，所以强制关闭。显式
+    ``chat_template_kwargs.enable_thinking=true`` 是用户强意图：与约束冲突时报 400 而不是
+    悄悄改写；默认值（模板默认 / ``--no-think`` / 请求体的 ``enable_thinking``）直接让位。
+    """
+    explicit = None
+    if "enable_thinking" in template_kwargs:
+        explicit = template_kwargs["enable_thinking"]
+        if not isinstance(explicit, bool):
+            raise ValueError("chat_template_kwargs.enable_thinking 必须是布尔值")
+    elif body.get("enable_thinking") is not None:
+        explicit = bool(body["enable_thinking"])
+    if constrained:
+        if explicit is True:
+            raise ValueError(
+                "受约束请求（tool_choice=required / response_format=json_schema）必须关闭"
+                "思考：chat_template_kwargs.enable_thinking=true 与约束解码冲突")
+        return False
+    return _default_thinking if explicit is None else explicit
+
+
+def _build_constraint(kind, tools, choice_name, response_format):
+    """按请求构造约束解码对象；``ValueError`` 由调用方转 400（原因原样带出）。"""
+    from flashengine.structured import json_constraint, tool_constraint
+
+    cfg = engine.config
+    eos_ids = getattr(cfg, "eos_ids", ()) or (cfg.eos,)
+    vocab_size = cfg.model_config.vocab_size
+    if kind == "json":
+        return json_constraint(response_format["schema"], _tokenizer, eos_ids,
+                               vocab_size=vocab_size, name=response_format["name"])
+    return tool_constraint(tools, _resolved_protocol, _tokenizer, eos_ids,
+                           choice=choice_name, vocab_size=vocab_size,
+                           max_tools=_max_tools)
+
+
+# ---------------------------------------------------------------------------
+# 消息渲染与上下文裁剪
+# ---------------------------------------------------------------------------
+
+def _template_ids(messages, tools=None, template_kwargs=None, enable_thinking=None):
+    """按 chat template 渲染 token id（与仓库既有口径一致）。"""
+    return render_chat(_tokenizer, messages, tools=tools,
+                       template_kwargs=template_kwargs,
+                       enable_thinking=enable_thinking)
+
+
+def _truncate_last(messages, enable_thinking, prompt_cap, tools=None,
+                   template_kwargs=None):
+    """只截最后一条消息「文本的 token 尾部」并重渲染，绝不切 id 流。"""
     fitted = list(messages)
     last = dict(fitted[-1])
     content_ids = _tokenizer.encode(last["content"] or "")
@@ -868,7 +1147,8 @@ def _truncate_last(messages, enable_thinking, prompt_cap):
     while allow >= 0:
         content = _tokenizer.decode(content_ids[-allow:]) if allow else ""
         fitted[-1] = dict(last, content=content)
-        ids = _template_ids(fitted, enable_thinking)
+        ids = _template_ids(fitted, tools=tools, template_kwargs=template_kwargs,
+                            enable_thinking=enable_thinking)
         if len(ids) <= prompt_cap:
             return fitted, ids
         allow -= max(1, len(ids) - prompt_cap)
@@ -876,24 +1156,31 @@ def _truncate_last(messages, enable_thinking, prompt_cap):
     return fitted, ids
 
 
-def _chat_prompt_ids_fit(messages, enable_thinking, prompt_cap):
-    msgs = _normalize_messages(messages)
+def _chat_prompt_ids_fit(messages, enable_thinking, prompt_cap, tools=None,
+                         template_kwargs=None):
+    """把 chat 请求裁进 ``prompt_cap``：保 system + 最近轮次，tools 也算预算。"""
+    msgs = normalize_messages(messages)
     n_sys = 0
     while n_sys < len(msgs) and msgs[n_sys].get("role") == "system":
         n_sys += 1
     system, convo = msgs[:n_sys], msgs[n_sys:]
     keep = list(convo)
-    ids = _template_ids(system + keep, enable_thinking)
+    ids = _template_ids(system + keep, tools=tools, template_kwargs=template_kwargs,
+                        enable_thinking=enable_thinking)
     while len(ids) > prompt_cap and len(keep) > 1:
         keep.pop(0)                      # 丢最旧的非 system 消息
-        ids = _template_ids(system + keep, enable_thinking)
+        ids = _template_ids(system + keep, tools=tools,
+                            template_kwargs=template_kwargs,
+                            enable_thinking=enable_thinking)
     if len(ids) > prompt_cap and keep:
-        fitted, ids = _truncate_last(system + keep, enable_thinking, prompt_cap)
+        fitted, ids = _truncate_last(system + keep, enable_thinking, prompt_cap,
+                                     tools=tools, template_kwargs=template_kwargs)
         keep[-1] = fitted[-1]
     if len(ids) > prompt_cap and (keep or system):
         keep = [keep[-1] if keep else system[-1]]
         system = []
-        keep, ids = _truncate_last(keep, enable_thinking, prompt_cap)
+        keep, ids = _truncate_last(keep, enable_thinking, prompt_cap,
+                                   tools=tools, template_kwargs=template_kwargs)
     if len(ids) > prompt_cap:
         raise ValueError(
             f"上下文窗口不足：system + 最新提问裁剪后仍需 {len(ids)} token，可用 "
@@ -933,7 +1220,8 @@ def _preview(body, mode, limit=40):
     return flat[:limit] + ("…" if len(flat) > limit else "")
 
 
-def _openai_body(req_id, model, mode, content, finish_reason, usage):
+def _openai_body(req_id, model, mode, content, finish_reason, usage, message=None):
+    """非流式响应体；chat 的 message 由调用方按解析结果组装（含 tool_calls）。"""
     if mode == "chat":
         return {
             "id": req_id,
@@ -942,7 +1230,7 @@ def _openai_body(req_id, model, mode, content, finish_reason, usage):
             "model": model,
             "choices": [{
                 "index": 0,
-                "message": {"role": "assistant", "content": content},
+                "message": message or {"role": "assistant", "content": content},
                 "finish_reason": finish_reason,
             }],
             "usage": usage,
@@ -961,14 +1249,23 @@ def _openai_body(req_id, model, mode, content, finish_reason, usage):
     }
 
 
-def _chunk(req_id, model, mode, delta_text, finish_reason=None, role=False):
+def _chunk(req_id, model, mode, delta_text="", finish_reason=None, role=False,
+           delta=None, tool_calls=None):
+    """SSE 数据块；chat 用 delta（角色/正文/工具调用），completion 用 text。"""
     choice = {"index": 0, "finish_reason": finish_reason}
     if mode == "completion":
         # Completions 的 SSE 文本直接位于 choice；delta 是 Chat 的字段。
         choice["text"] = delta_text
+    elif delta is not None:
+        choice["delta"] = delta
+    elif role:
+        choice["delta"] = {"role": "assistant"}
+    elif tool_calls is not None:
+        choice["delta"] = {"tool_calls": tool_calls}
+    elif delta_text:
+        choice["delta"] = {"content": delta_text}
     else:
-        choice["delta"] = {"role": "assistant"} if role else \
-                          {"content": delta_text} if delta_text else {}
+        choice["delta"] = {}
     return {
         "id": req_id,
         "object": "chat.completion.chunk" if mode == "chat" else "text_completion",
@@ -976,6 +1273,95 @@ def _chunk(req_id, model, mode, delta_text, finish_reason=None, role=False):
         "model": model,
         "choices": [choice],
     }
+
+
+def _parse_result(text, tools=None, response_format=None):
+    """工具/结构化请求才解析协议；普通请求返回 None（完全保持原行为与开销）。"""
+    if tools is None and response_format is None:
+        return None
+    return parse_output(text, _resolved_protocol, tools=tools)
+
+
+def _assistant_message(content, parsed):
+    """组装 OpenAI 的 assistant message；值为 None 的字段按惯例省略。"""
+    if parsed is None:
+        return {"role": "assistant", "content": content}
+    message = {"role": "assistant", "content": parsed.content}
+    if parsed.reasoning_content:
+        message["reasoning_content"] = parsed.reasoning_content
+    if parsed.tool_calls:
+        message["tool_calls"] = parsed.tool_calls
+    return message
+
+
+def _needs_buffered_stream(tools, response_format):
+    """有 tools / response_format 的请求必须整段缓冲后再发。
+
+    模型原生协议标记（``<tool_call>`` / ``<function ...>`` / DeepSeek 专用 token）绝不能
+    当 content 流给客户端，否则客户端会在拼装前就看到它们；普通请求仍走原流式路径。
+    """
+    return bool(tools) or response_format is not None
+
+
+def _tool_call_deltas(tool_calls):
+    """每个 tool_call 两条 delta：①id/type/name（arguments 空串）②完整 arguments。"""
+    deltas = []
+    for index, call in enumerate(tool_calls):
+        function = call.get("function") or {}
+        deltas.append({"tool_calls": [{
+            "index": index,
+            "id": call.get("id"),
+            "type": call.get("type") or "function",
+            "function": {"name": function.get("name") or "", "arguments": ""},
+        }]})
+        # 第二条一次给完整字符串：客户端拼出的 arguments 与非流式逐字节一致，也不会
+        # 出现「半截 JSON」被提前解析。
+        deltas.append({"tool_calls": [{
+            "index": index,
+            "function": {"arguments": function.get("arguments") or "{}"},
+        }]})
+    return deltas
+
+
+def _split_stream_content(text, min_piece=8):
+    """把缓冲好的正文按句切成若干 delta；片段太碎就并回上一段。"""
+    if not text:
+        return []
+    pieces = []
+    start = 0
+    for index, char in enumerate(text):
+        if char in "。！？!?\n" and index + 1 - start >= min_piece:
+            pieces.append(text[start:index + 1])
+            start = index + 1
+    if start < len(text):
+        rest = text[start:]
+        if pieces and len(rest) < min_piece:
+            pieces[-1] += rest
+        else:
+            pieces.append(rest)
+    return pieces or [text]
+
+
+def _buffered_stream_chunks(req_id, model, mode, parsed, finish_reason):
+    """缓冲后的流式序列：角色首块 → （思考段）→ 正文或 tool_calls → finish 块。"""
+    chunks = []
+    content = parsed.content if parsed is not None else None
+    if mode == "chat":
+        chunks.append(_chunk(req_id, model, mode, role=True))
+        if parsed is not None and parsed.reasoning_content:
+            chunks.append(_chunk(req_id, model, mode,
+                                 delta={"reasoning_content": parsed.reasoning_content}))
+        if parsed is not None and parsed.tool_calls:
+            for delta in _tool_call_deltas(parsed.tool_calls):
+                chunks.append(_chunk(req_id, model, mode, delta=delta))
+        elif content:
+            for piece in _split_stream_content(content):
+                chunks.append(_chunk(req_id, model, mode, delta={"content": piece}))
+    elif content:
+        for piece in _split_stream_content(content):
+            chunks.append(_chunk(req_id, model, mode, delta_text=piece))
+    chunks.append(_chunk(req_id, model, mode, finish_reason=finish_reason))
+    return chunks
 
 
 
@@ -1077,6 +1463,12 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, obj, code=200):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self._bytes(body, "application/json", code)
+
+    def _write_sse(self, obj):
+        """写一个 SSE 数据块（``data: <json>\\n\\n``）。"""
+        payload = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.wfile.write(b"data: " + payload + b"\n\n")
+        self.wfile.flush()
 
     def _bytes(self, body, content_type, code=200, headers=()):
         self.send_response(code)
@@ -1345,7 +1737,8 @@ class Handler(BaseHTTPRequestHandler):
                 f"unknown model {model!r}; available: "
                 f"{[_model_name] + [name for name, _ in _lora_modules]}", 400)
             return
-        lora_id = _lora_slots.get(model, 0) if model != _model_name else 0
+        lora_request = (LoRARequest(lora_name=model)
+                        if model and model != _model_name else None)
         if n != 1:
             self._error("'n' != 1 is not supported", 400)
             return
@@ -1388,17 +1781,33 @@ class Handler(BaseHTTPRequestHandler):
             return
         include_usage = bool(stream_options.get("include_usage", False))
 
+        # ---- 工具调用 / 结构化输出字段（非法组合一律 400 + 中文可读信息）----
+        try:
+            (tools, tool_mode, choice_name, response_format,
+             parallel_calls) = _request_tool_fields(body, mode)
+            template_kwargs = _chat_template_kwargs(body) if mode == "chat" else {}
+            constrained = _constraint_kind(tools, tool_mode, response_format)
+            # tool_choice="none" = 客户端明确要求"不调用工具"：连工具定义都不放进 prompt，
+            # 模型自然只答正文；响应也不解析工具调用（否则会把自发的调用当 tool_calls 返回）。
+            template_tools = tools if tool_mode != "none" else None
+            parse_tools = template_tools
+            enable_thinking = _resolve_enable_thinking(
+                body, template_kwargs, constrained is not None)
+        except ValueError as exc:
+            self._error(str(exc), 400)
+            return
+
         reserve = requested_max_tokens if requested_max_tokens is not None else _default_reserve
         reserve = min(max(reserve, 1), _max_model_len - 1)
         prompt_cap = _max_model_len - reserve
         dropped = 0
         try:
-            ctk = body.get("chat_template_kwargs") or {}
-            enable_thinking = ctk.get("enable_thinking", body.get("enable_thinking",
-                                                                  _default_thinking))
             if mode == "chat":
+                if not body.get("messages"):
+                    raise ValueError("'messages' is required")
                 prompt_ids, dropped = _chat_prompt_ids_fit(
-                    body["messages"], enable_thinking, prompt_cap)
+                    body["messages"], enable_thinking, prompt_cap,
+                    tools=template_tools, template_kwargs=template_kwargs)
                 if dropped:
                     _log("WARN", f"context eviction: dropped {dropped} oldest message(s) "
                                  f"(prompt<={prompt_cap}tok reserve={reserve} "
@@ -1422,41 +1831,79 @@ class Handler(BaseHTTPRequestHandler):
                       if requested_max_tokens is not None else remaining)
         max_tokens = max(1, max_tokens)
 
+        constraint = None
+        if constrained is not None:
+            try:
+                constraint = _build_constraint(
+                    constrained, tools, choice_name, response_format)
+            except ValueError as exc:
+                self._error(f"约束构建失败：{exc}", 400)
+                return
+            except Exception as exc:     # 约束层内部错误不当成客户端错误
+                _log("ERROR", f"约束构建内部错误：{exc}")
+                self._error(f"约束构建失败：{exc}", 500)
+                return
+
         req_id = f"chatcmpl-{time.time_ns()}" if mode == "chat" else f"cmpl-{time.time_ns()}"
         rid = req_id[-6:]
         self._rid = rid    # [HTTP] 行关联
 
-        seq = Sequence(prompt_ids, SamplingParams(
+        sampling = SamplingParams(
             temperature=temperature,
             max_tokens=max_tokens,
             top_p=top_p,
             top_k=top_k,
-            ignore_eos=ignore_eos), lora_id=lora_id)
+            ignore_eos=ignore_eos)
+        rejected = None
+        # 约束对象随请求进引擎（引擎挂到内部 Sequence 上，采样前按状态落掩码）。登记
+        # _active 必须与 add 在同一把锁内完成：否则驱动线程可能先把这条请求跑完，HTTP
+        # 线程却还没登记，等待会永远落空。
         with engine_lock:
-            engine.scheduler.add(seq)
-            st = _Request(seq, None if auto_continue else max_tokens, rid,
-                          t_http=self._t0, auto_continue=auto_continue)
-            st.endpoint = self.path
-            st.stream = stream
-            st.client = self.client_address[0]
-            st.temperature = temperature
-            st.top_p = top_p
-            st.top_k = top_k
-            st.thinking = "off" if enable_thinking is False else "on"
-            st.evicted = dropped
-            st.preview = _preview(body, mode)
-            st.execution_path = _execution_path(temperature)
-            st.preempt0 = engine.scheduler.stats["preemptions"]
-            _active[seq.seq_id] = st
-            _wakeup.set()
-            if st.execution_path == "eager_spec(sampling)" and st.execution_path not in _warned_execution_paths:
-                _warned_execution_paths.add(st.execution_path)
-                _log(
-                    "WARN",
-                    "Speculative Graph requires greedy sampling on this backend; "
-                    "this request keeps its stochastic sampling semantics and falls back to eager spec. "
-                    "Use temperature=0 for the benchmark-equivalent Graph path.",
-                )
+            try:
+                seq = engine.add_request(prompt_ids, sampling, lora_request=lora_request,
+                                          constraint=constraint)
+            except ValueError as exc:
+                seq = None
+                rejected = (400, f"invalid request: {exc}")
+            except Exception as exc:
+                seq = None
+                from flashengine.engine.requests import RequestCapacityError
+                if isinstance(exc, RequestCapacityError):
+                    rejected = (429, f"server overloaded: {exc}")
+                else:
+                    rejected = (500, f"request rejected: {exc}")
+            if seq is not None:
+                st = _Request(seq, None if auto_continue else max_tokens, rid,
+                              t_http=self._t0, auto_continue=auto_continue)
+                st.endpoint = self.path
+                st.stream = stream
+                st.client = self.client_address[0]
+                st.temperature = temperature
+                st.top_p = top_p
+                st.top_k = top_k
+                st.thinking = "off" if enable_thinking is False else "on"
+                st.evicted = dropped
+                st.tools = len(tools or ())
+                st.tool_mode = tool_mode
+                st.constraint = getattr(constraint, "name", None)
+                # 带 tools / response_format 的请求走"保留协议标记"的解码口径。
+                st.protocol_aware = _needs_buffered_stream(parse_tools, response_format)
+                st.preview = _preview(body, mode)
+                st.execution_path = _execution_path(temperature)
+                st.preempt0 = engine.scheduler.stats["preemptions"]
+                _active[seq.seq_id] = st
+                _wakeup.set()
+                if st.execution_path == "eager_spec(sampling)" and st.execution_path not in _warned_execution_paths:
+                    _warned_execution_paths.add(st.execution_path)
+                    _log(
+                        "WARN",
+                        "Speculative Graph requires greedy sampling on this backend; "
+                        "this request keeps its stochastic sampling semantics and falls back to eager spec. "
+                        "Use temperature=0 for the benchmark-equivalent Graph path.",
+                    )
+        if rejected is not None:
+            self._error(rejected[1], rejected[0])
+            return
 
         usage = {
             "prompt_tokens": st.prompt_tokens,
@@ -1471,12 +1918,18 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(b"data: " + payload + b"\n\n")
             self.wfile.flush()
 
+        buffered = _needs_buffered_stream(parse_tools, response_format)
         try:
             if not stream:
                 text, reason, ct = _run_llm(st, stop, None)
+                parsed = _parse_result(text, parse_tools, response_format)
+                finish = ("tool_calls"
+                          if (parsed is not None and parsed.tool_calls) else reason)
                 usage.update(completion_tokens=ct, total_tokens=st.prompt_tokens + ct)
-                _log_done(st, ct, reason, text)
-                self._json(_openai_body(req_id, model, mode, text, reason, usage))
+                _log_done(st, ct, finish, text)
+                message = _assistant_message(text, parsed) if mode == "chat" else None
+                self._json(_openai_body(req_id, model, mode, text, finish, usage,
+                                        message=message))
                 return
 
             self.send_response(200)
@@ -1486,18 +1939,24 @@ class Handler(BaseHTTPRequestHandler):
             self._cors()
             self.end_headers()
 
-            if mode == "chat":
-                first = json.dumps(_chunk(req_id, model, mode, "", role=True),
-                                   ensure_ascii=False).encode("utf-8")
-                self.wfile.write(b"data: " + first + b"\n\n")
-                self.wfile.flush()
-
-            text, reason, ct = _run_llm(st, stop, emit)
-            _log_done(st, ct, reason, text)
-
-            done = json.dumps(_chunk(req_id, model, mode, "", reason),
-                              ensure_ascii=False).encode("utf-8")
-            self.wfile.write(b"data: " + done + b"\n\n")
+            if buffered:
+                # 工具/结构化请求：先整段缓冲再发。模型原生协议标记（<tool_call> /
+                # <function ...> / DeepSeek 专用 token）绝不能当 content 流出去。
+                text, reason, ct = _run_llm(st, stop, None)
+                parsed = _parse_result(text, parse_tools, response_format)
+                finish = ("tool_calls"
+                          if (parsed is not None and parsed.tool_calls) else reason)
+                _log_done(st, ct, finish, text)
+                for chunk in _buffered_stream_chunks(req_id, model, mode, parsed,
+                                                     finish):
+                    self._write_sse(chunk)
+            else:
+                # 普通请求走原流式路径（逐 token 增量解码与推送，行为与性能口径不变）。
+                if mode == "chat":
+                    self._write_sse(_chunk(req_id, model, mode, role=True))
+                text, reason, ct = _run_llm(st, stop, emit)
+                _log_done(st, ct, reason, text)
+                self._write_sse(_chunk(req_id, model, mode, finish_reason=reason))
 
             if include_usage:
                 usage.update(completion_tokens=ct, total_tokens=st.prompt_tokens + ct)
@@ -1509,8 +1968,7 @@ class Handler(BaseHTTPRequestHandler):
                     "choices": [],
                     "usage": usage,
                 }
-                payload = json.dumps(usage_chunk, ensure_ascii=False).encode("utf-8")
-                self.wfile.write(b"data: " + payload + b"\n\n")
+                self._write_sse(usage_chunk)
 
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
@@ -1614,6 +2072,12 @@ def _build_parser():
     parser.add_argument("--top-k", type=int, default=0, help="默认 top-k，请求体可覆盖；0 关闭")
     parser.add_argument("--no-think", action="store_true")
     parser.add_argument("--reserve-output", type=int, default=512)
+    parser.add_argument("--tool-protocol", default="auto", choices=("auto",) + PROTOCOLS,
+                        help="模型原生工具调用协议；auto = 按 chat template 探测（默认）")
+    parser.add_argument("--no-path-constraints", action="store_true",
+                        help="关闭约束解码（默认开启）：工具/JSON 请求退化为「不约束、只解析」")
+    parser.add_argument("--max-tools", type=int, default=64,
+                        help="单个请求的 tools 数量上限，默认 64")
     parser.add_argument("--asr-max-tokens", type=int, default=256,
                         help="音频转写默认输出上限，默认 256（Qwen3-ASR 官方推荐；长音频可调大）")
     parser.add_argument("--asr-max-upload-mb", type=int, default=32,
@@ -1641,12 +2105,15 @@ def main(argv=None):
     global _max_model_len, _default_thinking, _default_reserve
     global TPS_INTERVAL, _ui_html_path, _engine_failure
     global _asr_processor, _asr_max_tokens, _asr_max_upload_bytes
+    global _tool_protocol, _resolved_protocol, _enable_path_constraints, _max_tools
 
     parser = _build_parser()
     args = parser.parse_args(argv)
 
     if args.prefix_cache and args.no_prefix_cache:
         parser.error("--prefix-cache 与 --no-prefix-cache 不能同时使用")
+    if args.max_tools < 1:
+        parser.error("--max-tools 必须为正整数")
     enable_prefix_cache = True if args.prefix_cache else not args.no_prefix_cache
     # 310P 算子选择开关必须在后端导入/初始化之前进环境变量。只有显式传参才写：
     # 未传时保留用户导出的 LITEQ_* （后端据此决定，默认 functional/npu）。
@@ -1673,6 +2140,9 @@ def main(argv=None):
     _default_thinking = False if args.no_think else None
     _default_reserve = max(1, args.reserve_output)
     TPS_INTERVAL = max(0.0, args.stats_interval)
+    _tool_protocol = args.tool_protocol
+    _enable_path_constraints = not args.no_path_constraints
+    _max_tools = max(1, args.max_tools)
     _ui_enabled = not args.no_ui
     _ui_html_path = args.webui or None
     _open_raw_log(args.raw_log)
@@ -1693,6 +2163,8 @@ def main(argv=None):
         enable_prefix_cache=enable_prefix_cache,
         enable_constraints=args.enable_constraints,
         constraint_ignore_spaces=args.constraint_ignore_spaces,
+        # 结构化约束（工具调用 / JSON Schema）默认开启；掩码在主机侧落，图内采样会关掉。
+        enable_path_constraints=_enable_path_constraints,
         recurrent_prefix_cache_bytes=args.recurrent_prefix_cache_mb * 1024 * 1024,
         fp16_only=args.fp16_only,
     )
@@ -1732,6 +2204,14 @@ def main(argv=None):
         _lora_slots = {name: manager.slot_of(name) for name, _ in lora_modules}
     _asr_max_tokens = max(1, args.asr_max_tokens)
     _asr_max_upload_bytes = max(1, args.asr_max_upload_mb) * 1024 * 1024
+    # 工具协议在拿到 tokenizer 之后解析一次（auto 按 chat template 特征探测）；
+    # 请求路径只读结果，不重复探测。显式取值由 argparse choices 保证合法，这里只是兜底。
+    try:
+        _resolved_protocol = resolve_protocol(_tool_protocol, _tokenizer)
+    except ValueError as exc:
+        _log("WARN", f"工具协议解析失败（{exc}），回退 hermes")
+        _resolved_protocol = "hermes"
+    _configure_special_stripping(_tokenizer, _resolved_protocol)
     # 只有音频目标模型才初始化 AsrProcessor；其它模型保持端点存在但返回 400，
     # 这样客户端探测 /v1/audio/transcriptions 时拿到明确错误而不是 404。
     if getattr(engine.config.target_adapter, "audio_input", False):
@@ -1760,6 +2240,9 @@ def main(argv=None):
              f"{ {name: slot for name, slot in _lora_slots.items()} } "
              f"(max_loras={args.max_loras}, rank<={args.max_lora_rank}); "
              f"请求体 model 填适配器名即可路由")
+    _log("INFO", f"Tool calls: protocol={_resolved_protocol} (requested={_tool_protocol}), "
+                 f"path_constraints={'on' if _enable_path_constraints else 'off'}, "
+                 f"max_tools={_max_tools}")
     if _asr_processor is not None:
         _log("INFO",
              f"ASR transcription enabled: POST /v1/audio/transcriptions "

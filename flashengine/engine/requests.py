@@ -9,7 +9,8 @@ class RequestCapacityError(RuntimeError):
 
 
 class EngineRequests:
-    def add_request(self, prompt, sampling_params, audio=None, lora_request=None):
+    def add_request(self, prompt, sampling_params, audio=None, lora_request=None,
+                    constraint=None):
         """登记一条请求。
 
         audio 为多模态音频的预处理产物（`AsrProcessor.build` 的返回值去掉 input_ids），
@@ -19,9 +20,17 @@ class EngineRequests:
 
         lora_request 为 `flashengine.lora.LoRARequest`：只在启动时 `lora_modules`
         注册过的适配器可用，否则直接报错（不静默回落到基座）。
+
+        constraint 为结构化约束（`flashengine.structured.PathConstraint`），需要引擎开启
+        `enable_path_constraints`：掩码在主机侧按语法状态生成，图内采样会绕过它。
         """
         if getattr(self, "_closed", False):
             raise RuntimeError("引擎已关闭")
+        if constraint is not None and not getattr(
+                self.config, "enable_path_constraints", False):
+            raise ValueError(
+                "请求带结构化约束，但引擎未开启 enable_path_constraints；"
+                "请用 enable_path_constraints=True 构造引擎")
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         if (not isinstance(prompt, (list, tuple)) or not prompt
@@ -57,6 +66,10 @@ class EngineRequests:
             seq.audio = audio
             # 占位 token 序列相同不代表隐层相同（音频特征不同），不能被前缀缓存复用。
             seq.skip_prefix_cache = True
+        if constraint is not None:
+            seq.path_constraint = constraint
+            seq.path_state = constraint.initial_state()
+            seq.path_committed = 0
         self.scheduler.add(seq)
         return seq
 

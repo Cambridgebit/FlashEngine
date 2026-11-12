@@ -1,17 +1,26 @@
 {
-  "schema_version":1,
+  "schema_version":2,
   "endpoints":{
     "GET /health":"liveness/readiness；设备异常终止进程",
     "GET /v1/models":"OpenAI model list",
-    "POST /v1/completions":"字符串或单条 token IDs，n=1，greedy",
-    "POST /v1/chat/completions":"文本 system/user/assistant 消息，n=1，greedy",
+    "POST /v1/completions":"字符串或单条 token IDs，n=1；不支持 tools/tool_choice/response_format",
+    "POST /v1/chat/completions":"文本 system/user/assistant/tool 消息，n=1；支持 tools / tool_choice / response_format",
     "GET /metrics":"Prometheus text",
     "GET /v1/metrics":"Prometheus text",
     "GET /v1/stats":"info/metrics/requests host snapshot"
   },
-  "request_fields":["model","prompt","messages","max_tokens","temperature","top_p","top_k","n","stream","stop","stream_options","chat_template_kwargs"],
-  "defaults":{"temperature":0,"top_p":1,"top_k":0,"n":1,"max_tokens":128,"enable_thinking":true,"reserve_output":512},
-  "unsupported":["tools","tool_choice","logprobs","response_format","seed","n>1","temperature>0"],
+  "request_fields":["model","prompt","messages","max_tokens","temperature","top_p","top_k","n","stream","stop","stream_options","chat_template_kwargs","tools","tool_choice","parallel_tool_calls","response_format"],
+  "defaults":{"temperature":0,"top_p":1,"top_k":0,"n":1,"max_tokens":128,"enable_thinking":true,"reserve_output":512,"tool_choice":"auto（有 tools 时）/ none","max_tools":64},
+  "unsupported":["logprobs","seed","n>1","temperature>0","response_format.json_object","tools 于 /v1/completions"],
+  "tool_calls":{
+    "constraint":"tool_choice=required 或指定函数时按模型原生协议做约束解码（默认开启，--no-path-constraints 只解析不约束）",
+    "protocols":"auto（按 chat template 探测）/ xml_function（MiniCPM5）/ hermes（Qwen3）/ deepseek_v3",
+    "protocols_endpoint":"GET /v1/stats 的 info.tool_protocol；启动日志打印解析结果",
+    "response":"choices[0].message 含 tool_calls（id/type/function{name,arguments}），finish_reason=tool_calls",
+    "streaming":"带 tools/response_format 的请求整段缓冲后发 SSE：role → tool_calls 分片（name 与完整 arguments）→ finish；普通请求保持原逐 token 流式",
+    "constraint_scope":"约束解码请求不参加投机轮；开启约束时图内采样关闭（logits 交回主机落掩码）",
+    "response_format":"{\"type\":\"json_schema\",\"json_schema\":{\"name\",\"schema\"}}；schema 子集见 docs/STRUCTURED_DECODING.md"
+  },
   "sse":{"framing":"data: <json>\n\n","terminator":"data: [DONE]\n\n","usage":"stream_options.include_usage"},
   "errors":{"invalid_request":400,"unauthorized":401,"overloaded":429},
   "cancellation":"断连仅取消对应请求；下一设备安全点回收 KV 和 draft 状态。",

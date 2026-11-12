@@ -243,6 +243,7 @@ class ModelRunner:
         self.graph_sample = (
             self.world_size == 1
             and not config.enable_constraints
+            and not config.enable_path_constraints
             and (self.backend.graph_sample_default if _env_sample is None
                  else _env_sample != "0")
         )
@@ -366,6 +367,7 @@ class ModelRunner:
                 )
         self.precision_audit = self._audit_precision(config)
         self.sampler = Sampler(device_rng=self.backend.supports_device_sampling_rng)
+        self.path_constraints_enabled = bool(config.enable_path_constraints)
         # 禁词约束：只建一次掩码器，随后每步取 bias 行；关闭时不加载 tokenizer。
         self.word_filter = None
         if config.enable_constraints and rank == 0:
@@ -447,6 +449,7 @@ class ModelRunner:
             "greedy_replays": 0,
             "greedy_capture_success": 0,
             "context_limited_rounds": 0,
+            "path_constraint_rounds": 0,
             "bucket_hits": {},
         }
         self.spec_accept_stats = {
@@ -1345,7 +1348,47 @@ class ModelRunner:
             states = torch.tensor([getattr(seq, "constraint_state", 0) for seq in seqs],
                                   dtype=torch.int64, device=logits.device)
             logits = logits + self._constraint_bias.index_select(0, states)
+        if self.path_constraints_enabled:
+            logits = self._apply_path_masks(logits, seqs)
         return self._sample_prepared(logits, seqs, is_prefill, prepared)
+
+    def _apply_path_masks(self, logits, seqs):
+        """按各序列的结构化约束状态在 logits 上落 -inf 掩码（采样前）。
+
+        与禁词约束同属"采样前偏置"；区别是结构化约束的状态空间大，不能预生成
+        [状态, 词表] 的偏置表，只能按状态现场取词表位图（语法对象内部按状态缓存）。
+        图内采样必须已关闭（config.enable_path_constraints 会关），否则这条路径根本
+        走不到，掩码会被绕过。
+        """
+        if logits.dim() != 2 or logits.shape[0] != len(seqs):
+            raise RuntimeError(
+                f"结构化约束要求 [请求数, 词表] 的 logits，收到 {tuple(logits.shape)}；"
+                "该采样路径无法应用掩码")
+        negative = torch.finfo(logits.dtype).min
+        rows = []
+        touched = False
+        for index, seq in enumerate(seqs):
+            constraint = getattr(seq, "path_constraint", None)
+            row = torch.zeros(
+                logits.shape[1], dtype=logits.dtype, device=logits.device
+            )
+            if constraint is not None:
+                state = getattr(seq, "path_state", None)
+                if state is None:
+                    state = constraint.initial_state()
+                allowed = constraint.mask(state)
+                if allowed.shape[0] != logits.shape[1]:
+                    raise RuntimeError(
+                        f"约束词表大小 {allowed.shape[0]} 与模型词表 {logits.shape[1]} 不一致；"
+                        "请检查 tokenizer 与 config.model_config.vocab_size")
+                row_mask = torch.from_numpy(allowed).to(logits.device)
+                row = row.masked_fill(~row_mask, negative)
+                touched = True
+            rows.append(row)
+        if touched:
+            # 不用原地写：logits 是 inference_mode 内产生的 inference tensor，图外原地改会报错。
+            logits = logits + torch.stack(rows)
+        return logits
 
     def _sample_prepared(self, logits, seqs, is_prefill=False, prepared=None):
         if all(seq.temperature <= 1e-10 for seq in seqs):
@@ -1451,6 +1494,22 @@ class ModelRunner:
         self.spec_graph_stats["eager_rounds"] += 1
         self.spec_graph_stats["context_limited_rounds"] += 1
         return result
+
+    @torch.inference_mode()
+    def path_constraint_round(self, seqs):
+        """结构化约束请求的单 token 解码轮。
+
+        约束请求不参加投机轮：verify 的 k+1 行 logits 在已捕获的图里采样，掩码塞不进图；
+        这里走一次普通 eager decode（`_sample_logits` 会落掩码），保证输出严格合规。
+        """
+        ids, positions = self.prepare_decode(seqs)
+        hidden, _ = self.model(ids, positions)
+        logits = self.model.compute_logits(hidden)
+        tokens = self._sample_logits(logits, seqs)
+        self.spec_graph_stats["eager_rounds"] += 1
+        self.spec_graph_stats["path_constraint_rounds"] += 1
+        reset_context()
+        return [[token] for token in tokens]
 
     def _fill_spec_meta(self, seqs: list[Sequence]) -> int:
         k = self.config.spec_num_tokens
