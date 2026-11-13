@@ -296,6 +296,8 @@ class ModelRunner:
         self.precision_audit = self._audit_precision(config)
         self.sampler = Sampler(device_rng=self.backend.supports_device_sampling_rng)
         self.path_constraints_enabled = bool(config.enable_path_constraints)
+        self._path_bitmask = None
+        self._path_bitmask_rows = 0
         # 禁词约束：只建一次掩码器，随后每步取 bias 行；关闭时不加载 tokenizer。
         self.word_filter = None
         if config.enable_constraints and rank == 0:
@@ -374,7 +376,7 @@ class ModelRunner:
             "greedy_replays": 0,
             "greedy_capture_success": 0,
             "context_limited_rounds": 0,
-            "path_constraint_rounds": 0,
+            "constrained_rounds": 0,
             "bucket_hits": {},
         }
         self.spec_accept_stats = {
@@ -1234,43 +1236,83 @@ class ModelRunner:
             logits = self._apply_path_masks(logits, seqs)
         return self._sample_prepared(logits, seqs, is_prefill, prepared)
 
-    def _apply_path_masks(self, logits, seqs):
-        """按各序列的结构化约束状态在 logits 上落 -inf 掩码（采样前）。
+    def _path_bitmask_applier(self, rows: int):
+        """按需扩容的打包位图缓冲（int32，vocab/32 个字）。"""
+        if self._path_bitmask is None or self._path_bitmask_rows < rows:
+            from flashengine.structured.bitmask import BitmaskApplier
 
-        与禁词约束同属"采样前偏置"；区别是结构化约束的状态空间大，不能预生成
-        [状态, 词表] 的偏置表，只能按状态现场取词表位图（语法对象内部按状态缓存）。
-        图内采样必须已关闭（config.enable_path_constraints 会关），否则这条路径根本
-        走不到，掩码会被绕过。
+            self._path_bitmask_rows = max(rows, self._path_bitmask_rows)
+            self._path_bitmask = BitmaskApplier(
+                self._path_bitmask_rows,
+                self.config.model_config.vocab_size,
+                device=self.device,
+            )
+        return self._path_bitmask
+
+    def _apply_path_masks(self, logits, seqs):
+        """按结构化约束状态落掩码：vLLM 口径的 int32 打包位图 + 图外 apply。
+
+        位图在主机侧按状态填好（每状态缓存），一次 H2D；CUDA 用 Triton kernel 把不允许
+        的位置写 -inf，其它后端退回 torch 展开。掩码/采样都在图外——图内采样开启时这条
+        路径根本走不到（config.enable_path_constraints 会关掉图内采样）。
         """
         if logits.dim() != 2 or logits.shape[0] != len(seqs):
             raise RuntimeError(
                 f"结构化约束要求 [请求数, 词表] 的 logits，收到 {tuple(logits.shape)}；"
                 "该采样路径无法应用掩码")
-        negative = torch.finfo(logits.dtype).min
         rows = []
         touched = False
-        for index, seq in enumerate(seqs):
+        for seq in seqs:
             constraint = getattr(seq, "path_constraint", None)
-            row = torch.zeros(
-                logits.shape[1], dtype=logits.dtype, device=logits.device
-            )
-            if constraint is not None:
-                state = getattr(seq, "path_state", None)
-                if state is None:
-                    state = constraint.initial_state()
-                allowed = constraint.mask(state)
-                if allowed.shape[0] != logits.shape[1]:
-                    raise RuntimeError(
-                        f"约束词表大小 {allowed.shape[0]} 与模型词表 {logits.shape[1]} 不一致；"
-                        "请检查 tokenizer 与 config.model_config.vocab_size")
-                row_mask = torch.from_numpy(allowed).to(logits.device)
-                row = row.masked_fill(~row_mask, negative)
-                touched = True
-            rows.append(row)
-        if touched:
-            # 不用原地写：logits 是 inference_mode 内产生的 inference tensor，图外原地改会报错。
-            logits = logits + torch.stack(rows)
-        return logits
+            if constraint is None:
+                rows.append(None)          # 全允许
+                continue
+            state = getattr(seq, "path_state", None)
+            if state is None:
+                state = constraint.initial_state()
+            rows.append((constraint, state))
+            touched = True
+        if not touched:
+            return logits
+        if logits.shape[1] != self.config.model_config.vocab_size:
+            raise RuntimeError(
+                f"约束词表大小 {self.config.model_config.vocab_size} 与 logits 词表 "
+                f"{logits.shape[1]} 不一致；请检查 tokenizer 与模型 config")
+        applier = self._path_bitmask_applier(len(rows))
+        applier.fill(rows, device=logits.device)
+        return applier.apply(logits, len(rows))
+
+    def _apply_spec_path_masks(self, logits, seqs, draft_tokens):
+        """投机 verify 的多行掩码：行 j = 已提交前缀再吃掉 d1..d{j-1}。
+
+        状态不可变，所以"乐观推进"不需要 rollback：推演出来的行状态用完即弃，真正提交
+        后由 `_sync_path_states` 用真实 token 推进。行数 = len(seqs) * (k+1)，与
+        verify logits 的行序（按序列连续、每序列 0..k）一致。
+        """
+        k = self.config.spec_num_tokens
+        rows_per_seq = k + 1
+        if logits.shape[0] != len(seqs) * rows_per_seq:
+            raise RuntimeError(
+                f"投机约束掩码要求 [{len(seqs)}*{rows_per_seq}, 词表] 的 logits，"
+                f"收到 {tuple(logits.shape)}")
+        rows = []
+        touched = False
+        for seq, drafts in zip(seqs, draft_tokens):
+            constraint = getattr(seq, "path_constraint", None)
+            if constraint is None:
+                rows.extend([None] * rows_per_seq)
+                continue
+            state = getattr(seq, "path_state", None)
+            if state is None:
+                state = constraint.initial_state()
+            states = constraint.spec_states(state, drafts)
+            rows.extend((constraint, item) for item in states)
+            touched = True
+        if not touched:
+            return logits
+        applier = self._path_bitmask_applier(len(rows))
+        applier.fill(rows, device=logits.device)
+        return applier.apply(logits, len(rows))
 
     def _sample_prepared(self, logits, seqs, is_prefill=False, prepared=None):
         if all(seq.temperature <= 1e-10 for seq in seqs):
@@ -1315,11 +1357,23 @@ class ModelRunner:
     @torch.inference_mode()
     def spec_round(self, seqs: list[Sequence]) -> list[list[int]]:
         self._spec_batch_greedy = all(seq.temperature <= 1e-10 for seq in seqs)
-        sampling_compatible = (
-            self.graph_sample
-            or self._spec_batch_greedy
-        )
-        result = self.spec_runtime.round(seqs, sampling_compatible)
+        constrained = any(
+            getattr(seq, "path_constraint", None) is not None for seq in seqs)
+        if constrained:
+            # 整轮 spec 图把采样也捕获了，动态语法掩码塞不进去；约束请求走 eager 轮：
+            # verify logits 出图后按"已提交前缀 + 草稿"的多行位图落掩码，再采样/接受，
+            # 等价 vLLM 的"图只包前向、采样与 bitmask 都在图外"。
+            if self.spec_runtime.block_draft:
+                result = self._df_round_eager(seqs)
+            else:
+                result = self._spec_round_eager(seqs)
+            self.spec_graph_stats["constrained_rounds"] += 1
+        else:
+            sampling_compatible = (
+                self.graph_sample
+                or self._spec_batch_greedy
+            )
+            result = self.spec_runtime.round(seqs, sampling_compatible)
         self._record_spec_acceptance(result)
         return result
 
@@ -1349,22 +1403,6 @@ class ModelRunner:
         self.spec_graph_stats["context_limited_rounds"] += 1
         reset_context()
         return result
-
-    @torch.inference_mode()
-    def path_constraint_round(self, seqs):
-        """结构化约束请求的单 token 解码轮。
-
-        约束请求不参加投机轮：verify 的 k+1 行 logits 在已捕获的图里采样，掩码塞不进图；
-        这里走一次普通 eager decode（`_sample_logits` 会落掩码），保证输出严格合规。
-        """
-        ids, positions = self.prepare_decode(seqs)
-        hidden, _ = self.model(ids, positions)
-        logits = self.model.compute_logits(hidden)
-        tokens = self._sample_logits(logits, seqs)
-        self.spec_graph_stats["eager_rounds"] += 1
-        self.spec_graph_stats["path_constraint_rounds"] += 1
-        reset_context()
-        return [[token] for token in tokens]
 
     def _fill_spec_meta(self, seqs: list[Sequence]) -> int:
         k = self.config.spec_num_tokens
@@ -1524,7 +1562,7 @@ class ModelRunner:
 
         self._fill_spec_meta(seqs)
         self._push_spec_meta()
-        self._sg_round(n, use_cuda_graph=False)
+        self._sg_round(n, use_cuda_graph=False, seqs=seqs)
         results = self._readback_spec_commit(seqs)
         for i, seq in enumerate(seqs):
             self.spec_carry[seq.seq_id] = (row_m_hidden[i:i + 1], draft1[i].item())
@@ -1673,7 +1711,7 @@ class ModelRunner:
         self._fill_df_meta(seqs)
         self._df_load_ctx_aux(seqs, size)
         self._push_spec_meta()
-        self._df_round_body(size, use_cuda_graph=False)
+        self._df_round_body(size, use_cuda_graph=False, seqs=seqs)
         return self._df_readback_commit(seqs)
     def _verify_block_tables(self, g, bs: int, rows: int):
         if self.paged_context_attn:
@@ -1787,7 +1825,7 @@ class ModelRunner:
             ids = self.draft_model.map_to_target_ids(ids)
         g['drafted_ids'][:k, :bs] = ids.t()
 
-    def _df_round_body(self, bs: int, use_cuda_graph: bool = True):
+    def _df_round_body(self, bs: int, use_cuda_graph: bool = True, seqs=None):
         g = self._sg
         k = self.config.spec_num_tokens
         rows = k + 1
@@ -1799,7 +1837,7 @@ class ModelRunner:
         v[:, 0] = g['chain_tokens'][:bs]
         v[:, 1:].copy_(g['drafted_ids'][:k, :bs].t())
         self._spec_constraint_rows(bs)
-        self._sg_verify(bs, use_cuda_graph)
+        self._sg_verify(bs, use_cuda_graph, seqs)
         self._sg_acceptance(bs)
         if self.state_runtime:
             self.state_runtime.commit_verify_device(g['commit_buf'], bs)
@@ -2117,7 +2155,7 @@ class ModelRunner:
             current = torch.where(advanced >= 0, advanced.to(torch.int64), current)
             view[:, step + 1] = current
 
-    def _sg_verify(self, bs: int, use_cuda_graph: bool = True):
+    def _sg_verify(self, bs: int, use_cuda_graph: bool = True, seqs=None):
         g = self._sg
         rows = self.config.spec_num_tokens + 1
         set_context(True,
@@ -2138,6 +2176,15 @@ class ModelRunner:
             # 采样前加偏置：gather 一次 [bs*rows, 词表]，图内完成，不经主机。
             logits = logits + self._constraint_bias.index_select(
                 0, g['row_state'][:bs * rows])
+        if (not use_cuda_graph and self.path_constraints_enabled
+                and seqs is not None):
+            # 多行语法掩码：每行状态 = 已提交前缀 + 前面已"乐观接受"的草稿 token。
+            # 草稿 token 在设备侧产生，这里只回拷 k 个整数，代价可忽略。
+            ck = self.config.spec_num_tokens
+            draft_rows = g['drafted_ids'][:ck, :bs].to("cpu").tolist()
+            drafts_per_seq = [[draft_rows[step][i] for step in range(ck)]
+                              for i in range(bs)]
+            logits = self._apply_spec_path_masks(logits, seqs[:bs], drafts_per_seq)
         g['v_token_ids'][:bs * rows] = self._sg_sample(
             logits, g['v_temps'][:bs * rows], g['v_topps'][:bs * rows], g['v_topks'][:bs * rows],
             use_cuda_graph)
@@ -2195,7 +2242,7 @@ class ModelRunner:
         g['carry_seed'][:bs] = h_m
         g['commit_buf'][:bs, rows + 1] = g['drafted_ids'][0][:bs]
 
-    def _sg_round(self, bs: int, use_cuda_graph: bool):
+    def _sg_round(self, bs: int, use_cuda_graph: bool, seqs=None):
         g = self._sg
         k = self.config.spec_num_tokens
         rows = k + 1
@@ -2205,7 +2252,7 @@ class ModelRunner:
         v = g['v_input_ids'][:bs * rows].view(bs, rows)
         v[:, 0] = g['chain_tokens'][:bs]
         v[:, 1:].copy_(g['drafted_ids'][:k, :bs].t())
-        self._sg_verify(bs, use_cuda_graph)
+        self._sg_verify(bs, use_cuda_graph, seqs)
         self._sg_acceptance(bs)
         self._sg_refill(bs, use_cuda_graph)
 

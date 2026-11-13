@@ -21,10 +21,16 @@ import time
 
 from transformers import AutoTokenizer
 
+import numpy as np
+import torch
+
 from flashengine.structured import (
     PROTOCOLS,
+    BitmaskApplier,
     json_constraint,
+    pack_mask,
     tool_constraint,
+    unpack_mask,
     vocab_table,
 )
 
@@ -217,6 +223,54 @@ def main(argv=None):
              "required": ["b"]},
             tokenizer, eos_ids, vocab_size=vocab_size),
         "required")
+
+    # ---- 打包位图与投机多行状态（vLLM 口径）-------------------------------
+    print("\n[bitmask]")
+    rng = np.random.default_rng(0)
+    synthetic = rng.random(vocab_size) > 0.5
+    if not np.array_equal(unpack_mask(pack_mask(synthetic), vocab_size), synthetic):
+        checker.fail("pack_mask / unpack_mask 往返不一致")
+    else:
+        print("  ok   pack/unpack 往返一致（%d token）" % vocab_size)
+
+    state = xml.initial_state()
+    allowed = unpack_mask(xml.bitmask(state), vocab_size)
+    applier = BitmaskApplier(2, vocab_size, device="cpu")
+    applier.fill([(xml, state), None], device="cpu")
+    logits = torch.zeros(2, vocab_size)
+    out = applier.apply(logits, 2)
+    allowed_t = torch.from_numpy(allowed)
+    if not bool(torch.isinf(out[0][~allowed_t]).all()):
+        checker.fail("apply 没有把不允许的 token 写成 -inf")
+    elif not bool(out[0][allowed_t].eq(0).all()):
+        checker.fail("apply 改动了允许的 token")
+    elif not bool(out[1].eq(0).all()):
+        checker.fail("全允许行（None）被错误掩码")
+    else:
+        print("  ok   位图 apply：不允许位置 -inf、允许位不动、None 行全允许")
+
+    valid = tokenizer.encode(
+        '<function name="get_weather"><param name="city">Paris</param></function>',
+        add_special_tokens=False)
+    states = xml.spec_states(state, valid[:3])
+    expected = [state]
+    current = state
+    for token in valid[:3]:
+        current = xml.advance(current, token)
+        expected.append(current)
+    if list(states) != expected:
+        checker.fail("spec_states 的行状态与逐 token 推进不一致")
+    elif len(states) != 4:
+        checker.fail("spec_states 行数应为 k+1")
+    else:
+        print("  ok   spec_states：k+1 行按乐观推进排列")
+
+    invalid_token = tokenizer.encode("hello", add_special_tokens=False)[0]
+    bad_states = xml.spec_states(state, [invalid_token, invalid_token])
+    if bad_states[1] != state or bad_states[2] != state:
+        checker.fail("非法草稿 token 没有保持上一个可推进状态")
+    else:
+        print("  ok   非法草稿保持上一个状态（无需 rollback）")
 
     # ---- 掩码缓存 --------------------------------------------------------
     print("\n[掩码缓存]")

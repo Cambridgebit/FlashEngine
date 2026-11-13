@@ -71,13 +71,24 @@ JSON Schema 子集（编译期明确报错，不会生成期静默放宽）：
 
 后端无关：掩码在主机侧算好再与设备 logits 相加，CUDA/CoreX/310P 通用；要求 TP=1。
 
-## 4. 与投机解码的关系
+## 4. 与投机解码的关系（vLLM 对齐）
 
-约束请求**不参加投机轮**：verify 的 k+1 行 logits 在已捕获的图里采样，动态掩码塞不进图。
-混合 batch 里约束请求单独走一次单 token eager 轮（`ModelRunner.path_constraint_round`，
-统计 `path_constraint_rounds`），其余请求照常 speculative；投机图只服务无约束请求。
+约束请求**参加投机轮**。整轮 spec 图把采样/接受也捕获了，动态语法掩码塞不进图，所以
+`ModelRunner.spec_round` 检测到 `path_constraint` 时改走 eager spec 轮；算法与 vLLM 一致：
 
-开启 `enable_path_constraints` 会同时关掉图内采样（decode graph 只出 logits，掩码在主机侧落），
+1. 草稿链在设备侧产 k 个草稿 token；
+2. verify logits 出图后，按"已提交前缀 + d1..d{j-1}"**乐观推进**语法得到 k+1 行状态
+   （语法状态不可变，回滚就是丢掉推演状态，不需要 vLLM 的 `grammar.rollback`）；
+3. 主机侧把每行打包成 int32 位图（`ceil(vocab/32)` 个字，bit=1 允许，与 xgrammar 同约定），
+   一次 H2D；
+4. 图外 apply：CUDA 用 Triton kernel `_apply_bitmask_kernel` 把 0 位写 `-inf`，
+   其它后端退回 torch 展开；
+5. 采样/接受/提交照旧；真正提交的 token 由 `_sync_path_states` 推进语法（只认已接受 token）。
+
+无约束请求继续走整轮 spec 图（`graph_replay` 正常增长）。位图按状态缓存（13 万词表约
+16KB/状态，比原来的 bool 掩码小 8 倍）。
+
+开启 `enable_path_constraints` 会同时关掉**图内采样**（decode graph 只出 logits，掩码在主机侧落），
 因此**不使用工具调用的纯性能场景建议用 `--no-path-constraints`**（工具请求退化为"不约束、只解析"）。
 
 ## 5. 用法
@@ -132,8 +143,10 @@ CPU 自检（不需要 GPU/权重，只要 tokenizer 目录）：
   `city="Paris"`、`finish_reason=tool_calls`；
 - 约束解码 16 token 约 1.0–1.4s；掩码冷启动 2.6ms/步、热路径 0ms，无约束路径行为与
   逐字节输出不变；
-- DSpark 引擎（MiniCPM5-2B + DSpark k=7）：带约束请求走 16 个单 token 轮、0 次 spec replay
-  且输出正确；不带约束请求仍走 spec 图（9 次 replay）。
+- DSpark 引擎（MiniCPM5-2B + DSpark k=7）：约束请求走 eager spec 轮（`constrained_rounds`
+  增长），**E=2.143**（7 轮接受 8 token），输出与普通约束解码逐字一致；长工具调用、
+  JSON Schema 约束、混合批（约束 + 自由请求同批）均通过；CUDA 上走 Triton 位图 apply
+  （`triton=True`）。无约束请求仍走整轮 spec 图。
 
 端到端（对着已启动服务，stdlib 客户端，含流式）：
 
@@ -206,7 +219,7 @@ Web GUI 用同一段 provider 配置（加在 `$DSH_HOME/profiles/<profile>/cord
 
 ## 8. 已知限制
 
-- 约束请求不参与投机（见 §4），单 token eager 解码比 spec 图慢；
+- 约束请求走 eager spec 轮（见 §4），比整轮 spec 图慢；无约束请求仍走最快路径；
 - `auto` 模式不约束、只解析：模型没调工具/格式不完整时服务端不做补救
   （`tool_choice=required` 才强制约束）；
 - 自由文本区禁止输出"非完整 UTF-8/特殊 token"的碎片，模型偶尔会选到更生僻的 token，

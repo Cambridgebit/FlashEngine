@@ -18,7 +18,7 @@
     "protocols_endpoint":"GET /v1/stats 的 info.tool_protocol；启动日志打印解析结果",
     "response":"choices[0].message 含 tool_calls（id/type/function{name,arguments}），finish_reason=tool_calls",
     "streaming":"带 tools/response_format 的请求整段缓冲后发 SSE：role → tool_calls 分片（name 与完整 arguments）→ finish；普通请求保持原逐 token 流式",
-    "constraint_scope":"约束解码请求不参加投机轮；开启约束时图内采样关闭（logits 交回主机落掩码）",
+    "constraint_scope":"约束解码请求参加投机轮：走 eager spec 轮，verify logits 出图后按已提交前缀+草稿的 k+1 行 int32 打包位图落掩码（状态不可变，乐观推进无需回滚），采样/接受在图外；无约束请求保留整轮 spec 图；开启约束时图内采样关闭",
     "response_format":"{\"type\":\"json_schema\",\"json_schema\":{\"name\",\"schema\"}}；schema 子集见 docs/STRUCTURED_DECODING.md"
   },
   "sse":{"framing":"data: <json>\n\n","terminator":"data: [DONE]\n\n","usage":"stream_options.include_usage"},

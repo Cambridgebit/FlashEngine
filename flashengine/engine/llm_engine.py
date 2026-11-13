@@ -292,21 +292,16 @@ class LLMEngine(EngineRequests):
             self._drop_finished_spec_state(capped)
         if not active:
             return self._collect_outputs(capped), 0
-        # 结构化约束请求不参加投机轮：掩码无法塞进已捕获的图，单独走单 token eager 轮。
-        structured = [seq for seq in active
-                      if getattr(seq, "path_constraint", None) is not None]
-        rest = [seq for seq in active
-                if getattr(seq, "path_constraint", None) is None]
-        limited = [seq for seq in rest if self.config.max_model_len - len(seq) < num_draft + 1]
-        normal = [seq for seq in rest if seq not in limited]
+        # 约束请求同样参加投机轮：ModelRunner.spec_round 检测到 path_constraint 时改走
+        # eager 轮（verify logits 出图后按多行位图落掩码再采样/接受），无约束批继续用
+        # 整轮 spec 图。两者的提交契约一致，这里不再按约束拆分。
+        limited = [seq for seq in active if self.config.max_model_len - len(seq) < num_draft + 1]
+        normal = [seq for seq in active if seq not in limited]
         by_id = {}
         if normal:
             by_id.update(zip((seq.seq_id for seq in normal), self.model_runner.call("spec_round", normal)))
         if limited:
             by_id.update(zip((seq.seq_id for seq in limited), self.model_runner.call("context_limited_spec_round", limited)))
-        if structured:
-            by_id.update(zip((seq.seq_id for seq in structured),
-                             self.model_runner.call("path_constraint_round", structured)))
         committed = [by_id[seq.seq_id] for seq in active]
         if self.observer is not None:
             self.observer.on_commit(active, committed, perf_counter())
