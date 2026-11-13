@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 from collections import OrderedDict
 
+from flashengine.structured.bitmask import BitmaskApplier, pack_mask, unpack_mask
 from flashengine.structured.machines import (  # noqa: F401  （对外导出便于测试）
     DONE,
     END,
@@ -41,15 +42,25 @@ _GRAMMAR_LIMIT = 16
 
 
 class PathConstraint:
-    """挂在一条请求上的结构化约束（状态由引擎按生成历史推进）。"""
+    """挂在一条请求上的结构化约束（状态由引擎按生成历史推进）。
 
-    __slots__ = ("grammar", "name", "description", "_initial")
+    状态是不可变对象：投机 verify 的多行掩码用"乐观推进"算出来即可，**回滚天然免费**
+    （丢掉推演状态、保留已提交状态），对应 vLLM 里 ``grammar.accept_tokens`` +
+    ``grammar.rollback`` 的语义。
+    """
+
+    __slots__ = ("grammar", "name", "description", "_initial", "_packed",
+                 "_packed_bytes", "_packed_limit")
 
     def __init__(self, grammar: Grammar, name: str, description: str = ""):
         self.grammar = grammar
         self.name = name
         self.description = description
         self._initial = grammar.initial()
+        # int32 打包位图缓存：每状态约 vocab/32*4 字节（13 万词表约 16KB）。
+        self._packed = OrderedDict()
+        self._packed_bytes = 0
+        self._packed_limit = 32 << 20
 
     def initial_state(self):
         return self._initial
@@ -59,6 +70,36 @@ class PathConstraint:
 
     def mask(self, state):
         return self.grammar.mask(state)
+
+    def bitmask(self, state):
+        """vLLM 口径的打包位图（int32[ceil(vocab/32)]），按状态缓存。"""
+        cached = self._packed.get(state)
+        if cached is not None:
+            self._packed.move_to_end(state)
+            return cached
+        packed = pack_mask(self.grammar.mask(state))
+        self._packed[state] = packed
+        self._packed_bytes += packed.nbytes
+        while self._packed_bytes > self._packed_limit and self._packed:
+            _, old = self._packed.popitem(last=False)
+            self._packed_bytes -= old.nbytes
+        return packed
+
+    def spec_states(self, state, draft_tokens):
+        """投机 verify 的多行状态：行 j = 已提交前缀再吃掉 d1..d{j-1}。
+
+        草稿 token 不在语法允许范围内时保持上一个可推进状态（该行及之后的采样结果本来
+        就会被接受逻辑丢弃）。返回长度 ``len(draft_tokens) + 1``。
+        """
+        states = [state]
+        current = state
+        for token in draft_tokens:
+            try:
+                current = self.advance(current, int(token))
+            except ValueError:
+                pass
+            states.append(current)
+        return states
 
     def is_accepting(self, state):
         return self.grammar.accepting(state)
@@ -145,6 +186,9 @@ __all__ = [
     "FreeText",
     "NumberText",
     "VocabTable",
+    "BitmaskApplier",
+    "pack_mask",
+    "unpack_mask",
     "vocab_table",
     "tool_constraint",
     "json_constraint",
