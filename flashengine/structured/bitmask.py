@@ -90,6 +90,11 @@ class BitmaskApplier:
         self.device = torch.device(device) if device is not None else None
         self.dtype = dtype
         self._host = np.full((self.max_rows, self.words), -1, dtype=np.int32)
+        # 非 CUDA 后端用「已展开的 bool 允许表」：310P 上 aclnn 的 RightShift 不支持
+        # 位图广播（实测 `Shape of out should be [1, 7760*32]` 类 161002），展开后的
+        # 形状与 logits 同宽，masked_fill 一条算子即可。
+        self._allowed_host = np.ones((self.max_rows, self.vocab_size), dtype=bool)
+        self._allowed_device = None
         self._device = None
         self._pinned = None
         self._triton_ready = False
@@ -108,6 +113,10 @@ class BitmaskApplier:
                                     pin_memory=True) if use_pin else None)
         self._triton_ready = bool(
             use_pin and _HAS_TRITON and self.device.type == "cuda")
+        self._allowed_device = (
+            None if self._triton_ready else
+            torch.empty((self.max_rows, self.vocab_size), dtype=torch.bool,
+                        device=self.device))
 
     # -- 填充与 apply -----------------------------------------------------
 
@@ -118,12 +127,16 @@ class BitmaskApplier:
             raise RuntimeError(
                 f"位图行数 {n} 超过容量 {self.max_rows}；请调大 max_rows")
         host = self._host[:n]
+        allowed_host = self._allowed_host[:n]
         for index, row in enumerate(rows):
             if row is None:
                 host[index].fill(-1)             # 全部允许
+                allowed_host[index].fill(True)
             else:
                 constraint, state = row
-                host[index] = constraint.bitmask(state)
+                packed = constraint.bitmask(state)
+                host[index] = packed
+                allowed_host[index] = unpack_mask(packed, self.vocab_size)
         self._ensure_device(device)
         src = torch.from_numpy(host)
         if self._pinned is not None:
@@ -131,6 +144,8 @@ class BitmaskApplier:
             self._device[:n].copy_(self._pinned[:n], non_blocking=True)
         else:
             self._device[:n].copy_(src)
+        if self._allowed_device is not None:
+            self._allowed_device[:n].copy_(torch.from_numpy(allowed_host))
         return n
 
     def apply(self, logits: torch.Tensor, n: int) -> torch.Tensor:
@@ -146,10 +161,6 @@ class BitmaskApplier:
                 self.vocab_size, BLOCK_SIZE=_BLOCK,
             )
             return out
-        # 回退：torch 展开位图（CPU/CoreX/310P 都能跑，行的语义一致）
-        shifts = torch.arange(32, device=self.device, dtype=torch.int32)
-        packed = self._device[:n]
-        bits = ((packed.unsqueeze(-1) >> shifts) & 1)
-        allowed = bits.reshape(n, -1)[:, :self.vocab_size].bool()
-        out[:n] = out[:n].masked_fill(~allowed, float("-inf"))
+        # 回退：主机侧展开成 bool 允许表（CPU/CoreX/310P 都能跑，行的语义一致）
+        out[:n] = out[:n].masked_fill(~self._allowed_device[:n], float("-inf"))
         return out

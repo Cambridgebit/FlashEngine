@@ -606,7 +606,7 @@ def _roll_auto_context(st):
         top_p=old_seq.top_p,
         top_k=old_seq.top_k,
         ignore_eos=old_seq.ignore_eos,
-    ))
+    ), lora_id=old_seq.lora_id)
     new_seq.prefix_cache_hit_blocks = old_seq.prefix_cache_hit_blocks
     new_seq.prefill_query_tokens = old_seq.prefill_query_tokens
     new_seq.prefill_splitfuse_used = old_seq.prefill_splitfuse_used

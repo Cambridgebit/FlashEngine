@@ -162,6 +162,35 @@ CPU 自检（不需要 GPU/权重，只要 tokenizer 目录）：
 json_schema+required / thinking 冲突 / completions 带 tools / 非法 tool_choice）文案正确；
 普通 chat 流式仍逐 token（35 个 content chunk），没有被缓冲。
 
+实机（2026-11-23，Ascend 310P / Atlas 300I Duo，容器 `vllm018` / CANN 9.0.T3，融合 LoRA 的
+Qwen3.5-9B + DFlash k=7、fp16、`--max-model-len 2048 --max-num-seqs 8`）：
+
+- 协议探测：Qwen3.5 模板 → `hermes`；启动摘要打印 `Tool calls: protocol=hermes
+  (requested=auto), path_constraints=on, max_tools=64`；
+- 端到端四档全过：`--mode tool` 2/2（`get_weather({"city": "Paris"})`、`read_file({"path":
+  "src/main.py"})`，单请求 5.3–7.9s）、`--mode tool --stream` 2/2、`--mode json` 与
+  `--mode json --stream` 各 1/1（`{"city": "Paris", "temperature_c": 14, "condition":
+  "cloudy"}`）；
+- 约束请求确实走 eager spec 轮：`[DONE ]` 里 `spec_graph=0.0%(0/N)`、`E=1.58–1.91`；代价是每
+  token 190–217ms（同机无约束图路径 55ms），与 CUDA 侧「约束轮比整轮 spec 图慢」一致；
+- 310P 特有 bug（已修）：`flashengine/structured/bitmask.py` 的非 Triton 回退用
+  `packed.unsqueeze(-1) >> shifts` 广播展开位图，310P 的 `aclnnRightShift` 不接受该广播
+  （`AclNN_Parameter_Error(EZ1001): Shape of out should be ...`，错误码 161002，整个请求 500）。
+  改成主机侧 `unpack_mask` 展开成 bool 允许表（`self._allowed_host` / `self._allowed_device`，
+  只在 `not triton_ready` 时分配），`apply()` 回退分支变成一次 `masked_fill(~allowed, -inf)`；
+  CUDA/Triton 路径不变；
+- 约束一致性：同一 prompt、同一 schema、`enforce_eager` 下 spec 与无 spec 两次生成**逐 token
+  一致**（`[4754, 8656, 3147, 57590, 2129, 33413, 648, 763, 16, 19, 1288, 8783, 3147, 5619,
+  391, 14388, 88, 8934, 248046]`，输出 `{"city":"Paris","temperature_c":14,"condition":
+  "Partly Cloudy"}`）；
+- 零回归（同一台板、同一模型、`--max-model-len 2048 --max-num-seqs 8`、c1、128 token、
+  8 条）：业务长提示 13.924 TPS / TPOT p50 58.23ms（合并前 13.683 / 58.33），英文 coding
+  25.443 / 35.23ms（合并前 25.049 / 35.29）——约束开关默认关，热路径无额外分支；
+- CPU 自检在 310P 树上一并跑通（`scripts.check_structured --model /data/Qwen3-8B`：三协议 ok、
+  json_schema 4 项 ok、`pack/unpack 往返一致（151669 token）`），注意容器里需
+  `TORCH_DEVICE_BACKEND_AUTOLOAD=0`，否则 `torch_npu` 扩展加载失败会掩盖成
+  `ModuleNotFoundError: Could not import module 'AutoTokenizer'`。
+
 ## 7. 在 DSH 里调用
 
 `dsh headless` 的实测（2026-11-12）：用一个临时 overlay 把默认模型换成 FlashEngine 服务，
