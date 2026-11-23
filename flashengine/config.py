@@ -114,6 +114,9 @@ class Config:
     banned_words: tuple[str, ...] = DEFAULT_BANNED_WORDS
     # 忽略空白匹配可堵住"航 空"式绕过，但会把模型逼到劣质 token（实测乱码），默认关闭。
     constraint_ignore_spaces: bool = False
+    # 结构化约束（JSON Schema / 工具调用语法）：采样前按语法状态给 logits 落掩码。
+    # 掩码要回主机算，因此开启时关闭图内采样（graph_sample），其余路径不变。
+    enable_path_constraints: bool = False
     spec_model: str = ""
     spec_num_tokens: int = 4
     spec_aux_layers: tuple[int, ...] = ()
@@ -145,6 +148,8 @@ class Config:
         self.banned_words = normalize_banned_words(self.banned_words)
         if type(self.constraint_ignore_spaces) is not bool:
             raise ValueError("constraint_ignore_spaces 必须为布尔值")
+        if type(self.enable_path_constraints) is not bool:
+            raise ValueError("enable_path_constraints 必须为布尔值")
         resolve_constraint_words(self.enable_constraints, self.banned_words,
                                  tensor_parallel_size=self.tensor_parallel_size,
                                  spec_model=self.spec_model)

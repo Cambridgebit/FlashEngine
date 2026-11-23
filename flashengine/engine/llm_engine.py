@@ -276,6 +276,7 @@ class LLMEngine(EngineRequests):
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
         self._sync_constraint_states(seqs)
+        self._sync_path_states(seqs)
         self._drop_finished_spec_state(seqs)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens
@@ -299,6 +300,24 @@ class LLMEngine(EngineRequests):
             if seq.is_finished and masker.utf8_safe and masker._split(state)[1] != 0:
                 raise RuntimeError("约束输出在不完整 UTF-8 字符处结束，已停止返回结果")
 
+    def _sync_path_states(self, seqs):
+        """按真实生成历史回填结构化约束状态（与禁词状态同一口径）。"""
+        if not getattr(self.config, "enable_path_constraints", False):
+            return
+        for seq in seqs:
+            constraint = getattr(seq, "path_constraint", None)
+            if constraint is None:
+                continue
+            generated = seq.token_ids[seq.num_prompt_tokens:]
+            done = getattr(seq, "path_committed", 0)
+            restart = len(generated) < done
+            state = constraint.initial_state() if restart else seq.path_state
+            start = 0 if restart else done
+            for token in generated[start:]:
+                state = constraint.advance(state, token)
+            seq.path_state = state
+            seq.path_committed = len(generated)
+
     def _step_spec(self):
         seqs, is_prefill = self.scheduler.schedule()
         self._notify_schedule(seqs, is_prefill)
@@ -308,6 +327,7 @@ class LLMEngine(EngineRequests):
             self.model_runner.after_spec_prefill(seqs)
             self.scheduler.postprocess(seqs, token_ids, True)
             self._sync_constraint_states(seqs)
+            self._sync_path_states(seqs)
             self._drop_finished_spec_state(seqs)
             return self._collect_outputs(seqs), num_tokens
         num_draft = self.model_runner.config.spec_num_tokens
@@ -316,6 +336,9 @@ class LLMEngine(EngineRequests):
             self._drop_finished_spec_state(capped)
         if not active:
             return self._collect_outputs(capped), 0
+        # 约束请求同样参加投机轮：ModelRunner.spec_round 检测到 path_constraint 时改走
+        # eager 轮（verify logits 出图后按多行位图落掩码再采样/接受），无约束批继续用
+        # 整轮 spec 图。两者的提交契约一致，这里不再按约束拆分。
         limited = [seq for seq in active if self.config.max_model_len - len(seq) < num_draft + 1]
         normal = [seq for seq in active if seq not in limited]
         by_id = {}
@@ -328,6 +351,7 @@ class LLMEngine(EngineRequests):
             self.observer.on_commit(active, committed, perf_counter())
         finished = self.scheduler.commit_spec(active, committed)
         self._sync_constraint_states(active)
+        self._sync_path_states(active)
         self._drop_finished_spec_state(finished)
         num_tokens = -sum(len(tokens) for tokens in committed)
         return self._collect_outputs(capped + active), num_tokens
@@ -411,6 +435,7 @@ class LLMEngine(EngineRequests):
         use_tqdm: bool = True,
         audio: dict | list[dict | None] | None = None,
         lora_requests=None,
+        constraint=None,
     ) -> list[dict]:
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
@@ -432,12 +457,22 @@ class LLMEngine(EngineRequests):
             loras = list(lora_requests)
             if len(loras) != len(prompts):
                 raise ValueError("prompts 与 lora_requests 的数量必须一致")
+        if constraint is None:
+            constraints = [None] * len(prompts)
+        elif isinstance(constraint, (list, tuple)):
+            constraints = list(constraint)
+            if len(constraints) != len(prompts):
+                raise ValueError("prompts 与 constraint 的数量必须一致")
+        else:
+            constraints = [constraint] * len(prompts)
         pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
         submitted = []
         try:
-            for prompt, sp, item_audio, item_lora in zip(prompts, sampling_params, audios, loras):
-                submitted.append(
-                    self.add_request(prompt, sp, audio=item_audio, lora_request=item_lora))
+            for prompt, sp, item_audio, item_lora, item_constraint in zip(
+                    prompts, sampling_params, audios, loras, constraints):
+                submitted.append(self.add_request(
+                    prompt, sp, audio=item_audio, lora_request=item_lora,
+                    constraint=item_constraint))
             outputs = {}
             prefill_throughput = decode_throughput = 0.
             while not self.is_finished():

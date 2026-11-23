@@ -137,6 +137,8 @@ def server_arguments(settings):
         "--stats-interval", str(settings.stats_interval),
         "--recurrent-prefix-cache-mb", str(settings.recurrent_prefix_cache_bytes // (1024 * 1024)),
         "--api-key-env", settings.api_key_env,
+        "--tool-protocol", settings.tool_protocol,
+        "--max-tools", str(settings.max_tools),
         "--prefix-cache" if settings.enable_prefix_cache else "--no-prefix-cache",
         "--enable-constraints" if settings.enable_constraints else "--no-enable-constraints",
         "--banned-words", json.dumps(settings.banned_words, ensure_ascii=False),
@@ -158,6 +160,10 @@ def server_arguments(settings):
         arguments += [flag, str(getattr(settings, field) // (1024 * 1024))]
     if settings.fp16_only:
         arguments.append("--fp16-only")
+    # 服务端默认开启结构化约束解码（--no-path-constraints 才关）；统一设置默认关闭，
+    # 因此只有设置里显式打开时才让服务端保持默认，否则显式传关闭开关。
+    if not settings.enable_path_constraints:
+        arguments.append("--no-path-constraints")
     for enabled, flag in ((settings.enforce_eager, "--eager"),
                           (not settings.enable_chunked_prefill, "--disable-chunked-prefill"),
                           (not settings.enable_thinking, "--no-think"),
