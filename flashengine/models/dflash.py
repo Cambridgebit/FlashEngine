@@ -86,6 +86,7 @@ class DFlashBlockAttention(nn.Module):
         context_lens: torch.Tensor | None = None,
         max_seq_len: int | None = None,
         dense_context_lens: torch.Tensor | None = None,
+        paged_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
         q = qkv[..., :self.q_size].view(n, rows, self.num_heads, self.head_dim)
@@ -98,7 +99,7 @@ class DFlashBlockAttention(nn.Module):
             q.reshape(n * rows, self.num_heads, self.head_dim),
             k.reshape(n * rows, self.num_kv_heads, self.head_dim),
         )
-        if (query_slots is not None and not self.is_causal and self.sliding_window is None
+        if (query_slots is not None
                 and getattr(self.backend, "supports_dflash_paged", False)
                 and self.k_cache.numel() and self.v_cache.numel()):
             q_flat = q.reshape(n * rows, self.num_heads, self.head_dim)
@@ -116,6 +117,7 @@ class DFlashBlockAttention(nn.Module):
                 rows,
                 self.scaling,
                 max_seq_len,
+                mask=paged_mask,
             )
             return self.o_proj(o.reshape(n * rows, self.q_size))
         if (getattr(self.backend, "supports_dflash_dense_varlen", False)
@@ -157,7 +159,7 @@ class DFlashDecoderLayer(nn.Module):
 
     def forward(self, hidden_states, residual, positions, n, rows, k_ctx, v_ctx, mask,
                 query_slots=None, block_tables=None, context_lens=None,
-                max_seq_len=None, dense_context_lens=None):
+                max_seq_len=None, dense_context_lens=None, paged_mask=None):
         if residual is None:
             hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
         else:
@@ -169,6 +171,7 @@ class DFlashDecoderLayer(nn.Module):
             context_lens=context_lens,
             max_seq_len=max_seq_len,
             dense_context_lens=dense_context_lens,
+            paged_mask=paged_mask,
         )
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
@@ -290,7 +293,8 @@ class DFlashDraftModel(nn.Module):
                       query_slots: torch.Tensor | None = None,
                       block_tables: torch.Tensor | None = None,
                       total_lens: torch.Tensor | None = None,
-                      sample_from_anchor: bool = False) -> torch.Tensor:
+                      sample_from_anchor: bool = False,
+                      paged_windows: dict | None = None) -> torch.Tensor:
         n = last_token_ids.size(0)
         k = rows - 1
         anchor = self.embed_tokens(last_token_ids)                         # [n, h]
@@ -314,13 +318,19 @@ class DFlashDraftModel(nn.Module):
         residual = None
         hidden = flat
         for lid, layer in enumerate(self.layers):
+            attn = layer.self_attn
+            tables, lengths, paged_mask = block_tables, total_lens, None
+            if self.use_paged_kv and (attn.is_causal or attn.sliding_window is not None):
+                if paged_windows is None:
+                    raise ValueError("DFlash 分页窗口注意力缺少窗口元数据")
+                tables, lengths, paged_mask = paged_windows[attn.is_causal, attn.sliding_window]
             hidden, residual = layer(hidden, residual, pos_flat, n, rows,
                                      None if k_all is None else k_all[:, :, lid],
                                      None if v_all is None else v_all[:, :, lid], mask,
                                      query_slots=query_slots,
-                                     block_tables=block_tables,
-                                     context_lens=total_lens,
-                                     max_seq_len=max_ctx, dense_context_lens=ctx_lens)
+                                     block_tables=tables, context_lens=lengths,
+                                     max_seq_len=max_ctx, dense_context_lens=ctx_lens,
+                                     paged_mask=paged_mask)
         hidden, _ = self.norm(hidden, residual)
         h = hidden.view(n, rows, -1)
         h = (h if sample_from_anchor else h[:, 1:]).reshape(-1, h.size(-1))

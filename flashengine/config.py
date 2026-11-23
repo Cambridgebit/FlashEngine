@@ -290,8 +290,8 @@ class Config:
             self.use_paged_draft = bool(
                 self.spec_is_block_draft
                 and self.backend_impl.supports_dflash_paged
-                # 当前分页草稿内核只支持全局非因果注意力；窗口草稿走稠密掩码。
-                and not getattr(self.draft_config, "block_draft_requires_mask", False)
+                and (not self.draft_config.block_draft_requires_mask
+                     or self.backend_impl.supports_dflash_paged_mask)
             )
             self.keep_last_block_unhashed = self.use_paged_draft
             self.target_adapter.validate_spec_method(self.spec_method)

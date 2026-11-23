@@ -31,7 +31,6 @@ from flashengine.lora.context import (
     set_active_mask,
 )
 
-
 def _bucket(table, n):
     return next((x for x in table if x >= n), None)
 
@@ -181,14 +180,26 @@ class ModelRunner:
         self.event = event
         self.backend = config.backend_impl
         self.dflash_paged = config.use_paged_draft
-        # NARROW_CTX_CANDIDATE: 块草稿稠密路径的窄列宽整轮图（默认开，=0 关闭）。
-        self._df_narrow_ctx = 0
+        self._df_paged_windows = {}
+        self._df_window_specs = ()
+        if self.dflash_paged and config.draft_config.block_draft_requires_mask:
+            from flashengine.speculative.registry import block_draft_attention
+            self._df_window_specs = tuple(dict.fromkeys(
+                spec for spec in block_draft_attention(config.draft_config)
+                if spec[0] or spec[1] is not None))
+        # 上下文分桶：块草稿稠密路径的缓冲宽度、以及传给分页注意力算子的上下文上界，
+        # 都按本批实际长度选桶。直接传整卡 max_model_len 会让 1.2K 的请求也按 32768 宽
+        # 做 cat/repeat_interleave/softmax（实测每轮 516ms，2K 配置同样负载只要 170ms）。
         self._df_ctx_active = None
-        self._df_replay_narrow = False
-        self._df_narrow_pools = {}
+        self._df_ctx_width = 0
+        self._df_ctx_pools: dict = {}
+        self._df_ctx_buckets: list[int] = []
         if (config.spec_is_block_draft and not config.use_paged_draft
-                and os.environ.get("FLASHENGINE_DFLASH_NARROW_CTX", "1") != "0"):
-            self._df_narrow_ctx = min(256, int(config.max_model_len))
+                and os.environ.get("FLASHENGINE_DFLASH_CTX_BUCKETS", "1") != "0"):
+            full_ctx = int(config.max_model_len)
+            ladder = os.environ.get("FLASHENGINE_DFLASH_CTX_LADDER", "2048")
+            widths = sorted({int(x) for x in ladder.split(",") if x.strip()})
+            self._df_ctx_buckets = [w for w in widths if 0 < w < full_ctx] + [full_ctx]
         self.paged_context_attn = self.backend.supports_paged_context_attn
         draft_rows = (
             config.spec_num_tokens
@@ -1121,7 +1132,7 @@ class ModelRunner:
                                 block_tables=gv['block_tables'][:bucket],
                                 cu_seqlens_q=gv['cu_seqlens_q'][:bucket + 1],
                                 cu_seqlens_k=gv['cu_seqlens_k'][:bucket + 1],
-                                max_context_len=self.config.max_model_len,
+                                max_context_len=self._ctx_bound(),
                                 use_cuda_graph=True,
                                 block_size=self.block_size)
                     if self.state_runtime:
@@ -1142,7 +1153,7 @@ class ModelRunner:
                     block_tables=block_tables,
                     cu_seqlens_q=cu_seqlens_q,
                     cu_seqlens_k=cu_seqlens_k,
-                    max_context_len=self.config.max_model_len,
+                    max_context_len=self._ctx_bound(),
                     block_size=self.block_size,
                     # 主机已知的本步位置：eager 单 token RoPE 直接取主机表视图，
                     # 不必为取一行位置再发一次设备 gather。图路径不传（图内按设备
@@ -1427,14 +1438,18 @@ class ModelRunner:
         # 固定宽度 verify 不应越过窗口；剩余不足一整轮时只消费当前 anchor。
         self._set_lora_indices(seqs, False, len(seqs))
         ids, positions = self.prepare_decode(seqs)
-        hidden, _ = self.model(ids, positions)
-        logits = self.model.compute_logits(hidden)
-        tokens = self._sample_logits(logits, seqs)
+        if self.state_runtime:
+            get_context().gdn_host_slots = tuple(self.state_runtime.get_slot(seq) for seq in seqs)
+        try:
+            hidden, _ = self.model(ids, positions)
+            logits = self.model.compute_logits(hidden)
+            tokens = self._sample_logits(logits, seqs)
+        finally:
+            reset_context()
         result = [[token] for token in tokens]
         self._record_spec_acceptance(result)
         self.spec_graph_stats["eager_rounds"] += 1
         self.spec_graph_stats["context_limited_rounds"] += 1
-        reset_context()
         return result
 
     def _fill_spec_meta(self, seqs: list[Sequence]) -> int:
@@ -1582,7 +1597,7 @@ class ModelRunner:
         ).to(self.device, non_blocking=True)
         set_context(False, slot_mapping=slots, context_lens=ctx,
                     block_tables=self.prepare_block_tables(seqs),
-                    max_context_len=self.config.max_model_len,
+                    max_context_len=self._ctx_bound(),
                     block_size=self.block_size)
         row_m_hidden, draft_logits = self.draft_model.forward_decode(p, seed, tokens)
         row_m_hidden = row_m_hidden.clone()
@@ -1751,10 +1766,16 @@ class ModelRunner:
     def _df_round_eager(self, seqs: list[Sequence]) -> list[list[int]]:
         if not seqs:
             return []
-        self._df_ctx_active = None
+        # 图外轮同样按上下文分桶：稠密草稿缓冲只需覆盖本批最长序列 + 本轮 k+1 行。
+        round_rows = int(self.config.spec_num_tokens) + (
+            0 if self.config.spec_sample_from_anchor else 1)
+        self._df_ctx_active = self._select_ctx_width(
+            max(len(seq) for seq in seqs) + round_rows + 1)
+        self._df_ctx_width = int(self._df_ctx_active or 0)
         self.spec_graph_stats['eager_rounds'] += 1
         size = self._fill_spec_meta(seqs)
         self._fill_df_meta(seqs)
+        self._prepare_df_paged_windows(size, self._graph_pad_block())
         self._df_load_ctx_aux(seqs, size)
         self._push_spec_meta()
         self._df_round_body(size, use_cuda_graph=False)
@@ -1805,6 +1826,20 @@ class ModelRunner:
                     self._slot_of(seq, pos) if self.dflash_paged else int(cs[i])
                 )
 
+    def _prepare_df_paged_windows(self, bs: int, pad_block: int):
+        if not self._df_window_specs:
+            return
+        blob = self._sblob
+        tables = blob.view_i64('btables', (self._pin_M, self._pin_W))[:bs]
+        lengths = blob.view_i64('df_total_lens')[:bs]
+        windows = self._df_paged_windows.setdefault(bs, {})
+        for causal, window in self._df_window_specs:
+            key = causal, window
+            windows[key] = self.backend.prepare_dflash_paged_window(
+                tables, lengths, self._df_query_rows(), self.block_size, pad_block,
+                causal, window, self.device, buffers=windows.get(key),
+            )
+
     def _df_load_ctx_aux(self, seqs: list[Sequence], bs: int):
         g = self._sg
         rows = self.config.spec_num_tokens + 1
@@ -1850,12 +1885,13 @@ class ModelRunner:
         logits = self.draft_model.forward_block(
             g['chain_tokens'][:bs], block_pos,
             blob.device_view_i64('df_ctxslot')[:bs], l1,
-            self._df_ctx_active or self.config.max_model_len, query_rows,
+            self._ctx_bound(), query_rows,
             query_slots=query_slots,
             block_tables=(g['v_btables'][:bs] if self.dflash_paged else None),
             total_lens=(g['df_total_lens'][:bs]
                         if self.dflash_paged else None),
-            sample_from_anchor=self._df_sample_from_anchor())
+            sample_from_anchor=self._df_sample_from_anchor(),
+            paged_windows=self._df_paged_windows.get(bs))
         ids = self.draft_model.sample_proposals(
             logits,
             g['chain_tokens'][:bs],
@@ -1934,7 +1970,11 @@ class ModelRunner:
         try:
             prepare()
             self._push_spec_meta()
-            for bs in reversed(self.spec_graph_bs):
+            # 有窄桶且未显式要求整宽图时，整宽图只占显存不会更慢也更少用（实测 1.2K 上下文
+            # 整宽图每轮 516ms、窄桶 385ms、eager 142ms），故默认不捕整宽图，超桶走 eager 轮。
+            capture_full = bool(not self._df_ctx_buckets[:-1]
+                                or os.environ.get("FLASHENGINE_DFLASH_CTX_FULL", "0") == "1")
+            for bs in reversed(self.spec_graph_bs) if capture_full else ():
                 self._prepare_spec_lora(bs)
                 self._sg['v_cu_k'][:bs + 1] = self._sg['v_cu_q'][:bs + 1]
                 for _ in range(self.backend.graph_warmup_iters()):
@@ -1944,7 +1984,7 @@ class ModelRunner:
                 graph = self.backend.new_graph()
                 with self.backend.graph_ctx(graph, pool=self.spec_graph_pool):
                     body(bs)
-                if self.spec_graph_pool is None:
+                if self.backend.share_spec_graph_pool and self.spec_graph_pool is None:
                     self.spec_graph_pool = self.backend.graph_pool(graph)
                 self.spec_graphs[bs] = graph
                 reset_context()
@@ -1952,29 +1992,30 @@ class ModelRunner:
                 graph.replay()
                 self.backend.synchronize()
                 self.spec_graph_stats["capture_success"] += 1
-            # NARROW_CTX_CANDIDATE: 窄列宽整轮图，独立 graph pool，按 bs 各一张。
-            if self._df_narrow_ctx:
-                self._df_ctx_active = self._df_narrow_ctx
+            # 上下文分桶：每个窄桶各捕一套整轮图（每桶独立 graph pool），回放按本批长度选桶。
+            for width in self._df_ctx_buckets[:-1]:
+                self._df_ctx_active = width
                 for bs in reversed(self.spec_graph_bs):
                     for _ in range(self.backend.graph_warmup_iters()):
                         body(bs)
                         reset_context()
                         self.backend.synchronize()
                     graph = self.backend.new_graph()
-                    pool = self._df_narrow_pools.get(bs)
+                    pool = self._df_ctx_pools.get((width, bs))
                     with self.backend.graph_ctx(graph, pool=pool):
                         body(bs)
                     if pool is None:
-                        self._df_narrow_pools[bs] = self.backend.graph_pool(graph)
-                    self.spec_graphs[(bs, 'narrow')] = graph
+                        self._df_ctx_pools[(width, bs)] = self.backend.graph_pool(graph)
+                    self.spec_graphs[(bs, width)] = graph
                     reset_context()
                     self._push_spec_meta()
                     graph.replay()
                     self.backend.synchronize()
                     self.spec_graph_stats['capture_success'] += 1
-                self._df_ctx_active = None
+            self._df_ctx_active = None
             # 保留原随机采样图；另捕获纯 argmax 图，不在 replay 中读取设备标量。
-            if (self.graph_sample and self.backend.supports_greedy_graph_variants
+            if (capture_full and self.graph_sample
+                    and self.backend.supports_greedy_graph_variants
                     and os.getenv("FLASHENGINE_SPEC_GREEDY_GRAPH", "1") != "0"):
                 for bs in reversed(self.spec_graph_bs):
                     try:
@@ -2041,6 +2082,8 @@ class ModelRunner:
             else:
                 blob.view_i64('df_ctx_phys_slots', (M, rows)).fill_(self._df_pad_ctx_slot)
             blob.view_i64('df_total_lens').fill_(self._df_query_rows())
+            for bs in self.spec_graph_bs:
+                self._prepare_df_paged_windows(bs, pad_block)
         self._capture_spec_graphs(prepare, self._df_round_body,
                                   "Block-draft speculative")
 
@@ -2081,16 +2124,30 @@ class ModelRunner:
         blob.view_i64('btables', (M, W))[n:].fill_(pad_block)
         blob.view_i64('v_btables_exp', (M, rows, W))[n:].fill_(pad_block)
 
+    def _ctx_bound(self) -> int:
+        """本批生效的上下文上界：优先用上下文桶宽度，否则整卡 max_model_len。"""
+        return self._df_ctx_active or int(self.config.max_model_len)
+
+    def _select_ctx_width(self, need: int) -> int | None:
+        """按本批最长上下文选最小桶；None 表示用整卡宽度（不进窄桶）。"""
+        if not self._df_ctx_buckets:
+            return None
+        full_ctx = self._df_ctx_buckets[-1]
+        for width in self._df_ctx_buckets:
+            if width >= need:
+                return None if width >= full_ctx else width
+        return None
+
     def _replay_spec_graph(self, bucket: int):
         self._spec_graph_active = bucket
         self._push_spec_meta()
-        # NARROW_CTX_CANDIDATE: 短上下文优先用窄列宽图。
-        narrow = (self._df_replay_narrow
-                  and (bucket, 'narrow') in self.spec_graphs)
+        width = int(self._df_ctx_width or 0)
+        narrow = width > 0 and (bucket, width) in self.spec_graphs
         greedy = (self._spec_batch_greedy and not narrow
                   and bucket in self.spec_greedy_graphs)
+        key = (bucket, width) if narrow else bucket
         graphs = self.spec_greedy_graphs if greedy else self.spec_graphs
-        graphs[(bucket, 'narrow') if narrow else bucket].replay()
+        graphs[key].replay()
         if greedy:
             self.spec_graph_stats["greedy_replays"] += 1
         self.spec_graph_stats["replay"] += 1
@@ -2099,10 +2156,20 @@ class ModelRunner:
 
     @torch.inference_mode()
     def _df_round_graph(self, seqs: list[Sequence], bucket: int) -> list[list[int]]:
-        # NARROW_CTX_CANDIDATE: 本批最长序列放得进窄桶才用窄图。
-        self._df_replay_narrow = bool(
-            self._df_narrow_ctx and max(len(seq) for seq in seqs) <= self._df_narrow_ctx)
-        self._df_ctx_active = self._df_narrow_ctx if self._df_replay_narrow else None
+        # 上下文分桶：按本批最长序列（含本轮 k+1 行）选最小桶，宽度与算子上界一起收窄。
+        round_rows = int(self.config.spec_num_tokens) + (
+            0 if self.config.spec_sample_from_anchor else 1)
+        need = max(len(seq) for seq in seqs) + round_rows + 1
+        self._df_ctx_active = self._select_ctx_width(need)
+        self._df_ctx_width = int(self._df_ctx_active or 0)
+        key = (bucket, self._df_ctx_width) if self._df_ctx_width else bucket
+        if key not in self.spec_graphs:
+            # 本批上下文超出已捕获的桶：走 eager 轮（实测比整宽整轮图快 2-3 倍）。
+            self._df_ctx_active = None
+            self._df_ctx_width = 0
+            self.spec_graph_stats["ctx_fallbacks"] = (
+                self.spec_graph_stats.get("ctx_fallbacks", 0) + 1)
+            return self._df_round_eager(seqs)
         prof = _DF_PROF and not self._capturing_spec_graph
         marks = []
         clock = time.perf_counter()
@@ -2117,6 +2184,7 @@ class ModelRunner:
         n = self._fill_spec_meta(seqs)
         self._fill_df_meta(seqs)
         self._reset_spec_padding(n, bucket, True)
+        self._prepare_df_paged_windows(bucket, self._graph_pad_block())
         if prof:
             _mark("meta")
         self._df_load_ctx_aux(seqs, bucket)
@@ -2239,7 +2307,7 @@ class ModelRunner:
                         block_tables=g['chain_btables'][:bs],
                         cu_seqlens_q=g['chain_cu_q'][:bs + 1],
                         cu_seqlens_k=g['chain_cu_k'][i, :bs + 1],
-                        max_context_len=self.config.max_model_len,
+                        max_context_len=self._ctx_bound(),
                         use_cuda_graph=use_cuda_graph,
                         block_size=self.block_size)
             seed, logits = self.draft_model.forward_decode(
@@ -2278,7 +2346,7 @@ class ModelRunner:
                     cu_seqlens_q=g['v_cu_q'][:bs + 1],
                     cu_seqlens_k=g['v_cu_k'][:bs + 1],
                     max_seqlen_q=rows,
-                    max_seqlen_k=self.config.max_model_len,
+                    max_seqlen_k=self._ctx_bound(),
                     slot_mapping=g['v_slots'][:bs * rows],
                     context_lens=g['v_ctx_lens'][:bs * rows],
                     block_tables=self._verify_block_tables(g, bs, rows),
@@ -2332,7 +2400,7 @@ class ModelRunner:
                     cu_seqlens_q=g['v_cu_q'][:bs + 1],
                     cu_seqlens_k=g['v_cu_k'][:bs + 1],
                     max_seqlen_q=rows,
-                    max_seqlen_k=self.config.max_model_len,
+                    max_seqlen_k=self._ctx_bound(),
                     slot_mapping=g['v_slots'][:bs * rows],
                     context_lens=g['v_ctx_lens'][:bs * rows],
                     block_tables=self._verify_block_tables(g, bs, rows),

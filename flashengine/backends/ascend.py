@@ -218,6 +218,9 @@ class Ascend310PBackend(BackendBase):
     default_dtype = torch.float16
     graph_sample_default = False
     spec_graph_try_default = True
+    # Different speculative batch buckets can replay in any order. Sharing the
+    # 310P graph pool can invalidate paged-attention buffers across buckets.
+    share_spec_graph_pool = False
     # 310P 的 D2H 同步拷贝在块边界上会拖慢 prefill；快照留在设备侧做 D2D。
     prefix_snapshots_on_device = True
 
@@ -343,6 +346,9 @@ class Ascend310PBackend(BackendBase):
                 "_npu_paged_attention_splitfuse(_v2)"
             )
         self.supports_dflash_paged = self.supports_splitfuse and not disable_paged
+        self.supports_dflash_paged_mask = (
+            self.supports_dflash_paged and self._splitfuse_legacy is not None
+        )
         self._compressed_mask_supported = (
             hasattr(tn, "_npu_flash_attention_v3")
             and hasattr(tn, "_npu_paged_attention_splitfuse_v2")
@@ -846,6 +852,42 @@ class Ascend310PBackend(BackendBase):
                  pinned=self._dflash_mask_pinned)
         return mask
 
+    def prepare_dflash_paged_window(
+        self, block_tables, lengths, rows, page_size, pad_block, causal, window,
+        device, buffers=None,
+    ):
+        # Keep the first partial page and mask its expired keys per query row.
+        # The query's RoPE positions still refer to the original logical sequence.
+        width_pages = (block_tables.size(1) if window is None else
+                       (window + rows + 2 * page_size - 3) // page_size)
+        starts = (torch.zeros_like(lengths) if window is None else
+                  (lengths - rows - window + 1).clamp_min(0) // page_size)
+        cols = torch.arange(width_pages, device="cpu") + starts[:, None]
+        rel_lengths = lengths - starts * page_size
+        valid_pages = (cols < block_tables.size(1)) & (
+            (cols - starts[:, None]) * page_size < rel_lengths[:, None])
+        table = block_tables.gather(1, cols.clamp_max(block_tables.size(1) - 1))
+        table = table.masked_fill(~valid_pages, pad_block).to(torch.int32)
+        width = width_pages * page_size
+        query_pos = rel_lengths[:, None] - rows + torch.arange(rows, device="cpu")
+        delta = query_pos[:, :, None] - torch.arange(width, device="cpu")
+        visible = torch.ones_like(delta, dtype=torch.bool)
+        if causal:
+            visible &= delta >= 0
+        if window is not None:
+            visible &= (delta < window) if causal else (delta.abs() < window)
+        mask = torch.zeros((lengths.numel() * rows, width), dtype=torch.float16, device="cpu")
+        mask.masked_fill_(~visible.flatten(0, 1), float("-inf"))
+        mask = self._nd_to_nz_spec(mask.to(device))
+        rel_lengths = rel_lengths.to(torch.int32)
+        if buffers is None:
+            return table.to(device), rel_lengths.to(device), mask
+        tables_npu, lengths_npu, mask_npu = buffers
+        tables_npu.copy_(table)
+        lengths_npu.copy_(rel_lengths)
+        mask_npu.copy_(mask)
+        return buffers
+
     def dflash_paged_attention(
         self,
         q,
@@ -856,6 +898,7 @@ class Ascend310PBackend(BackendBase):
         rows: int,
         scale: float,
         max_seq_len: int,
+        mask=None,
     ):
         if not self.supports_dflash_paged:
             raise RuntimeError("310P DFlash paged attention requires SplitFuse")
@@ -883,10 +926,10 @@ class Ascend310PBackend(BackendBase):
             )
         if not block_tables.is_contiguous() or not context_lens.is_contiguous():
             raise ValueError("310P DFlash graph metadata must be contiguous")
-        mask = self._dflash_noncausal_mask(
-            query_tokens, max_seq_len, q.device
-        )
-        if self._splitfuse_v2 is not None:
+        use_v2 = mask is None and self._splitfuse_v2 is not None
+        if mask is None:
+            mask = self._dflash_noncausal_mask(query_tokens, max_seq_len, q.device)
+        if use_v2:
             self._splitfuse_v2(
                 query=q,
                 key_cache=k_cache,

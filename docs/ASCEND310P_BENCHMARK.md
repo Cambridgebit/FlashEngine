@@ -120,7 +120,7 @@
 ## Qwen3.5 系列全量复测（2026-10-30，含草稿注意力窄列宽优化）
 
 本轮把「草稿注意力按实际上下文缩窄列宽」合入 `flashengine/engine/model_runner.py`
-（默认开，`FLASHENGINE_DFLASH_NARROW_CTX=0` 关闭），并按上表同口径重测 Qwen3.5-4B / 9B 的
+（默认开；该机制已于 2026-11-23 升级为上下文分桶，开关改为 `FLASHENGINE_DFLASH_CTX_BUCKETS=0` 关闭 / `FLASHENGINE_DFLASH_CTX_LADDER` 配桶阶梯，详见 [`QWEN35_OPT.md`](QWEN35_OPT.md)），并按上表同口径重测 Qwen3.5-4B / 9B 的
 普通解码与 DFlash 各档草稿长度。板卡 `/data2/FlashEngine_integrated` 的
 `model_runner.py` 与本地合入文件 SHA-256 一致（`dc7ae2de…`）。
 

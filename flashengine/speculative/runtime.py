@@ -76,11 +76,12 @@ class BlockDraftRuntime(SpecRuntime):
     def startup_details(self):
         runner = self.runner
         info = runner.backend.runtime_info()
+        path = info.get("dflash_backend", "dense-KV/SDPA")
+        if runner.config.draft_config.block_draft_requires_mask:
+            path = ("paged-KV/SplitFuse (causal or sliding window)" if runner.dflash_paged
+                    else "dense-KV/masked (causal or sliding window)")
         details = [
-            ("Block-draft attention path",
-             "dense-KV/masked (causal or sliding window)"
-             if getattr(runner.config.draft_config, "block_draft_requires_mask", False)
-             else info.get("dflash_backend", "dense-KV/SDPA")),
+            ("Block-draft attention path", path),
             ("Draft prefix state", "paged KV (anchor block excluded)"
              if runner.dflash_paged else "bounded CPU snapshots (1024 MiB)"),
         ]

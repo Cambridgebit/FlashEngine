@@ -44,6 +44,7 @@ class BackendBase(ABC):
     # 310P 的 D2H 是阻塞的（块边界各拷一次 49 MiB），改为设备内 D2D 拷贝。
     prefix_snapshots_on_device = False
     spec_graph_try_default = True
+    share_spec_graph_pool = True
     # 后端是否需要零初始化 KV 池；避免未初始化内容引发设备算子的数值问题。
     zero_init_kv_cache = False
 
@@ -203,6 +204,8 @@ class BackendBase(ABC):
             f"Backend {self.name} does not implement W8A8 dynamic matmul."
         )
 
+    supports_dflash_paged_mask = False
+
     def dflash_paged_attention(
         self,
         q,
@@ -213,6 +216,7 @@ class BackendBase(ABC):
         rows: int,
         scale: float,
         max_seq_len: int,
+        mask=None,
     ):
         raise NotImplementedError("DFlash paged attention is not supported by this backend")
 

@@ -389,7 +389,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             if ctx.is_prefill:
                 core = self._forward_prefill(mixed_qkv, b, a, slots, has_initial, ctx)
             else:
-                core = self._forward_decode(mixed_qkv, b, a, slots, has_initial)
+                core = self._forward_decode(
+                    mixed_qkv, b, a, slots, has_initial, ctx.gdn_host_slots)
         # 输出归一化：逐 (token, v-head) 的 RMSNormGated（norm(o) * silu(z)）→ out_proj
         core = self.norm(core, z)
         return self.out_proj(core.flatten(1, -1))
@@ -490,6 +491,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         a: torch.Tensor,
         slots,
         has_initial,
+        host_slots=None,
     ) -> torch.Tensor:
         """decode：单行/序列，全批向量化（无 python 循环、无 host 同步，图捕获友好）。"""
         n = mixed_qkv.size(0)
@@ -508,7 +510,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             conv_state = torch.where(has_initial[:, None, None], conv_state, torch.zeros_like(conv_state))
             window = torch.cat([conv_state, mixed_qkv.unsqueeze(-1)], dim=-1)  # [n, conv_dim, K]
             conv_out = self._act(self.backend.gdn_causal_conv1d(window, conv_w)[:, :, 0])
-            self.conv_cache.index_copy_(0, idx, window[:, :, 1:].contiguous())
+            self._write_decode_state(self.conv_cache, idx, window[:, :, 1:], host_slots)
 
         q, k, v = conv_out.split([self.key_dim, self.key_dim, self.value_dim], dim=-1)
         q = q.view(n, self.num_k_heads, self.head_k_dim)
@@ -545,8 +547,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # 就地 rank-1 更新（state 为本层新张量；与 out-of-place 位等，省一次分配）
         state = state.add_(k.unsqueeze(-1) * delta.unsqueeze(-2))
         out = (state * q.unsqueeze(-1)).sum(dim=-2)  # [n, H, V]
-        self.ssm_cache.index_copy_(0, idx, state)
+        self._write_decode_state(self.ssm_cache, idx, state, host_slots)
         return out.to(mixed_qkv.dtype)
+
+    @staticmethod
+    def _write_decode_state(cache, indices, states, host_slots):
+        if host_slots is None:
+            cache.index_copy_(0, indices, states.contiguous())
+            return
+        # 窗口边界的 eager 单步已知主槽，直接切片写回可避开 NPU IndexCopy。
+        for slot, state in zip(host_slots, states.unbind(0)):
+            cache[slot].copy_(state)
 
     def _forward_rows(
         self,
