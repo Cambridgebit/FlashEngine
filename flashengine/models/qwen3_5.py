@@ -553,7 +553,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     @staticmethod
     def _write_decode_state(cache, indices, states, host_slots):
         if host_slots is None:
-            cache.index_copy_(0, indices, states.contiguous())
+            # 状态递推在 fp32 上做，而状态池按 config 的 mamba_ssm_dtype 分配（9B 是
+            # fp16）。index_copy_ 要求 source 与目标同 dtype，直接传会让 310P 报
+            # 161001「executor is nullptr」；显式转换与旧 setitem 的隐式转换同语义。
+            cache.index_copy_(0, indices, states.to(dtype=cache.dtype, device=cache.device).contiguous())
             return
         # 窗口边界的 eager 单步已知主槽，直接切片写回可避开 NPU IndexCopy。
         for slot, state in zip(host_slots, states.unbind(0)):
