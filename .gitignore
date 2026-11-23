@@ -216,3 +216,4 @@ cython_debug/
 /scratch/
 /.dsh-ssh/
 board.sh
+/.tmp/

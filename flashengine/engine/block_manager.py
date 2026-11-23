@@ -47,10 +47,15 @@ class BlockManager:
         }
 
     @classmethod
-    def compute_hash(cls, token_ids: list[int], prefix: int = -1):
+    def compute_hash(cls, token_ids: list[int], prefix: int = -1, lora_id: int = 0):
         h = xxhash.xxh64()
         if prefix != -1:
             h.update(prefix.to_bytes(8, "little"))
+        # LoRA：同一段 token 在基座与不同适配器下的隐层完全不同，KV 不可互用。
+        # 把 lora_id 混进哈希（链首块也混），不同适配器的块必然落在不同的键上。
+        if lora_id:
+            h.update(b"lora")
+            h.update(int(lora_id).to_bytes(8, "little"))
         h.update(np.array(token_ids).tobytes())
         return h.intdigest()
 
@@ -81,7 +86,7 @@ class BlockManager:
         candidates = []
         for i in range(seq.num_blocks - 1):
             token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h)
+            h = self.compute_hash(token_ids, h, getattr(seq, "lora_id", 0))
             block_id = self.hash_to_block_id.get(h, -1)
             # 哈希表条目必须仍然对应该块当前的哈希：块被重新分配/重写后
             # 旧映射可能残留（hash_blocks 只更新块上的 hash，不清理旧键），
@@ -114,7 +119,7 @@ class BlockManager:
         h = -1
         for i in range(num_cached_blocks):
             token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h)
+            h = self.compute_hash(token_ids, h, getattr(seq, "lora_id", 0))
             block_id = self.hash_to_block_id[h]
             block = self.blocks[block_id]
             if block_id in self.used_block_ids:
@@ -183,7 +188,7 @@ class BlockManager:
         for i in range(start, end):
             block = self.blocks[seq.block_table[i]]
             token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h)
+            h = self.compute_hash(token_ids, h, getattr(seq, "lora_id", 0))
             old = block.hash
             if old != -1 and self.hash_to_block_id.get(old) == block.block_id:
                 del self.hash_to_block_id[old]

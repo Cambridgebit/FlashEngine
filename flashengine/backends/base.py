@@ -40,6 +40,9 @@ class BackendBase(ABC):
     supports_greedy_graph_variants = False
     supports_dflash_dense_varlen = False
     supports_async_prefix_snapshots = False
+    # recurrent 前缀快照放设备侧还是主机侧。CUDA 有异步锁页 D2H（False）；
+    # 310P 的 D2H 是阻塞的（块边界各拷一次 49 MiB），改为设备内 D2D 拷贝。
+    prefix_snapshots_on_device = False
     spec_graph_try_default = True
     # 后端是否需要零初始化 KV 池；避免未初始化内容引发设备算子的数值问题。
     zero_init_kv_cache = False

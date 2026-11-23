@@ -94,6 +94,7 @@ class LLMEngine(EngineRequests):
             SamplingParams(temperature=0.0, max_tokens=2),
             use_tqdm=False,
         )
+        self._warmup_lora_prefill(config)
         runtime_warmup_s = perf_counter() - runtime_warmup_t0
         self.reset_measurement_stats()
         self._print_startup_summary(
@@ -102,6 +103,41 @@ class LLMEngine(EngineRequests):
             runtime_warmup_s=runtime_warmup_s,
             engine_startup_s=perf_counter() - engine_t0,
         )
+
+    def _warmup_lora_prefill(self, config):
+        """用真实适配器预热 LoRA 前向，避免服务端第一条请求白等算子编译。
+
+        310P 上 aclnn 的小 GEMM 按**行数**各自编译：LoRA 每个 binding 两次 GEMM，
+        Qwen3.5-9B 有 248 个 binding，一个没见过的前向行数首次要花约 0.4-0.5 s
+        （实测 spec 单请求 TTFT 因此比纯 DFlash 多 450 ms）。上面那条 "warmup"
+        只有 1 行，覆盖不到真实提示长度，所以这里再跑几个代表长度；只做前向、
+        max_tokens=1，不写 KV 之外的任何状态，也不影响后续前缀缓存。
+        """
+        manager = getattr(self.model_runner, "lora", None)
+        if not getattr(config, "enable_lora", False) or manager is None or not manager.slots:
+            return
+        from flashengine.lora import LoRARequest
+
+        name = sorted(manager.slots)[0]
+        request = LoRARequest(lora_name=name)
+        seed = self.tokenizer.encode("warmup") or [0]
+        # 短到长各一次：短提示覆盖闲聊，长提示覆盖 RAG/系统提示词。
+        for length in (16, max(64, config.max_model_len // 2)):
+            length = min(length, max(1, config.max_model_len - 2))
+            prompt = (seed * (length // len(seed) + 1))[:length]
+            try:
+                self.generate(
+                    [prompt],
+                    # max_tokens 必须 >1：投机走图前有一轮 eager 冷轮，那个
+                    # 形状（rows=k+1）才是首次真编译的来源，只预填充不会再触发。
+                    SamplingParams(temperature=0.0, max_tokens=4),
+                    use_tqdm=False,
+                    lora_requests=[request],
+                )
+            except Exception as exc:  # 预热失败不应挡住启动
+                print(f"[FlashEngine] LoRA warmup skipped ({length} tokens): {exc}",
+                      flush=True)
+                break
 
     def _print_startup_summary(
         self,
@@ -151,6 +187,14 @@ class LLMEngine(EngineRequests):
         for label, seconds in timings:
             print(f"[FlashEngine]   {label}: {seconds:.3f} s", flush=True)
         print(f"[FlashEngine] Engine ready in {engine_startup_s:.3f} s", flush=True)
+        # KV 池过小是大面积抢占的直接原因（310P 上重启 server 不释放 NPU 显存，
+        # 上次运行的残留会把 util 预算吃掉，池子缩到几十个块，表现为「并发就卡」）。
+        need_tokens = config.max_num_seqs * min(config.max_model_len, 256)
+        if kv_capacity_tokens < need_tokens:
+            print(f"[FlashEngine] [WARN] KV 池只有 {kv_capacity_tokens} tokens，"
+                  f"不足 {config.max_num_seqs} 并发 × 256 tokens（需 {need_tokens}）；"
+                  f"调度会大面积抢占。请先重启容器释放残留显存，再调高 --gpu-mem-util "
+                  f"或调低 --max-num-seqs/--max-model-len。", flush=True)
 
     def close(self):
         if getattr(self, "_closed", False):
@@ -366,6 +410,7 @@ class LLMEngine(EngineRequests):
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
         audio: dict | list[dict | None] | None = None,
+        lora_requests=None,
     ) -> list[dict]:
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
@@ -379,11 +424,20 @@ class LLMEngine(EngineRequests):
             audios = list(audio)
             if len(audios) != len(prompts):
                 raise ValueError("prompts 与 audio 的数量必须一致")
+        if lora_requests is None:
+            loras = [None] * len(prompts)
+        elif not isinstance(lora_requests, list):
+            loras = [lora_requests] * len(prompts)
+        else:
+            loras = list(lora_requests)
+            if len(loras) != len(prompts):
+                raise ValueError("prompts 与 lora_requests 的数量必须一致")
         pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
         submitted = []
         try:
-            for prompt, sp, item_audio in zip(prompts, sampling_params, audios):
-                submitted.append(self.add_request(prompt, sp, audio=item_audio))
+            for prompt, sp, item_audio, item_lora in zip(prompts, sampling_params, audios, loras):
+                submitted.append(
+                    self.add_request(prompt, sp, audio=item_audio, lora_request=item_lora))
             outputs = {}
             prefill_throughput = decode_throughput = 0.
             while not self.is_finished():

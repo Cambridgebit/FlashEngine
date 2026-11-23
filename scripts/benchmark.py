@@ -71,6 +71,11 @@ def main(argv=None):
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--spec-model", default="")
     parser.add_argument("--spec-num-tokens", type=int, default=3)
+    # 多 LoRA：可重复传入 NAME=PATH；请求按轮转分配适配器（0=基座也参与的话用 base）。
+    parser.add_argument("--lora-module", action="append", default=[], metavar="NAME=PATH",
+                        help="注册一个 LoRA 适配器，可重复；基准按轮转方式逐请求切换")
+    parser.add_argument("--max-loras", type=int, default=8)
+    parser.add_argument("--max-lora-rank", type=int, default=16)
     parser.add_argument("--no-think", action="store_true")
     parser.add_argument("--enable-constraints", action=argparse.BooleanOptionalAction,
                         default=False, help="启用禁词约束（词表掩码，可与投机解码并存）")
@@ -121,9 +126,23 @@ def main(argv=None):
                       constraint_ignore_spaces=args.constraint_ignore_spaces)
     if args.dtype:
         kwargs["dtype"] = args.dtype
+    lora_modules = []
+    for item in args.lora_module or []:
+        name, sep, path = item.partition("=")
+        if not sep or not name or not path:
+            raise SystemExit(f"--lora-module 需要 NAME=PATH，收到 {item!r}")
+        lora_modules.append((name, path))
+    if lora_modules:
+        kwargs.update(enable_lora=True, max_loras=args.max_loras,
+                      max_lora_rank=args.max_lora_rank,
+                      lora_modules=tuple(lora_modules))
     kwargs.update(memory_kwargs(args))
     llm = LLM(args.model, **kwargs)
     cfg = llm.config
+    lora_slots = []
+    if lora_modules:
+        manager = llm.model_runner.lora
+        lora_slots = [(name, manager.slot_of(name)) for name, _ in lora_modules]
     pcache = "on" if cfg.enable_prefix_cache else "off"
     spec = (f"spec({cfg.spec_method},k={cfg.spec_num_tokens})"
             if args.spec_model else "decode")
@@ -131,11 +150,14 @@ def main(argv=None):
         f"on(budget={cfg.max_num_batched_tokens},partial={cfg.max_num_partial_prefills})"
         if cfg.enable_chunked_prefill else "off"
     )
+    lora_desc = (f" | lora={len(lora_slots)} adapters "
+                 f"({','.join(name for name, _ in lora_slots)})"
+                 if lora_slots else " | lora=off")
     print(f"prompts: {len(qs)} (category={args.category}, seed={args.seed}) "
           f"x repeats={args.num_repeats} | mode={spec} | prefix_cache={pcache} | "
           f"chunked_prefill={chunked} | "
           f"max_tokens={args.max_tokens} | temp={args.temperature:g} | "
-          f"top_p={args.top_p:g} | top_k={args.top_k} | thinking={thinking} | "
+          f"top_p={args.top_p:g} | top_k={args.top_k} | thinking={thinking}{lora_desc} | "
           f"protocol=vllm-bench-serve-compatible\n",
           flush=True)
 
@@ -158,7 +180,8 @@ def main(argv=None):
             return llm.tokenizer.encode(text)
 
         for _ in range(args.warmup):
-            run_seqs(llm, [Sequence(chat(qs[0]), sp)])
+            warm_lora = lora_slots[0][1] if lora_slots else 0
+            run_seqs(llm, [Sequence(chat(qs[0]), sp, lora_id=warm_lora)])
 
         llm.reset_measurement_stats()
         spec_stats = None
@@ -173,7 +196,10 @@ def main(argv=None):
                 tokens_in = chat(q)
                 for rep in range(args.num_repeats):
                     prompt_lens.append(len(tokens_in))
-                    tokens, ttfts, wall = run_seqs(llm, [Sequence(tokens_in, sp)])
+                    lora_id = (lora_slots[len(rows) % len(lora_slots)][1]
+                               if lora_slots else 0)
+                    tokens, ttfts, wall = run_seqs(
+                        llm, [Sequence(tokens_in, sp, lora_id=lora_id)])
                     n = len(tokens[0])
                     ttft = ttfts[0] or 0.0
                     rows.append((n, ttft, wall, rep))

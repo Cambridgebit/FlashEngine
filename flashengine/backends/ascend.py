@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from .base import BackendBase
+from flashengine.utils.pinned import PIN_MEMORY as _PIN_MEMORY
 
 _npu = None
 _vllm_import_thread = None
@@ -217,6 +218,8 @@ class Ascend310PBackend(BackendBase):
     default_dtype = torch.float16
     graph_sample_default = False
     spec_graph_try_default = True
+    # 310P 的 D2H 同步拷贝在块边界上会拖慢 prefill；快照留在设备侧做 D2D。
+    prefix_snapshots_on_device = True
 
     def gdn_causal_conv1d(self, inputs, weight):
         # 310P 用静态短卷积展开，避免数千组 depthwise Conv1d 的算子约束。
@@ -870,7 +873,7 @@ class Ascend310PBackend(BackendBase):
         qlens_cpu = qlens.get(qkey)
         if qlens_cpu is None:
             qlens_cpu = torch.full(
-                (num_reqs,), rows, dtype=torch.int32, device="cpu", pin_memory=True
+                (num_reqs,), rows, dtype=torch.int32, device="cpu", pin_memory=_PIN_MEMORY
             )
             qlens[qkey] = qlens_cpu
         if block_tables.dtype != torch.int32 or context_lens.dtype != torch.int32:
@@ -931,6 +934,11 @@ class Ascend310PBackend(BackendBase):
                 set_compile_mode(jit_compile=False)
             except Exception as exc:
                 print(f"[FlashEngine] 310P: set_compile_mode failed: {exc}", flush=True)
+        # 不要改 torch.npu.conv/matmul.allow_hf32：310P 驱动（24.1.rc4）只在
+        # 默认下发值 "10" 下接受 ACL_ALLOW_HF32，改成 "00"（关 HF32）反而让
+        # _npu_init 返回 500001。本机实测：默认值 + 不在设备初始化前做
+        # host-mapped（pinned）分配 = 可以正常 set_device；需要时用
+        # FLASHENGINE_PIN_MEMORY=0 关掉锁页。
         set_option = getattr(torch.npu, "set_option", None)
         if set_option is not None:
             try:
@@ -939,6 +947,13 @@ class Ascend310PBackend(BackendBase):
                 print(f"[FlashEngine] 310P: set_option failed: {exc}", flush=True)
 
     def set_device(self, rank):
+        # 若 flashengine.npu_bootstrap 已在进程启动时做过一次干净初始化，
+        # 这里就不要再调 set_device：第二次进入 torch_npu 的 _npu_init 会
+        # 重新下发 ACL_ALLOW_HF32 并失败（详见该模块说明）。
+        from flashengine.npu_bootstrap import npu_device_initialized
+
+        if npu_device_initialized() == rank:
+            return
         torch.npu.set_device(rank)
 
     def synchronize(self):

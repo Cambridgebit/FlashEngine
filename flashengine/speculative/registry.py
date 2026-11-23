@@ -98,11 +98,27 @@ def load_draft_config(path: str) -> Any:
         config = PretrainedConfig(**layer_config)
         config.architectures = list(
             data.get("architectures") or ["DFlashDraftModel"])
-        config.block_size = data.get("block_size")
-        config.mask_token_id = data.get("mask_token_id")
-        config.draft_vocab_size = data.get("draft_vocab_size")
-        config.aux_hidden_state_layer_ids = data.get("aux_hidden_state_layer_ids")
-        config.speculators_model_type = data.get("speculators_model_type")
+        # speculators 把草稿侧字段放在顶层，`transformer_layer_config` 只含文本骨干。
+        # 这些字段必须原样透传，否则 DSpark 在构造 Markov head 时读 markov_rank 会
+        # AttributeError（Qwen3-0.6B-Dspark_1 就是 model_type 缺失 + 该类检查点）。
+        for key in (
+            "block_size",
+            "mask_token_id",
+            "draft_vocab_size",
+            "aux_hidden_state_layer_ids",
+            "target_layer_ids",
+            "markov_rank",
+            "markov_head_type",
+            "sample_from_anchor",
+            "enable_confidence_head",
+            "confidence_head_with_markov",
+            "sliding_window_non_causal",
+            "target_hidden_size",
+            "rope_theta",
+            "speculators_model_type",
+        ):
+            if data.get(key) is not None:
+                setattr(config, key, data[key])
         return config
 
 

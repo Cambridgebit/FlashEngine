@@ -313,18 +313,59 @@ curl -s -H "Authorization: Bearer sk-test" http://127.0.0.1:8011/v1/audio/transc
 贴地分配（本轮 `--gpu-mem-util 0.3`，KV 460–479×128 token）。ASR 无投机、无量化，前缀缓存
 对该请求由 `skip_prefix_cache` 关闭，不依赖 SplitFuse 前缀命中路径。
 
-### 4.3 CoreX（Iluvatar）——**代码路径已具备，未在真机验证**
+### 4.3 CoreX（Iluvatar）——实机冒烟（2026-11-09）
 
-同样按「只加代码」处理：
+开发板 `10.23.50.3`，容器 `Qwen3-test`：CoreX 4.4.0、Python 3.10、
+PyTorch 2.7.1、Transformers 5.15.0；测试时设备总显存报告为 65536 MiB。
+模型为 `/home/iluvatar/Qwen3-1.7B-ASR`，代码基于提交 `4bc564b`，并包含当时
+工作区的 `model_runner.py` 改动及 CoreX KV 池零初始化修复。Transformers 等新依赖
+离线安装在独立目录，容器原有 CoreX Python 包目录仍需保留。
 
-- 音频塔为纯 torch 前向、mel/prompt 在 CPU 侧生成；CoreX 上 eager decode 慢、图是刚需，
-  但 ASR 的音频塔只做一次 prefill 前向，不受 decode 图收益影响，文本 decode 仍走通用图/eager 路径。
-- 前置条件与 Qwen3 文本模型一致：Iluvatar 驱动 + 厂商提供的 `ixformer`（仓库 `corex` extra）、
-  Python 3.10 环境、32GB 级板卡；ASR 本身不调用 ixformer 算子、无需额外依赖或量化支持。
-- 机器可用时直接跑同一条 `scripts.asr_benchmark`（`--backend corex --gpu-mem-util 0.85`，
-  模型目录换 Qwen3-ASR、再加 `--wav`）；**本轮未执行**。
+```bash
+cd /home/iluvatar/FlashEngine-asr-4bc564b-20261106
+PYTHONPATH="$PWD:/home/iluvatar/flashengine-asr-deps:/usr/local/corex-4.4.0/lib64/python3/dist-packages" \
+  python3 -u -m scripts.asr_benchmark /home/iluvatar/Qwen3-1.7B-ASR \
+  --backend corex --dtype float16 --gpu-mem-util 0.5 \
+  --max-model-len 2048 --max-num-seqs 1 \
+  --wav bench_data/asr/asr_en.wav bench_data/asr/asr_zh.wav \
+  --save-jsonl /tmp/flashengine-asr-fixed.jsonl
+```
 
-**状态：未在真机验证**（无 CoreX 机器；代码路径已具备，文档不填未产生过的数字）。
+默认 greedy、单请求串行、自动检测语言，预热 1 条后计时；decode 使用图模式
+（`decode_graph buckets=(1,)`），KV block size 256。结果为一次运行、两条音频：
+
+| 音频 | 时长 | prompt / 生成 token | TTFT | 单条墙钟 | RTF | TPS | CER |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| asr_en.wav | 15.05 s | 211 / 48 | 228.3 ms | 1.448 s | 0.0962 | 33.15 | 0.0% |
+| asr_zh.wav | 4.20 s | 70 / 10 | 234.2 ms | 0.485 s | 0.1153 | 20.63 | 0.0% |
+| 合计 | 19.26 s | — / 58 | mean 231.3 ms、p95 233.9 ms | 1.933 s | 0.1004（聚合） | 30.01（聚合） | 0.0% / 0.0%（mean/corpus） |
+
+中文输出为 `甚至出现交易几乎停滞的情况。`；英文与参考文本的区别仅为标点，按本脚本
+NFKC、忽略空白和标点的字符级 CER 口径均为零。RTF 是请求墙钟除以音频时长；TPS
+包含 prefill 和首 token，不是纯 decode 吞吐。引擎启动耗时 29.939 s，未计入上述请求墙钟。
+
+**预热后重复基准（2026-11-09）**：沿用上面相同命令和配置，连续运行 5 次；每次独立
+启动引擎并预热第一条英文音频，再串行测英文和中文各一条。各轮开测前 GPU 温度分别为
+35、37、39、39、39°C，结束后 39°C；每轮生成 58 token，字符级 CER 均为 0.0%。
+
+| 轮次 | 聚合 TPS（tok/s） | 聚合 RTF | TTFT 均值（ms） | 英文 TPS | 中文 TPS |
+|---|---:|---:|---:|---:|---:|
+| 1 | 30.33 | 0.0993 | 225.5 | 33.52 | 20.81 |
+| 2 | 30.10 | 0.1001 | 233.0 | 33.39 | 20.45 |
+| 3 | 29.99 | 0.1004 | 233.6 | 33.15 | 20.59 |
+| 4 | 30.18 | 0.0998 | 226.9 | 33.35 | 20.74 |
+| 5 | 30.34 | 0.0993 | 226.1 | 33.52 | 20.85 |
+
+五轮聚合 TPS **中位数 30.18 tok/s，范围 29.99–30.34 tok/s**；逐条请求 TPS 范围
+英文 33.15–33.52、中文 20.45–20.85 tok/s。聚合值为每轮总输出 token 除以各批次
+墙钟之和，包含音频塔、prefill 和解码；这是该两条样本、单并发负载的预热后端到端
+吞吐，不是纯 decode TPS，也不能代表其他时长或并发。板上逐轮日志与 JSONL 位于
+`/tmp/asr-steady-20261109/`。
+
+**数值问题与范围**：修复前，普通 Qwen3-1.7B 和 ASR 在 decode 阶段出现 NaN、输出连续
+`!`；CoreX 后端将 KV 池零初始化后，普通模型图模式及上述 ASR 两条样本恢复正常。
+这是已验证的缓解措施，尚未确定内核受哪个未写入区域影响。上述结果仅覆盖单并发、
+fp16、两条短音频及图模式重复运行；CoreX ASR server、长跑、块复用及投机路径未在此轮验证。
 
 ## 5. 已知限制
 
@@ -375,7 +416,7 @@ curl -s -H "Authorization: Bearer sk-test" http://127.0.0.1:8011/v1/audio/transc
 | CUDA 端到端转写（asr_en/asr_zh） | ✅ 已实测 | 2026-11-04 本机 4070 8GB：TTFT mean 78.8–96.0ms、RTF 聚合 0.114–0.141、TPS 聚合 21.4–26.4、**CER 0.0%/0.0%（mean/corpus）**；数字与口径见 §4.1 |
 | CUDA server `/v1/audio/transcriptions` curl | ✅ 已实测 | json/text/自动检测/401 鉴权/非 ASR 模型 400 全通过；`flashengine_transcription_requests_total 3`、`errors 0`、`audio_seconds_total 23.459125` |
 | Ascend 310P | ✅ 已实测（2026-11-09） | 容器 vllm018 / Atlas 300I Duo / fp16：eager 与图两种模式转写均正确、**CER 0.0%/0.0%**；图模式 RTF 0.088 / TPS 34.15、eager RTF 0.256 / TPS 11.75；server `/v1/audio/transcriptions` json/text/401/metrics 全通过。本轮修掉 3 个 310P 专属构建期问题（整数算子落 AICPU、NPU 侧随机初始化、长度运算留主机），见 §4.2 |
-| CoreX | ❌ 未在真机验证 | 代码路径已具备（同上）；无 CoreX 机器，未产生任何真机数字 |
+| CoreX 离线转写 | ✅ 两条样本冒烟（2026-11-09） | CoreX 4.4.0 / fp16 / 图模式：中英文 CER 均 0.0%，TTFT mean 231.3 ms、RTF 聚合 0.1004、TPS 聚合 30.01；KV 池零初始化后测得。server、长跑和块复用等尚未验证，见 §4.3 |
 
 详细设计（processor 契约、引擎集成点、分工）见
 [`docs/QWEN3_ASR_DESIGN.md`](QWEN3_ASR_DESIGN.md)；支持矩阵见

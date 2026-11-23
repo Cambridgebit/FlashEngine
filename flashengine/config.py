@@ -4,6 +4,11 @@ import torch
 from dataclasses import dataclass, field
 from typing import Any
 
+# 必须在 transformers 之前：先建好 NPU 设备上下文，否则 torch_npu 的
+# ACL_ALLOW_HF32 compileopt 会失败（详见 flashengine/npu_bootstrap.py）。
+from flashengine.npu_bootstrap import ensure_npu_device_before_transformers
+ensure_npu_device_before_transformers()
+
 from transformers import AutoConfig
 
 from flashengine.backends import get_backend
@@ -97,6 +102,13 @@ class Config:
     num_kvcache_blocks: int = -1
     enable_prefix_cache: bool = True
     recurrent_prefix_cache_bytes: int = 256 * 1024 * 1024
+    # ---- 多 LoRA（1 个基座 + N 个适配器同时在线，按请求路由）----
+    # 权重栈常驻显存：每个被命中的 Linear 子分片占 max_loras × (r×in + out×r)。
+    enable_lora: bool = False
+    max_loras: int = 8
+    max_lora_rank: int = 16
+    # ((name, adapter_path), ...)：启动即注册，slot 按顺序分配 1..max_loras。
+    lora_modules: tuple[tuple[str, str], ...] = ()
     # 禁词约束：编译成词表掩码，在采样之前生效，因此与随机采样、投机解码并存。
     enable_constraints: bool = False
     banned_words: tuple[str, ...] = DEFAULT_BANNED_WORDS

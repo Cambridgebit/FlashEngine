@@ -15,13 +15,16 @@ class Sequence:
     block_size = 256
     counter = count()
 
-    def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
+    def __init__(self, token_ids: list[int], sampling_params = SamplingParams(),
+                 lora_id: int = 0):
         self.seq_id = next(Sequence.counter)
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
         self.last_token = token_ids[-1]
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
+        # 0 = 基座权重；1..max_loras = 适配器槽位（LoRAManager 注册时分配）。
+        self.lora_id = lora_id
         self.num_cached_tokens = 0
         self.num_scheduled_tokens = 0
         self.is_prefill = True

@@ -14,12 +14,22 @@ from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
 from flashengine.backends.graph import DecodeGraphPlan
+from flashengine.utils.pinned import PIN_MEMORY as _PIN_MEMORY
+
+# 诊断开关：打印 spec 图轮的分阶段耗时（同步计时，仅供定位长停顿，勿常开）。
+_DF_PROF = os.getenv("FLASHENGINE_DF_PROF", "0") == "1"
 from flashengine.config import Config
 from flashengine.engine.block_manager import BlockManager
 from flashengine.engine.sequence import Sequence
 from flashengine.engine.memory import MemoryBudgetError, plan_kv_memory
 from flashengine.layers.sampler import Sampler
 from flashengine.utils.context import set_context, get_context, reset_context
+# 只导入无依赖的上下文模块，避免与 layers/backends 形成循环。
+from flashengine.lora.context import (
+    clear_active_mask,
+    get_active_mask,
+    set_active_mask,
+)
 
 
 def _bucket(table, n):
@@ -53,6 +63,24 @@ def _refill_ids(t2d, m_idx, rows: int, k: int, ar_f=None, shift_idx=None):
 
 class MetaBlob:
 
+    @staticmethod
+    def _zeros(shape, dtype):
+        """锁页 CPU 缓冲；不可用时退回普通 CPU 内存。
+
+        310P 上 torch_npu ≥ 2.9 的 LazyInitAclops 会在首次 HCF（host-mapped）
+        分配时把 ACL_ALLOW_HF32 下发给驱动，而本机驱动/固件组合对该
+        compileopt 返回 500001，直接抛 RuntimeError。锁页只是 H2D 的加速手段，
+        退化后语义不变（拷贝照常同步完成）。
+        """
+        try:
+            return torch.zeros(shape, dtype=dtype, device='cpu', pin_memory=_PIN_MEMORY)
+        except RuntimeError as exc:
+            print(
+                f"[FlashEngine] 锁页内存不可用，改用普通 CPU 缓冲：{str(exc)[:120]}",
+                flush=True,
+            )
+            return torch.zeros(shape, dtype=dtype, device='cpu')
+
     def __init__(self, i64_segments, f32_segments, device):
         self.device = device
         self._i64_off, self._i64_size = {}, {}
@@ -60,13 +88,13 @@ class MetaBlob:
         for name, size in i64_segments:
             self._i64_off[name], self._i64_size[name] = pos, size
             pos += size
-        self.i64 = torch.zeros(pos, dtype=torch.int64, device='cpu', pin_memory=True)
+        self.i64 = self._zeros(pos, torch.int64)
         self._f32_off, self._f32_size = {}, {}
         pos = 0
         for name, size in f32_segments:
             self._f32_off[name], self._f32_size[name] = pos, size
             pos += size
-        self.f32 = torch.zeros(pos, dtype=torch.float32, device='cpu', pin_memory=True)
+        self.f32 = self._zeros(pos, torch.float32)
         self._views = {}
         self._dev = {}
 
@@ -215,6 +243,7 @@ class ModelRunner:
         self.graph_runner = None
         self._max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         self._graph_max_bs = min(config.max_num_seqs, 512)
+        self._capturing_spec_graph = False
         M = self._graph_max_bs
         W = self._max_num_blocks + 1
         self._pin_M, self._pin_W = M, W
@@ -292,6 +321,38 @@ class ModelRunner:
                 )
         self.startup_stats["weight_layout_conversions"] = float(weight_nz_count)
         self.startup_stats["model_load_s"] = time.perf_counter() - model_load_t0
+        # ---- 多 LoRA：基座权重就位后再挂适配器栈 ----
+        # 顺序要求：先 optimize_model_weights（310P 会把 Linear 权重转成 NZ），
+        # LoRA 才按最终形状切 B 行宽；hook 加在 Linear 输出上，与权重布局无关。
+        self.lora = None
+        if getattr(config, "enable_lora", False):
+            from flashengine.lora import LoRAConfig, LoRAManager
+
+            lora_cfg = LoRAConfig(
+                enabled=True,
+                max_loras=int(getattr(config, "max_loras", 8)),
+                max_lora_rank=int(getattr(config, "max_lora_rank", 16)),
+                modules=tuple(getattr(config, "lora_modules", ()) or ()),
+            )
+            manager = LoRAManager(self.model, lora_cfg, self.dtype, self.device)
+            for name, path in lora_cfg.modules:
+                manager.register(name, path)
+            manager.flush()
+            hooks = manager.attach()
+            self.lora = manager
+            stats = manager.stats()
+            print(
+                f"[FlashEngine] LoRA: {stats['registered']} "
+                f"bindings={stats['bindings']} modules={stats['modules']} "
+                f"hooks={hooks} stack={stats['stack_bytes'] / 2**20:.1f}MiB",
+                flush=True,
+            )
+            if stats["unresolved"]:
+                print(
+                    "[FlashEngine] LoRA 警告：以下模块在模型里找不到对应 Linear，已跳过"
+                    f"（前 5 个）: {stats['unresolved'][:5]}",
+                    flush=True,
+                )
         self.precision_audit = self._audit_precision(config)
         self.sampler = Sampler(device_rng=self.backend.supports_device_sampling_rng)
         # 禁词约束：只建一次掩码器，随后每步取 bias 行；关闭时不加载 tokenizer。
@@ -358,6 +419,9 @@ class ModelRunner:
         # 未启用候选算子的后端返回 {"checked": False}，与主项目现状一致。
         self.linear_validation = self.backend.validate_model_decode(self.model, config)
         self.spec_graphs = None
+        # LoRA + 投机整轮图：每个桶一份静态路由张量（bs*(k+1) 行），回放前 copy_。
+        self._spec_lora_mask: dict[int, torch.Tensor] = {}
+        self._spec_lora_host_buf: dict[int, torch.Tensor] = {}
         self.spec_greedy_graphs = {}
         self._spec_capture_greedy = False
         self._spec_batch_greedy = False
@@ -414,6 +478,11 @@ class ModelRunner:
                 self.graph_runner = self.backend.create_decode_graph_executor(graph_plan)
                 if self.graph_runner is not None:
                     self.graph_capture_attempted = True
+                    if self.lora is not None:
+                        # LoRA 走图：路由下标是每桶的静态 buffer（回放前 copy_），
+                        # 增量计算切到形状全静态的掩码路径，图内外算子一致。
+                        self.lora.set_static(True)
+                        self.graph_runner.lora_manager = self.lora
                     self.graph_runner.capture_all()
                     if not self.graph_runner.is_available():
                         failed_stats = self.graph_runner.snapshot()
@@ -582,7 +651,9 @@ class ModelRunner:
         if self.state_runtime:
             details.append(("Recurrent state", f"{self.state_runtime.slot_count} slots / {self.state_runtime.bytes / 2**20:.1f} MiB"))
             if self.config.enable_prefix_cache:
-                details.append(("Recurrent prefix state", f"bounded CPU snapshots ({self.state_runtime.prefix_limit / 2**20:.0f} MiB)"))
+                where = "device-resident snapshots" if self.state_runtime.device_snapshots                     else "bounded CPU snapshots"
+                details.append(("Recurrent prefix state",
+                                f"{where} ({self.state_runtime.prefix_limit / 2**20:.0f} MiB)"))
         return details
 
     def exit(self):
@@ -830,7 +901,7 @@ class ModelRunner:
         pad = self._graph_pad_block()
         block_tables = [seq.block_table + [pad] * (max_len - len(seq.block_table)) for seq in seqs]
         block_tables = torch.tensor(
-            block_tables, dtype=torch.int32, device="cpu", pin_memory=True
+            block_tables, dtype=torch.int32, device="cpu", pin_memory=_PIN_MEMORY
         ).to(self.device, non_blocking=True)
         return block_tables
 
@@ -929,22 +1000,22 @@ class ModelRunner:
             )
         )
         input_ids = torch.tensor(
-            input_ids, dtype=torch.int64, device="cpu", pin_memory=True
+            input_ids, dtype=torch.int64, device="cpu", pin_memory=_PIN_MEMORY
         ).to(self.device, non_blocking=True)
         positions = torch.tensor(
-            positions, dtype=torch.int64, device="cpu", pin_memory=True
+            positions, dtype=torch.int64, device="cpu", pin_memory=_PIN_MEMORY
         ).to(self.device, non_blocking=True)
         cu_seqlens_q = torch.tensor(
-            cu_seqlens_q, dtype=torch.int32, device="cpu", pin_memory=True
+            cu_seqlens_q, dtype=torch.int32, device="cpu", pin_memory=_PIN_MEMORY
         ).to(self.device, non_blocking=True)
         cu_seqlens_k = torch.tensor(
-            cu_seqlens_k, dtype=torch.int32, device="cpu", pin_memory=True
+            cu_seqlens_k, dtype=torch.int32, device="cpu", pin_memory=_PIN_MEMORY
         ).to(self.device, non_blocking=True)
         slot_mapping = torch.tensor(
             slot_mapping,
             dtype=self.backend.graph_slot_mapping_dtype(),
             device="cpu",
-            pin_memory=True,
+            pin_memory=_PIN_MEMORY,
         ).to(self.device, non_blocking=True)
         host_seq_lens_q = torch.tensor(
             [seq.num_scheduled_tokens for seq in seqs], dtype=torch.int32, device="cpu")
@@ -968,7 +1039,7 @@ class ModelRunner:
         if audio_embeds:
             audio_embeds = torch.cat(audio_embeds, dim=0)
             audio_slots = torch.tensor(
-                audio_slots, dtype=torch.int64, device="cpu", pin_memory=True
+                audio_slots, dtype=torch.int64, device="cpu", pin_memory=_PIN_MEMORY
             ).to(self.device, non_blocking=True)
             self._prefill_audio = (audio_embeds, audio_slots)
         else:
@@ -1129,6 +1200,11 @@ class ModelRunner:
             return self.model.compute_logits(
                 self._model_forward(input_ids, positions, audio_embeds, audio_slots)
             ), False
+        # LoRA 批次暂不走捕获图：适配器下标是每步才更新的路由信息，图内尚未接。
+        if self.lora is not None and get_active_mask() is not None:
+            return self.model.compute_logits(
+                self._model_forward(input_ids, positions, audio_embeds, audio_slots)
+            ), False
         if self.graphs is None:    # 捕获失败降级：decode 全部走 eager 前向
             if self.graph_capture_attempted:
                 self.decode_graph_stats["fallback"] += 1
@@ -1164,8 +1240,36 @@ class ModelRunner:
             return gv["token_ids"][:bs], True
         return self.model.compute_logits(gv["outputs"][:bs]), False
 
+    def _set_lora_indices(self, seqs, is_prefill: bool, num_rows: int) -> None:
+        """按本步批组成铺开逐 token 的适配器下标（0 = 基座）。
+
+        prefill 用每条序列本步调度的 token 数展开，decode 每条序列一行；行数
+        与本次前向的 input_ids 对齐（图路径回落 eager 时可能带 padding 行，
+        补 0 让 padding 走基座权重，不污染真实序列）。
+        """
+        from flashengine.lora import clear_active_mask, set_active_mask
+
+        if self.lora is None:
+            return
+        if not any(getattr(seq, "lora_id", 0) for seq in seqs):
+            clear_active_mask()
+            return
+        ids = []
+        for seq in seqs:
+            n = seq.num_scheduled_tokens if is_prefill else 1
+            ids.extend([getattr(seq, "lora_id", 0)] * n)
+        if len(ids) < num_rows:
+            ids.extend([0] * (num_rows - len(ids)))
+        elif len(ids) > num_rows:
+            ids = ids[:num_rows]
+        # 掩码在主机侧拼好、走常驻 pinned 缓冲异步下发：图内外都只做一次 mul，
+        # 既不在图内做整数比较（回放语义会错），也不每步新建张量同步拷贝。
+        set_active_mask(self.lora.fill_mask(ids))
+
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         self._decode_batch_greedy = all(seq.temperature <= 1e-10 for seq in seqs)
+        lora_active = (self.lora is not None
+                       and any(getattr(seq, "lora_id", 0) for seq in seqs))
         if not is_prefill and self.graph_runner is not None:
             graph_result = self.graph_runner.try_run(seqs)
             if graph_result is not None:
@@ -1181,6 +1285,7 @@ class ModelRunner:
                 else:
                     token_ids = None
                 reset_context()
+                clear_active_mask()
                 return token_ids
         audio_embeds = audio_slots = None
         if is_prefill:
@@ -1192,6 +1297,7 @@ class ModelRunner:
         needs_sample = self.graph_sample or any(seq.temperature > 1e-10 for seq in seqs)
         sample = (self.prepare_sample(seqs, is_prefill)
                   if self.rank == 0 and needs_sample else None)
+        self._set_lora_indices(seqs, is_prefill, input_ids.size(0))
         result, sampled = self.run_model(
             input_ids, positions, is_prefill,
             audio_embeds=audio_embeds, audio_slots=audio_slots,
@@ -1208,6 +1314,7 @@ class ModelRunner:
         else:
             token_ids = None
         reset_context()
+        clear_active_mask()
         return token_ids
 
     def _sample_logits(self, logits, seqs, is_prefill: bool = False, prepared=None):
@@ -1238,7 +1345,25 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_prefill_spec(self, seqs: list[Sequence]) -> list[int]:
-        return self.spec_runtime.prefill(seqs)
+        # 投机 prefill 同样要按 seq 路由适配器（每 seq 的 chunk token 数展开）。
+        self._set_lora_indices(seqs, True, sum(seq.num_scheduled_tokens for seq in seqs))
+        try:
+            return self.spec_runtime.prefill(seqs)
+        finally:
+            clear_active_mask()
+
+    def _set_spec_lora_indices(self, seqs: list[Sequence]) -> None:
+        """投机整轮 verify 的逐行路由：每 seq 连续 k+1 行（anchor + 提案）。"""
+        if self.lora is None:
+            clear_active_mask()
+            return
+        ids = [getattr(seq, "lora_id", 0) for seq in seqs]
+        if not any(ids):
+            clear_active_mask()
+            return
+        rows = int(self.config.spec_num_tokens) + 1
+        expanded = [sid for sid in ids for _ in range(rows)]
+        set_active_mask(self.lora.fill_mask(expanded))
 
     @torch.inference_mode()
     def _run_prefill_eagle(self, seqs: list[Sequence]) -> list[int]:
@@ -1276,7 +1401,11 @@ class ModelRunner:
             self.graph_sample
             or self._spec_batch_greedy
         )
-        result = self.spec_runtime.round(seqs, sampling_compatible)
+        self._set_spec_lora_indices(seqs)
+        try:
+            result = self.spec_runtime.round(seqs, sampling_compatible)
+        finally:
+            clear_active_mask()
         self._record_spec_acceptance(result)
         return result
 
@@ -1296,6 +1425,7 @@ class ModelRunner:
     @torch.inference_mode()
     def context_limited_spec_round(self, seqs):
         # 固定宽度 verify 不应越过窗口；剩余不足一整轮时只消费当前 anchor。
+        self._set_lora_indices(seqs, False, len(seqs))
         ids, positions = self.prepare_decode(seqs)
         hidden, _ = self.model(ids, positions)
         logits = self.model.compute_logits(hidden)
@@ -1416,39 +1546,39 @@ class ModelRunner:
             [seq.temperature for seq in seqs],
             dtype=torch.float32,
             device="cpu",
-            pin_memory=True,
+            pin_memory=_PIN_MEMORY,
         ).to(self.device, non_blocking=True)
         top_ps = torch.tensor(
             [seq.top_p for seq in seqs],
             dtype=torch.float32,
             device="cpu",
-            pin_memory=True,
+            pin_memory=_PIN_MEMORY,
         ).to(self.device, non_blocking=True)
         top_ks_draft = torch.tensor(
             [seq.top_k if 0 < seq.top_k < draft_vocab else draft_vocab for seq in seqs],
-            dtype=torch.int64, device="cpu", pin_memory=True
+            dtype=torch.int64, device="cpu", pin_memory=_PIN_MEMORY
         ).to(self.device, non_blocking=True)
         h_seed = torch.cat([self.spec_hidden[seq.seq_id] for seq in seqs], dim=0)
         seed = self.draft_model.project_aux(h_seed)
         slot_dtype = self.backend.graph_slot_mapping_dtype()
         p = torch.tensor(
-            [l - 2 for l in lens], dtype=torch.int64, device="cpu", pin_memory=True
+            [l - 2 for l in lens], dtype=torch.int64, device="cpu", pin_memory=_PIN_MEMORY
         ).to(self.device, non_blocking=True)
         ctx = torch.tensor(
-            [l - 1 for l in lens], dtype=torch.int32, device="cpu", pin_memory=True
+            [l - 1 for l in lens], dtype=torch.int32, device="cpu", pin_memory=_PIN_MEMORY
         ).to(self.device, non_blocking=True)
         # 1D slot_indices（Ascend ATB 硬性要求；[n,1] 会 ReshapeAndCache setup failed）
         slots = torch.tensor(
             [self._slot_of(seq, l - 2) for seq, l in zip(seqs, lens)],
             dtype=slot_dtype,
             device="cpu",
-            pin_memory=True,
+            pin_memory=_PIN_MEMORY,
         ).to(self.device, non_blocking=True)
         tokens = torch.tensor(
             [seq.last_token for seq in seqs],
             dtype=torch.int64,
             device="cpu",
-            pin_memory=True,
+            pin_memory=_PIN_MEMORY,
         ).to(self.device, non_blocking=True)
         set_context(False, slot_mapping=slots, context_lens=ctx,
                     block_tables=self.prepare_block_tables(seqs),
@@ -1503,7 +1633,8 @@ class ModelRunner:
             # 分块 prefill 只保存已经投影的完整块，不能缓存尚未写入的草稿 KV。
             computed = seq.num_cached_tokens + seq.num_scheduled_tokens
             for i in range(computed // self.block_size):
-                block_hash = BlockManager.compute_hash(seq.block(i), block_hash)
+                block_hash = BlockManager.compute_hash(
+                    seq.block(i), block_hash, getattr(seq, "lora_id", 0))
                 block_id = seq.block_table[i]
                 if self.has_dflash_prefix_snapshot(block_id, block_hash):
                     continue
@@ -1530,7 +1661,8 @@ class ModelRunner:
             return
         block_hash = -1
         for i in range(seq.num_cached_tokens // self.block_size):
-            block_hash = BlockManager.compute_hash(seq.block(i), block_hash)
+            block_hash = BlockManager.compute_hash(
+                seq.block(i), block_hash, getattr(seq, "lora_id", 0))
             block_id = seq.block_table[i]
             if not self.has_dflash_prefix_snapshot(block_id, block_hash):
                 raise RuntimeError("DFlash prefix snapshot missing after cache admission")
@@ -1571,7 +1703,7 @@ class ModelRunner:
                     [self._slot_of(seq, p) for p in range(start, start + (p1 - p0))],
                     dtype=self.backend.graph_slot_mapping_dtype(),
                     device="cpu",
-                    pin_memory=True,
+                    pin_memory=_PIN_MEMORY,
                 ).to(self.device, non_blocking=True)
             else:
                 context_slots = torch.full(
@@ -1591,8 +1723,11 @@ class ModelRunner:
         return self.draft_model.query_rows(self.config.spec_num_tokens)
 
     def _df_readback_commit(self, seqs: list[Sequence]) -> list[list[int]]:
+        prof = _DF_PROF and not self._capturing_spec_graph
+        t0 = time.perf_counter()
         rows = self.config.spec_num_tokens + 1
         rows_out = self._sg['commit_buf'][:len(seqs)].tolist()
+        t1 = time.perf_counter()
         results = []
         for i, (seq, row) in enumerate(zip(seqs, rows_out)):
             count = row[rows]
@@ -1600,8 +1735,16 @@ class ModelRunner:
             self.spec_ctx_pending[seq.seq_id] = self._sg['v_aux'][
                 i * rows:i * rows + count].clone()
             seq.num_scheduled_tokens = 0
+        t2 = time.perf_counter()
         if self.state_runtime and not self.state_runtime.device_commit:
             self.state_runtime.commit_verify(seqs, [len(tokens) for tokens in results])
+        if prof:
+            t3 = time.perf_counter()
+            span = (t3 - t0) * 1000.0
+            if span > 200.0:
+                print(f"[df_prof2] readback n={len(seqs)} total={span:.1f} "
+                      f"tolist={(t1 - t0) * 1000.0:.1f} clone={(t2 - t1) * 1000.0:.1f} "
+                      f"commit={(t3 - t2) * 1000.0:.1f}", flush=True)
         return results
 
     @torch.inference_mode()
@@ -1745,14 +1888,54 @@ class ModelRunner:
         if self.state_runtime:
             self.state_runtime.commit_verify_device(g['commit_buf'], bs)
 
+    def _prepare_spec_lora(self, bs: int):
+        """把该桶的静态路由掩码绑定成当前 LoRA 上下文（捕获与回放共用）。"""
+        if self.lora is None:
+            return None
+        rows = int(self.config.spec_num_tokens) + 1
+        buf = self._spec_lora_mask.get(bs)
+        if buf is None:
+            buf = torch.zeros(bs * rows, self.lora.cols,
+                              dtype=self.lora.dtype, device=self.device)
+            self._spec_lora_mask[bs] = buf
+        set_active_mask(buf)
+        return buf
+
+    def _spec_lora_host(self, rows: int):
+        host = self._spec_lora_host_buf.get(rows)
+        if host is None:
+            host = self.lora.host_mask(rows)
+            self._spec_lora_host_buf[rows] = host
+        return host
+
+    def _fill_spec_lora(self, seqs: list[Sequence], bucket: int) -> None:
+        if self.lora is None:
+            return
+        rows = int(self.config.spec_num_tokens) + 1
+        buf = self._spec_lora_mask.get(bucket)
+        if buf is None:
+            buf = self._prepare_spec_lora(bucket)
+        ids = []
+        for seq in seqs:
+            ids.extend([getattr(seq, "lora_id", 0)] * rows)
+        ids.extend([0] * (bucket * rows - len(ids)))
+        host = self._spec_lora_host(bucket * rows)
+        self.lora.mask_into(host, ids)
+        buf.copy_(host, non_blocking=True)
+
     def _capture_spec_graphs(self, prepare, body, label):
         self.spec_graph_bs = _graph_buckets(self._graph_max_bs)
         self.spec_graphs = {}
         self.spec_greedy_graphs = {}
+        if self.lora is not None:
+            # 图内不能出现 torch.nonzero / 动态形状：LoRA 增量必须走掩码定长路径。
+            self.lora.set_static(True)
+        self._capturing_spec_graph = True
         try:
             prepare()
             self._push_spec_meta()
             for bs in reversed(self.spec_graph_bs):
+                self._prepare_spec_lora(bs)
                 self._sg['v_cu_k'][:bs + 1] = self._sg['v_cu_q'][:bs + 1]
                 for _ in range(self.backend.graph_warmup_iters()):
                     body(bs)
@@ -1831,6 +2014,8 @@ class ModelRunner:
                 self.backend.empty_cache()
             except Exception:
                 pass
+        finally:
+            self._capturing_spec_graph = False
 
     @torch.inference_mode()
     def capture_df_spec_cudagraph(self):
@@ -1918,12 +2103,40 @@ class ModelRunner:
         self._df_replay_narrow = bool(
             self._df_narrow_ctx and max(len(seq) for seq in seqs) <= self._df_narrow_ctx)
         self._df_ctx_active = self._df_narrow_ctx if self._df_replay_narrow else None
+        prof = _DF_PROF and not self._capturing_spec_graph
+        marks = []
+        clock = time.perf_counter()
+
+        def _mark(label):
+            nonlocal clock
+            self.backend.synchronize()
+            now = time.perf_counter()
+            marks.append((label, (now - clock) * 1000.0))
+            clock = now
+
         n = self._fill_spec_meta(seqs)
         self._fill_df_meta(seqs)
         self._reset_spec_padding(n, bucket, True)
+        if prof:
+            _mark("meta")
         self._df_load_ctx_aux(seqs, bucket)
+        if prof:
+            _mark("ctx_aux")
+        self._fill_spec_lora(seqs, bucket)
+        if prof:
+            _mark("lora")
         self._replay_spec_graph(bucket)
-        return self._df_readback_commit(seqs)
+        if prof:
+            _mark("replay")
+        out = self._df_readback_commit(seqs)
+        if prof:
+            _mark("readback")
+            total = sum(ms for _, ms in marks)
+            if total > 800.0:
+                detail = " ".join(f"{label}={ms:.1f}" for label, ms in marks)
+                print(f"[df_prof] bucket={bucket} n={n} total={total:.1f} {detail}",
+                      flush=True)
+        return out
 
 
     def _alloc_spec_graph_vars(self, max_bs: int, rows: int, k: int) -> dict:

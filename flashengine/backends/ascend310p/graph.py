@@ -6,6 +6,7 @@ import traceback
 import torch
 
 from flashengine.backends.graph import DecodeGraphExecutor, DecodeGraphPlan
+from flashengine.utils.pinned import PIN_MEMORY as _PIN_MEMORY
 from flashengine.utils.context import set_context, reset_context, get_context
 
 
@@ -37,6 +38,11 @@ class DecodeGraphEntry:
     host_block_tables_np: object | None = None
     logits: torch.Tensor | None = None
     greedy_token_ids: torch.Tensor | None = None
+    # LoRA：每行的 0/1 路由掩码 [graph_bs, max_loras*rank]，图内静态 buffer，
+    # 回放前整块 copy_（掩码在主机侧算好：图内绝不能出现整数比较）。
+    lora_mask: torch.Tensor | None = None
+    host_lora_mask: torch.Tensor | None = None
+    host_lora_mask_np: object | None = None
     attn_captures: list | None = None
     enabled: bool = True
     capture_error: str | None = None
@@ -63,6 +69,8 @@ class NPUGraphDecodeRunner(DecodeGraphExecutor):
         self.warmup_iters = plan.warmup_iters
         self.dummy_kv_block = self.config.num_kvcache_blocks - 1
         self.entries: dict[int, DecodeGraphEntry] = {}
+        # 由 ModelRunner 在启用 LoRA 时注入（LoRAManager），图内走静态掩码路径。
+        self.lora_manager = None
         self._npu = npu_graph_api()
         self.graph_pool = self._create_pool_handle()
         self.capture_stream = torch.npu.Stream()
@@ -197,28 +205,37 @@ class NPUGraphDecodeRunner(DecodeGraphExecutor):
             device=self.device,
         )
         entry.host_input_ids = torch.empty(
-            (graph_bs,), dtype=torch.int64, device="cpu", pin_memory=True
+            (graph_bs,), dtype=torch.int64, device="cpu", pin_memory=_PIN_MEMORY
         )
         entry.host_positions = torch.empty(
-            (graph_bs,), dtype=torch.int64, device="cpu", pin_memory=True
+            (graph_bs,), dtype=torch.int64, device="cpu", pin_memory=_PIN_MEMORY
         )
         entry.host_slot_mapping = torch.empty(
-            (graph_bs,), dtype=torch.int32, device="cpu", pin_memory=True
+            (graph_bs,), dtype=torch.int32, device="cpu", pin_memory=_PIN_MEMORY
         )
         entry.host_context_lens = torch.empty(
-            (graph_bs,), dtype=torch.int32, device="cpu", pin_memory=True
+            (graph_bs,), dtype=torch.int32, device="cpu", pin_memory=_PIN_MEMORY
         )
         entry.host_block_tables = torch.empty(
             (graph_bs, self.max_block_cols),
             dtype=torch.int32,
             device="cpu",
-            pin_memory=True,
+            pin_memory=_PIN_MEMORY,
         )
         entry.host_input_ids_np = entry.host_input_ids.numpy()
         entry.host_positions_np = entry.host_positions.numpy()
         entry.host_slot_mapping_np = entry.host_slot_mapping.numpy()
         entry.host_context_lens_np = entry.host_context_lens.numpy()
         entry.host_block_tables_np = entry.host_block_tables.numpy()
+        # LoRA 路由掩码：常驻静态张量，捕获期即绑定给 forward hook。
+        if self.lora_manager is not None:
+            lora_cols = int(self.lora_manager.cols)
+            dtype = self.lora_manager.dtype
+            entry.lora_mask = torch.zeros((graph_bs, lora_cols), dtype=dtype, device=self.device)
+            entry.host_lora_mask = torch.zeros(
+                (graph_bs, lora_cols), dtype=dtype, device="cpu", pin_memory=_PIN_MEMORY
+            )
+            entry.host_lora_mask_np = entry.host_lora_mask.numpy()
         return entry
 
     def _fill_dummy(self, entry: DecodeGraphEntry):
@@ -229,6 +246,8 @@ class NPUGraphDecodeRunner(DecodeGraphExecutor):
         entry.slot_mapping.fill_(dummy_slot)
         entry.block_tables.fill_(self.dummy_kv_block)
         entry.block_tables[:, 0] = self.dummy_kv_block
+        if entry.lora_mask is not None:
+            entry.lora_mask.zero_()
 
     def build_metadata(self, entry: DecodeGraphEntry, seqs):
         dummy_slot = self.dummy_kv_block * self.block_size
@@ -237,15 +256,24 @@ class NPUGraphDecodeRunner(DecodeGraphExecutor):
         context_lens = entry.host_context_lens_np
         slot_mapping = entry.host_slot_mapping_np
         block_tables = entry.host_block_tables_np
+        lora_mask = entry.host_lora_mask_np
         input_ids.fill(0)
         positions.fill(0)
         context_lens.fill(1)
         slot_mapping.fill(dummy_slot)
         block_tables.fill(self.dummy_kv_block)
+        if lora_mask is not None:
+            lora_mask.fill(0)
         for row, seq in enumerate(seqs):
             input_ids[row] = seq.last_token
             positions[row] = len(seq) - 1
             context_lens[row] = len(seq)
+            if lora_mask is not None:
+                slot = int(getattr(seq, "lora_id", 0))
+                if slot > 0:
+                    rank = int(self.lora_manager.config.max_lora_rank)
+                    lo = (slot - 1) * rank
+                    lora_mask[row, lo:lo + rank] = 1.0
             slot_mapping[row] = (
                 seq.block_table[-1] * self.block_size
                 + (seq.last_block_num_tokens - 1)
@@ -260,6 +288,8 @@ class NPUGraphDecodeRunner(DecodeGraphExecutor):
         entry.slot_mapping.copy_(entry.host_slot_mapping, non_blocking=True)
         entry.context_lens.copy_(entry.host_context_lens, non_blocking=True)
         entry.block_tables.copy_(entry.host_block_tables, non_blocking=True)
+        if entry.lora_mask is not None:
+            entry.lora_mask.copy_(entry.host_lora_mask, non_blocking=True)
 
     def _forward(self, entry: DecodeGraphEntry):
         self._bind(entry)
@@ -275,9 +305,17 @@ class NPUGraphDecodeRunner(DecodeGraphExecutor):
     @torch.inference_mode()
     def capture(self, graph_bs: int):
         entry = DecodeGraphEntry(graph_bs=graph_bs)
+        # LoRA：捕获期把路由张量绑定成该桶的静态 buffer，图内 hook 每行按它取值。
+        # 捕获/回放共用同一个张量对象，回放前只更新内容（copy_），形状不变。
+        from flashengine.lora.context import clear_active_mask, set_active_mask
+
+        if self.lora_manager is not None:
+            clear_active_mask()
         try:
             entry = self._allocate_entry(graph_bs)
             self._fill_dummy(entry)
+            if self.lora_manager is not None:
+                set_active_mask(entry.lora_mask)
             from flashengine.backends.ascend310p.aclgraph_attn import (
                 begin_attn_capture,
                 finish_attn_capture,
@@ -385,6 +423,10 @@ class NPUGraphDecodeRunner(DecodeGraphExecutor):
         if self.state_runtime:
             self.state_runtime.prepare_decode(seqs)
         self._copy_into_static(entry)
+        if self.lora_manager is not None:
+            # 图内 hook 通过上下文拿到「这一桶的静态路由张量」，回放前只换了内容。
+            from flashengine.lora.context import set_active_mask
+            set_active_mask(entry.lora_mask)
         self._bind(entry)
         if entry.attn_captures:
             from flashengine.backends.ascend310p.aclgraph_attn import update_paged_attention_params

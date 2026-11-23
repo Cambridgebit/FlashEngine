@@ -39,6 +39,11 @@ class RecurrentStateRuntime:
         self.prefix_pending = {}
         self.prefix_stats = {"saved": 0, "restored": 0, "evicted": 0}
         self.async_prefix = getattr(self.backend, "supports_async_prefix_snapshots", False)
+        # 前缀快照的位置：CUDA 用锁页主机内存做异步 D2H；310P 的 D2H 是阻塞的，
+        # 留在设备侧做 D2D（每块边界 49 MiB，实测 ~0.2 ms 级，不拖 prefill）。
+        self.device_snapshots = getattr(self.backend, "prefix_snapshots_on_device", False)
+        self.snapshot_device = self.device if self.device_snapshots else "cpu"
+        self.pin_snapshots = self.async_prefix and not self.device_snapshots
         self.prefix_entry_bytes = self.bytes // self.slot_count
         if config.enable_prefix_cache and self.prefix_entry_bytes > self.prefix_limit:
             print("[FlashEngine] Recurrent 前缀预算不足以保存一个状态，关闭 prefix cache。", flush=True)
@@ -86,9 +91,11 @@ class RecurrentStateRuntime:
         count = self.prefix_limit // self.prefix_entry_bytes
         for row, offset, block_id, block_hash in candidates[-count:]:
             conv = torch.empty((len(self.layers), *self.conv_pool.shape[2:]),
-                               dtype=self.conv_pool.dtype, device="cpu", pin_memory=self.async_prefix)
+                               dtype=self.conv_pool.dtype, device=self.snapshot_device,
+                               pin_memory=self.pin_snapshots)
             ssm = torch.empty((len(self.layers), *self.ssm_pool.shape[2:]),
-                              dtype=self.ssm_pool.dtype, device="cpu", pin_memory=self.async_prefix)
+                              dtype=self.ssm_pool.dtype, device=self.snapshot_device,
+                              pin_memory=self.pin_snapshots)
             self.prefix_pending[row, offset] = (block_id, block_hash, conv, ssm, set())
         context.gdn_prefix_checkpoints = tuple(
             tuple(offset for r, offset in self.prefix_pending if r == row)
@@ -109,15 +116,15 @@ class RecurrentStateRuntime:
             raise RuntimeError("前缀已获准复用，但 recurrent 末块状态缺失")
         _, conv, ssm = self.prefix_snapshots[block_id]
         slot = self.get_slot(seq)
-        self.conv_pool[:, slot].copy_(conv, non_blocking=self.async_prefix)
-        self.ssm_pool[:, slot].copy_(ssm, non_blocking=self.async_prefix)
+        self.conv_pool[:, slot].copy_(conv, non_blocking=self.pin_snapshots)
+        self.ssm_pool[:, slot].copy_(ssm, non_blocking=self.pin_snapshots)
         self.prefix_snapshots.move_to_end(block_id)
         self.prefix_stats["restored"] += 1
 
     def capture_prefix_layer(self, layer, row, offset, conv, ssm):
         _, _, conv_out, ssm_out, ready = self.prefix_pending[row, offset]
-        conv_out[layer].copy_(conv, non_blocking=self.async_prefix)
-        ssm_out[layer].copy_(ssm, non_blocking=self.async_prefix)
+        conv_out[layer].copy_(conv, non_blocking=self.pin_snapshots)
+        ssm_out[layer].copy_(ssm, non_blocking=self.pin_snapshots)
         ready.add(layer)
 
     def finish_prefill(self):
@@ -125,6 +132,7 @@ class RecurrentStateRuntime:
         if self.prefix_pending and self.async_prefix:
             # CUDA 各层 D2H 排在同一流，只在发布前统一等待一次。
             self.backend.synchronize()
+        # 设备侧快照是同一流上的 D2D 拷贝，顺序已经保证，无需额外同步。
         for block_id, block_hash, conv, ssm, ready in self.prefix_pending.values():
             if len(ready) != len(self.layers):
                 continue
@@ -166,11 +174,16 @@ class RecurrentStateRuntime:
 
     def commit_verify(self, seqs, counts):
         # 行 count-1 已消费 anchor 和接受的提案；bonus 留给下一轮消费。
-        source = self._tensor([self.capacity + row * self.rows + count - 1
-                               for row, count in enumerate(counts)], torch.int64)
-        target = self._tensor([self.get_slot(seq) for seq in seqs], torch.int64)
-        for cache in (self.conv_pool, self.ssm_pool):
-            cache.index_copy_(1, target, cache.index_select(1, source))
+        #
+        # 逐序列按槽位切片拷贝，不要用 index_select + index_copy_：大池上按
+        # 序列数建索引的算子要按索引长度各自编译，310P 实测首次调用
+        # 9.5-13.5 s（并发从 1 涨到 4 时正好卡在这里），之后才降到 4-35 ms；
+        # 切片拷贝首次 42 ms、稳态 11 ms，且与序列数无关。
+        for row, (seq, count) in enumerate(zip(seqs, counts)):
+            source = self.capacity + row * self.rows + count - 1
+            target = self.get_slot(seq)
+            for cache in (self.conv_pool, self.ssm_pool):
+                cache[:, target].copy_(cache[:, source])
 
     def commit_verify_device(self, commit_buf, batch_size):
         """静态图尾部状态回写；接受数留在设备，padding 不写 dummy 主槽。"""
@@ -195,4 +208,5 @@ class RecurrentStateRuntime:
                 "pool_slots": self.slot_count, "bytes": self.bytes,
                 "prefix_cache": {**self.prefix_stats, "bytes": self.prefix_bytes,
                                  "limit_bytes": self.prefix_limit,
-                                 "entries": len(self.prefix_snapshots)}}
+                                 "entries": len(self.prefix_snapshots),
+                                 "on_device": self.device_snapshots}}

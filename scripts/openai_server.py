@@ -28,6 +28,10 @@ _default_temperature = 0.0
 _default_top_p = 1.0
 _default_top_k = 0
 _max_model_len = 4096
+# 多 LoRA：{适配器名: 槽位}，由启动参数 --lora-module 填充；基座用 _model_name。
+_lora_modules: list[tuple[str, str]] = []
+_lora_slots: dict[str, int] = {}
+
 _default_thinking = None
 _default_reserve = 512
 _ui_enabled = True
@@ -1140,15 +1144,22 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(_stats_json())
                 return
             if path in ("/v1/models", "/models"):
-                self._json({
-                    "object": "list",
-                    "data": [{
-                        "id": _model_name,
+                # 基座 + 每个已注册适配器各自是一个可选 model id（LoRA 容器语义）。
+                data = [{
+                    "id": _model_name,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "flashengine",
+                }]
+                for name, _ in _lora_modules:
+                    data.append({
+                        "id": name,
                         "object": "model",
                         "created": 0,
                         "owned_by": "flashengine",
-                    }],
-                })
+                        "parent": _model_name,
+                    })
+                self._json({"object": "list", "data": data})
                 return
             if path in ("/health", "/v1/health"):
                 self._bytes(b"OK", "text/plain")
@@ -1327,6 +1338,14 @@ class Handler(BaseHTTPRequestHandler):
         except (TypeError, ValueError) as exc:
             self._error(f"invalid request parameters: {exc}", 400)
             return
+        # 多 LoRA 路由：model 缺省 = 基座；等于某个适配器名 = 走该适配器；
+        # 其它未知名字直接 400（不静默回落到基座，避免用户以为生效了）。
+        if model and model != _model_name and model not in _lora_slots:
+            self._error(
+                f"unknown model {model!r}; available: "
+                f"{[_model_name] + [name for name, _ in _lora_modules]}", 400)
+            return
+        lora_id = _lora_slots.get(model, 0) if model != _model_name else 0
         if n != 1:
             self._error("'n' != 1 is not supported", 400)
             return
@@ -1351,6 +1370,9 @@ class Handler(BaseHTTPRequestHandler):
             top_p = min(max(top_p, 1e-6), 1.0)
             top_k = body.get("top_k")
             top_k = max(int(top_k), 0) if top_k is not None else _default_top_k
+            # 速度口径：ignore_eos=true 时忽略 EOS、一直生成到 max_tokens，
+            # 让不同模型/适配器的输出长度一致，TPS 不被「谁话多」污染。
+            ignore_eos = bool(body.get("ignore_eos", False))
         except (TypeError, ValueError) as exc:
             self._error(f"invalid sampling parameters: {exc}", 400)
             return
@@ -1408,7 +1430,8 @@ class Handler(BaseHTTPRequestHandler):
             temperature=temperature,
             max_tokens=max_tokens,
             top_p=top_p,
-            top_k=top_k))
+            top_k=top_k,
+            ignore_eos=ignore_eos), lora_id=lora_id)
         with engine_lock:
             engine.scheduler.add(seq)
             st = _Request(seq, None if auto_continue else max_tokens, rid,
@@ -1581,6 +1604,11 @@ def _build_parser():
                         help="recurrent 前缀状态的主机内存上限，默认 256 MiB；0 关闭")
     parser.add_argument("--spec-model", default="")
     parser.add_argument("--spec-num-tokens", type=int, default=3)
+    # 多 LoRA：可重复传入；请求体的 model 字段填适配器名即可路由到对应适配器。
+    parser.add_argument("--lora-module", action="append", default=[], metavar="NAME=PATH",
+                        help="注册一个 LoRA 适配器（可重复）；请求 model 字段用 NAME 选择")
+    parser.add_argument("--max-loras", type=int, default=8)
+    parser.add_argument("--max-lora-rank", type=int, default=16)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0, help="默认 top-p，请求体可覆盖")
     parser.add_argument("--top-k", type=int, default=0, help="默认 top-k，请求体可覆盖；0 关闭")
@@ -1682,11 +1710,26 @@ def main(argv=None):
     from scripts.memory_options import memory_kwargs
 
     kwargs.update(memory_kwargs(args))
+    lora_modules = []
+    for item in args.lora_module or []:
+        name, sep, path = item.partition("=")
+        if not sep or not name or not path:
+            raise SystemExit(f"--lora-module 需要 NAME=PATH，收到 {item!r}")
+        lora_modules.append((name, path))
+    if lora_modules:
+        kwargs.update(enable_lora=True, max_loras=args.max_loras,
+                      max_lora_rank=args.max_lora_rank,
+                      lora_modules=tuple(lora_modules))
     engine = LLM(**kwargs)
     _tokenizer = engine.tokenizer
     _eos = engine.scheduler.eos
     _max_model_len = engine.config.max_model_len
     _model_name = args.model.rstrip("/").rsplit("/", 1)[-1]
+    global _lora_modules, _lora_slots
+    _lora_modules = lora_modules
+    if lora_modules:
+        manager = engine.model_runner.lora
+        _lora_slots = {name: manager.slot_of(name) for name, _ in lora_modules}
     _asr_max_tokens = max(1, args.asr_max_tokens)
     _asr_max_upload_bytes = max(1, args.asr_max_upload_mb) * 1024 * 1024
     # 只有音频目标模型才初始化 AsrProcessor；其它模型保持端点存在但返回 400，
@@ -1711,6 +1754,12 @@ def main(argv=None):
     httpd.daemon_threads = True
     _log("INFO", f"Starting OpenAI-compatible API server on http://{args.host}:{args.port}/v1")
     _log("INFO", f"Served model: {_model_name} (source={args.model})")
+    if _lora_modules:
+        _log("INFO",
+             f"LoRA adapters: {len(_lora_modules)} -> "
+             f"{ {name: slot for name, slot in _lora_slots.items()} } "
+             f"(max_loras={args.max_loras}, rank<={args.max_lora_rank}); "
+             f"请求体 model 填适配器名即可路由")
     if _asr_processor is not None:
         _log("INFO",
              f"ASR transcription enabled: POST /v1/audio/transcriptions "

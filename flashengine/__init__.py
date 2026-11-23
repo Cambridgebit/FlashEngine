@@ -7,6 +7,13 @@ __all__ = [
     "__version__",
 ]
 
+# 必须发生在任何 transformers 导入之前（见 flashengine/npu_bootstrap.py）：
+# Ascend 上 torch_npu 的首次 _npu_init 若晚于 transformers 导入，会因
+# ACL_ALLOW_HF32 compileopt 返回 500001 而失败。非 Ascend 机器上是 no-op。
+from flashengine.npu_bootstrap import ensure_npu_device_before_transformers
+
+ensure_npu_device_before_transformers()
+
 
 def __getattr__(name):
     # 全部惰性：导入 flashengine 不应拉入 torch / transformers / 服务端模块。

@@ -9,13 +9,16 @@ class RequestCapacityError(RuntimeError):
 
 
 class EngineRequests:
-    def add_request(self, prompt, sampling_params, audio=None):
+    def add_request(self, prompt, sampling_params, audio=None, lora_request=None):
         """登记一条请求。
 
         audio 为多模态音频的预处理产物（`AsrProcessor.build` 的返回值去掉 input_ids），
         字段：`mel`（[num_mel_bins, frames] 的 CPU 张量/数组）、`valid_frames`（int，
         conv 前的有效帧数）、`audio_span`（(start, end)，占位 token 在 prompt 里的区间）、
         `num_audio_tokens`（= end - start）。带音频的请求跳过前缀缓存。
+
+        lora_request 为 `flashengine.lora.LoRARequest`：只在启动时 `lora_modules`
+        注册过的适配器可用，否则直接报错（不静默回落到基座）。
         """
         if getattr(self, "_closed", False):
             raise RuntimeError("引擎已关闭")
@@ -42,7 +45,14 @@ class EngineRequests:
             raise RequestCapacityError("请求队列已满")
         if audio is not None:
             audio = self.validate_audio(audio, len(prompt))
-        seq = Sequence(list(prompt), sp)
+        lora_id = 0
+        if lora_request is not None:
+            manager = getattr(self.model_runner, "lora", None)
+            if manager is None:
+                raise RuntimeError(
+                    "该请求指定了 LoRA 适配器，但引擎未启用 LoRA（enable_lora=True）")
+            lora_id = manager.slot_of(lora_request.lora_name)
+        seq = Sequence(list(prompt), sp, lora_id=lora_id)
         if audio is not None:
             seq.audio = audio
             # 占位 token 序列相同不代表隐层相同（音频特征不同），不能被前缀缓存复用。
