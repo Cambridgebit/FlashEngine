@@ -341,3 +341,127 @@ alpha=8 只有一半强度（0.47）；alpha=192 直接崩坏，输出退化成
    p99 +1064 ms、TPS −1.4%（解码 28.3 vs 28.4 几乎不变）。改设备侧后拷贝变成同流
    D2D，只剩显存占用；启动摘要会打印 `device-resident snapshots`。
 
+
+## 7. 离线融合：把适配器烘进基座权重（`scripts/merge_lora.py`，2026-11-23）
+
+**什么时候用**：只要 1 个适配器、且愿意为它付一份模型权重时，把 LoRA 永久相加进
+基座比运行时 `--lora-module` 更省：少一套 330 MB 适配器张量、少每步的增量 GEMM 与
+定长掩码、服务启动参数也不必带适配器名。代价是**每个适配器一份 ~19 GB 模型目录**，
+换适配器 = 换服务；要 8 个适配器热切仍走引擎的运行时 LoRA（§1–§2）。
+
+**用法**（纯 CPU、不占 NPU；容器内用 `/data2/fe-t5-venv/bin/python3`，
+宿主 `python3` 没有 safetensors）：
+
+```bash
+# 最小用法：只给基座 + 适配器（--out 省略时产出 <适配器目录>-merged）
+python -m scripts.merge_lora --base /data/Qwen3.5-9B \
+    --adapter /data/lora/Qwen3.5-9B-lora-642 --out /data2/merged/a3
+
+# 310P 部署要 fp16 时显式指定；校验强度可用 all / off / 正整数
+python -m scripts.merge_lora --base /data/Qwen3.5-9B \
+    --adapter /data/lora/Qwen3.5-9B-lora-642 --out /data2/merged/a3 \
+    --dtype float16 --verify-tensors all
+
+# 干跑（只报映射与体积，不落盘）/ 批量 / 只审适配器（不需要基座）
+python -m scripts.merge_lora --base /data/Qwen3.5-9B --adapter <adapter> --check
+python -m scripts.merge_lora --base /data/Qwen3.5-9B \
+    --adapters-dir /data/lora/adapters --all --out /data2/merged --dtype float16
+python -m scripts.merge_lora --adapter /data/lora/qwen35-35b-a3b-lora --audit-adapter
+```
+
+**训练参数全部自动读，不需要手工填**（只需选基座、适配器、输出目录）：
+
+| 参数 | 来源 | 说明 |
+|---|---|---|
+| `rank` / `alpha` / `use_rslora` | `adapter_config.json` | 另读 `rank_pattern` / `alpha_pattern` 逐模块覆盖 |
+| `scaling` | 上式推导 | `alpha/r`，rsLoRA 为 `alpha/sqrt(r)` |
+| dtype | 基座 `config.json` | 顶层 `dtype`/`torch_dtype` → `text_config` → `llm_config`/`language_config`，全缺省则 bfloat16 |
+| 输出目录 | `--out`，可省略 | 省略 = `<适配器目录>-merged` |
+| 分片大小 | 固定默认 | 4 GiB（`--shard-size-gb` 可改） |
+| 校验 | 默认开启 | `auto` = 32 个张量且覆盖每种模块模式 |
+
+**数学与命名**：`W += (alpha/r)·(B@A)`（`use_rslora=true` 时 `alpha/sqrt(r)`，
+`rank_pattern`/`alpha_pattern` 逐模块覆盖）。适配器键是 PEFT 的
+`base_model.model.model.language_model...`，剥掉 `base_model.model.` 后与基座
+`model.safetensors.index.json` 的键同名；仅当基座换了多模态外壳前缀时按
+`model.language_model.` / `language_model.` / `model.` 顺序回退匹配。
+`in_proj_qkv` 在基座里是**单个** `[3*dim, in]` 张量、B 的行已覆盖 q/k/v 全序，
+所以整张量相加即可——拆 `in_proj_qkvz`/`in_proj_ba` 只是引擎内部的融合细节
+（`flashengine/lora/loader.py`），离线维度上不需要。
+
+**安全阀**（任一不满足就报错退出，绝不产出「部分融合」的模型）：
+
+- 适配器模块在基座里找不到、两个模块映射到同一张量、只有 `lora_A` 没有 `lora_B`
+  → 退出码 2；
+- `use_dora` / `bias != none` / `modules_to_save` / `target_parameters` / 出现
+  `lora_magnitude_vector` 等非 `lora_A|lora_B` 张量 → 明确拒绝（不近似）；
+- `visual.` / `mtp.` / `conv1d` / `lm_head` / `embed_tokens` 按引擎 loader 同口径跳过；
+- 磁盘余量按基座体积 ×1.05 预检；输出目录非空需 `--overwrite`。
+
+**产物自洽**：先写 `merge-tmp-*.safetensors`，全部写完后按最终分片数改名并生成
+`model.safetensors.index.json`（`total_size` 为实际字节数）；`config.json` /
+`generation_config.json` 的 `dtype`/`torch_dtype`（含 `text_config` 内）同步改写；
+`--dtype` 作用于**全部**张量，避免「语言层 fp16 + 视觉塔 bf16」的混合产物；
+**自动校验**（默认开启，`--verify-tensors auto`）：从产物里回读抽样张量，用
+`base + s·B@A` 在 CPU 上重算并比对（atol：fp16 5e-3 / bf16 5e-2 / fp32 1e-5）；
+取样先保证**每种模块模式至少一个**（`layers.N` 归一化后去重），再均匀补足到 32 个，
+所以 9B 的 12 种模式、35B 的 13 种模式都会被验到。`all` 校验全部融合张量（9B 248 个，
+多花一两分钟），`off` 关闭，正整数为自定义抽样数；校验失败即报错退出（退出码 2），
+不会留下「看起来成功」的产物。
+
+**测试**：`tests/test_merge_lora.py`（**17 项**，容器内
+`python -m unittest tests.test_merge_lora -v`）覆盖数学等价、多分片与 index 自洽、
+未融合张量透传、dtype 与 config 改写、`--check` 不落盘、未命中模块/DoRA/缺 B/
+非空输出目录报错、pattern 缩放，以及本轮新增的「默认行为」：dtype 自动推断（含
+`torch_dtype` 优先与兜底）、`--verify-tensors auto` 覆盖全部模块模式、省略 `--out`
+时落到 `<适配器>-merged`、MoE 夹具。
+
+**板上实跑（2026-11-23，容器 vllm018，Qwen3.5-9B + `Qwen3.5-9B-lora-642`）**：
+248 个目标模块全部命中（`modules=248 targets=248 skipped=0 scaling=['4']`，
+r=8/alpha=32），输出 5 分片、19,306,208,736 字节（≈18.0 GiB）、775 个张量与基座
+一一对应；与既有手工融合产物 `/data/Qwen3.5-9B-lora642-fp16` 抽样 16 个张量
+（含 `in_proj_qkv`/`in_proj_z`/`o_proj`/`down_proj`/`conv1d` 与视觉塔）
+**最大绝对误差 0.0（bit 级一致）**，dtype 同为 fp16；脚本自身的 `--verify-tensors`
+对基座重算的最大绝对误差 1.2e-04，属 fp16 舍入量级。即本脚本与历史手工融合等价，
+可直接替换现有部署目录。
+
+**MoE（Qwen3.5-35B-A3B）同样一条路径（2026-11-23）**：`--adapter` 指向
+`v1-20260923-094720/checkpoint-2206`（已放到板上 `/data/lora/qwen35-35b-a3b-lora`），
+`--audit-adapter` 实测结果：`r=32 alpha=64` → **scaling 2**（rsLoRA 关）、适配器张量为
+bf16（加载即转 fp32）、**350 个模块 / 45.0M delta 参数 / 13 种模式**：
+
+| 层（40 层） | 命中模块 | 数量 |
+|---|---|---|
+| 30 层 GDN | `linear_attn.in_proj_a` / `in_proj_b` / `in_proj_qkv` / `in_proj_z` / `out_proj` | 30×5 |
+| 10 层全注意力 | `self_attn.q_proj` / `k_proj` / `v_proj` / `o_proj` | 10×4 |
+| 40 层 MoE | `mlp.shared_expert.gate_proj` / `up_proj` / `down_proj` | 40×3 |
+| 40 层 MoE 门控 | `mlp.shared_expert_gate`（输出 1 维标量门） | 40 |
+
+**关键点：该适配器不含路由专家**（没有 `mlp.experts.<i>.*`），`shared_expert*` 在 HF
+里就是普通 `nn.Linear`，所以 35B-A3B 与 9B 走完全相同的「同名键 + 整张量相加」路径，
+不需要任何 MoE 专用分支。若将来适配器按 `mlp.experts.<i>.<proj>` 逐专家训练，Qwen 系
+检查点本身就是逐专家存权重（`/data/Qwen3-30B-A3B` 的 index 可查），同名键照样能直接
+融合；只有基座把专家堆叠成融合张量（`[num_experts, out, in]`）时，形状校验才会报错并
+提示「需要逐专家导出的适配器」。
+
+**新增 `--audit-adapter`（不需要基座、不需要输出目录）**：打印 rank/alpha/缩放、按层归一化
+的模块模式与计数、delta 参数量、是否命中逐专家权重，并给出结论，用于在拿到基座前先确认
+适配器可融合性：
+
+```bash
+python -m scripts.merge_lora --adapter /data/lora/qwen35-35b-a3b-lora --audit-adapter
+# → modules=350 delta_params=45.0M scaling=2 … 结论: OK
+```
+
+同轮其它加固：`fan_in_fan_out=true` 明确拒绝（Conv1D 权重按 `[in, out]` 存储，delta 需
+转置，静默相加会算错）；`--dtype` 对全部张量统一；形状不一致时的报错区分「模块未命中」
+与「MoE 专家融合张量」两种情况。单测增至 **11 项**（新增 MoE 基座夹具：shared_expert 三项
++ `shared_expert_gate` + 逐专家 `experts.0/1`，覆盖 scaling、融合数学、未命中专家透传、
+`--audit-adapter` 不写盘）。
+
+**35B-A3B 目前只差基座**：板上有 `/data/Qwen3.5-9B`、`/data/Qwen3.5-4B`、
+`/data/Qwen3-30B-A3B`（Qwen3 代次，无 shared expert），没有
+`Qwen3.5-35B-A3B`；适配器里的 `base_model_name_or_path` 是训练机路径
+`/mnt/si003010rsbi/default/models/Qwen3.5-35B-A3B`。要出产物需把该基座放到板上
+（bf16 ≈70 GB；输出同样 ≈70 GB，按默认 4 GiB/分片约 18 片，`/data2` 现余 336 GB），
+命令与 9B 完全一致，只换 `--base/--adapter/--out`。
