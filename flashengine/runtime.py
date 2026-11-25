@@ -82,6 +82,7 @@ class RuntimeSettings:
     device_ids: tuple[int, ...] = ()
     max_pending_requests: int = 1024
     recurrent_prefix_cache_bytes: int = 256 * 1024 * 1024
+    recurrent_snapshot_stride: int = 1
     hccl_port: int = 0
     shm_name: str = ""
     memory_budget_bytes: int = 0
@@ -125,7 +126,7 @@ class RuntimeSettings:
         # device_ids 之外的计数/预算类字段允许 0。
         for name in ("memory_budget_bytes", "device_memory_reserve_bytes",
                      "memory_workspace_bytes", "graph_memory_reserve_bytes",
-                     "recurrent_prefix_cache_bytes", "hccl_port"):
+                     "recurrent_prefix_cache_bytes", "recurrent_snapshot_stride", "hccl_port"):
             value = getattr(self, name)
             if type(value) is not int or value < 0:
                 raise ValueError(f"配置 {name} 必须为非负整数")
@@ -265,7 +266,7 @@ class RuntimeSettings:
             "max_num_partial_prefills", "enable_chunked_prefill", "enable_prefix_cache",
             "gpu_memory_utilization", "kvcache_block_size", "enforce_eager", "spec_model",
             "spec_num_tokens", "tensor_parallel_size", "max_pending_requests",
-            "recurrent_prefix_cache_bytes", "hccl_port", "shm_name", "memory_budget_bytes",
+            "recurrent_prefix_cache_bytes", "recurrent_snapshot_stride", "hccl_port", "shm_name", "memory_budget_bytes",
             "device_memory_reserve_bytes", "memory_workspace_bytes",
             "graph_memory_reserve_bytes", "fp16_only", "decode_linear_backend",
             "greedy_backend", "enable_constraints", "banned_words",

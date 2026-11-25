@@ -27,6 +27,13 @@ _XML_CALL = re.compile(r"<function\s+name=\"([^\"]+)\"\s*>(.*?)</function>", re.
 _XML_PARAM = re.compile(r"<param\s+name=\"([^\"]+)\"\s*>(.*?)</param>", re.S)
 _CDATA = re.compile(r"<\!\[CDATA\[(.*?)\]\]>", re.S)
 _HERMES_CALL = re.compile(r"<tool_call>(.*?)</tool_call>", re.S)
+# Qwen3 / Hermes 的 XML 形态：<tool_call><function=NAME><parameter=KEY>值</parameter></function></tool_call>
+# 与上面的 JSON 形态（hermes）并存。放开 tool_choice=auto（不挂语法约束）时，模型几乎
+# 只用这一种形态；漏解析会让客户端看到原始 XML、以为模型没调工具。
+_HX_CALL = re.compile(
+    r"<tool_call>\s*<function=([^>\s]+)\s*>(.*?)</function>\s*</tool_call>", re.S
+)
+_HX_PARAM = re.compile(r"<parameter=([^>\s]+)\s*>(.*?)</parameter>", re.S)
 _DS_CALL_BEGIN = "<｜｜tool▁call▁begin｜｜>"
 _DS_CALL_END = "<｜｜tool▁call▁end｜｜>"
 _DS_SEP = "<｜｜tool▁sep｜｜>"
@@ -360,6 +367,35 @@ def _parse_hermes(body: str, tools) -> tuple[str, list[dict]]:
     return "".join(content).strip(), calls
 
 
+def _parse_hermes_xml(body: str, tools) -> tuple[str, list[dict]]:
+    """解析 ``<function=NAME><parameter=KEY>值</parameter>`` 形态的工具调用。"""
+    parameters = _tool_parameters(tools)
+    calls = []
+    spans = []
+    for match in _HX_CALL.finditer(body):
+        name = match.group(1).strip()
+        inner = match.group(2)
+        schema = parameters.get(name) or {}
+        arguments = {}
+        for param in _HX_PARAM.finditer(inner):
+            key = param.group(1).strip()
+            raw = param.group(2)
+            value = _xml_param_value(raw)
+            if not _CDATA.search(raw):
+                value = value.strip()
+            arguments[key] = _coerce(value, _property_schema(schema, key))
+        calls.append(_new_call(name, arguments))
+        spans.append(match.span())
+    content = []
+    cursor = 0
+    for start, end in spans:
+        content.append(body[cursor:start])
+        cursor = end
+    content.append(body[cursor:])
+    text = "".join(content).strip()
+    return text, calls
+
+
 def _parse_deepseek(body: str, tools) -> tuple[str, list[dict]]:
     calls = []
     spans = []
@@ -405,6 +441,9 @@ def parse_output(text: str, protocol: str, *, tools=None) -> ParsedOutput:
         content, calls = _parse_deepseek(body, tools)
     else:
         content, calls = _parse_hermes(body, tools)
+    if not calls and "<function=" in (content or ""):
+        # 兜底：任何协议下漏掉的 XML 形态调用都解析出来，避免整段 XML 当成正文回给客户端。
+        content, calls = _parse_hermes_xml(content, tools)
     return ParsedOutput(
         content=content or None,
         reasoning_content=reasoning,

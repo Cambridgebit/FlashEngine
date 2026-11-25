@@ -24,6 +24,8 @@ from transformers import AutoTokenizer
 import numpy as np
 import torch
 
+from flashengine.protocol import parse_output
+
 from flashengine.structured import (
     PROTOCOLS,
     BitmaskApplier,
@@ -189,6 +191,33 @@ def main(argv=None):
                  '<｜｜tool▁calls▁begin｜｜><｜｜tool▁call▁begin｜｜>function'
                  '<｜｜tool▁sep｜｜>get_weather\n```json\n{"city":"Paris"}\n```'
                  '<｜｜tool▁call▁end｜｜><｜｜tool▁calls▁end｜｜>')
+
+    # ---- 工具调用解析（Qwen3/Hermes 的 XML 形态）--------------------------
+    print("\n[tool_parse]")
+    qwen_call = ('<tool_call>\n<function=read_file>\n<parameter=path>\nsrc/a.py\n'
+                 '</parameter>\n<parameter=lines>\n7\n</parameter>\n</function>\n'
+                 '</tool_call>')
+    for protocol in PROTOCOLS:
+        parsed = parse_output(qwen_call, protocol, tools=TOOLS)
+        calls = parsed.tool_calls or []
+        if len(calls) != 1:
+            checker.fail("%s 未解析出 XML 形态工具调用（%d 个）" % (protocol, len(calls)))
+            continue
+        arguments = json.loads(calls[0]["function"]["arguments"])
+        if calls[0]["function"]["name"] != "read_file":
+            checker.fail("%s 解析出的函数名错误" % protocol)
+        elif arguments.get("lines") != 7:
+            checker.fail("%s 参数没有按 schema 转成整数：%r" % (protocol, arguments))
+        elif parsed.content:
+            checker.fail("%s 正文里残留了 XML：%r" % (protocol, parsed.content))
+        else:
+            print("  ok   %s：XML 形态调用可解析，参数按 schema 转型，正文不残留" % protocol)
+    mixed = '先看一下文件' + qwen_call + '，然后总结'
+    parsed = parse_output(mixed, "hermes", tools=TOOLS)
+    if len(parsed.tool_calls or []) != 1 or "先看一下文件" not in (parsed.content or ""):
+        checker.fail("混合正文与 XML 调用时切分错误：%r" % (parsed.content,))
+    else:
+        print("  ok   正文与 XML 调用混排时正确切分")
 
     # ---- response_format JSON Schema -------------------------------------
     print("\n[json_schema]")

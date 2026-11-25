@@ -1,5 +1,7 @@
 # 结构化约束解码与工具调用
 
+> **状态**（2026-11-24）：约束解码与工具协议。2026-11-24 起带工具请求改为**增量流式**（正文边生成边发、工具标记零泄漏），§8 里「带工具请求整段缓冲」为历史描述。
+
 agent（DSH 等）要能把本地模型当 OpenAI 工具调用后端用，必须满足两件事：
 
 1. 模型输出**真正被约束**成合法结构（JSON Schema 或工具调用协议），而不是"希望它听话"；
@@ -121,8 +123,17 @@ engine.generate([prompt_ids], SamplingParams(temperature=0.0, max_tokens=256),
 请求体走标准 OpenAI 字段：`tools`（≤`--max-tools`）、`tool_choice`
 （`auto`/`none`/`required`/`{"type":"function","function":{"name":...}}`）、
 `parallel_tool_calls`、`response_format={"type":"json_schema",...}`；
-响应 `message.tool_calls` + `finish_reason="tool_calls"`；带 tools/response_format 的流式请求
-整段缓冲后发 SSE（role → tool_calls 分片 → finish），普通请求保持原逐 token 流式。
+响应 `message.tool_calls` + `finish_reason="tool_calls"`。
+
+**流式有两条路**（2026-11-24 起）：
+
+| 条件 | 行为 |
+|---|---|
+| tools 非空、无 `response_format`、协议探成 `hermes`、thinking 关、无自定义 `stop`、未挂约束 | **增量流式**：正文随生成逐段发出，<br>一旦出现 `<tool_call>`/`<function` 等标记立即停发（`flashengine.streaming.HermesTextStream`），<br>正文结束后再补 `tool_calls` 分片与 `finish` |
+| 其余（`xml_function`/`deepseek_v3`、`response_format`、自定义 `stop`、路径/禁词约束） | **整段缓冲**后按解析结果发（role → tool_calls 分片 → finish） |
+
+按需选择：默认 `auto` 工具调用（pi 等 agent 的用法）吃增量路径，
+首段正文延迟从「整段生成完」降到「首个安全片段」（310P 实测 2.53s vs 14.4s 完整耗时）。
 
 ## 6. 验证
 
@@ -256,3 +267,76 @@ Web GUI 用同一段 provider 配置（加在 `$DSH_HOME/profiles/<profile>/cord
 - `deepseek_v3` 协议需要目标 tokenizer 自带对应特殊 token（本机无该系模型，仅实现 + CPU 校验）；
 - agent 场景下 2B 模型对 23 个工具的选择能力有限（实测简单 shell 任务会直接文字作答），
   这是模型能力而非协议问题；换更大目标模型（Qwen3-8B/30B 等）或减小工具集更稳。
+
+## 9. 与真实 agent 客户端对接（pi，2026-11-24 实测）
+
+本轮把「Qwen3.5 模板实际吐出的工具调用形态」和「agent 客户端的大系统提示」两件事补齐，
+以下三条都是实机踩出来的，缺任一条 pi 都跑不起来。
+
+### 9.1 解析：Qwen3.5 的 XML 形态工具调用
+
+Qwen3.5 的 `chat_template.jinja` 在 `tool_choice=auto`（不约束）时输出的是
+
+```
+<tool_call>
+<function=bash>
+<parameter=command>
+ls -1 *.toml
+</parameter>
+</function>
+</tool_call>
+```
+
+而不是 hermes 的 `<tool_call>{"name": …}</tool_call>` JSON 形态。`flashengine/protocol.py`
+新增 `_parse_hermes_xml()`（`_HX_CALL` / `_HX_PARAM` 两条正则 + 按 schema 的 `_coerce` 类型
+转换），在 `_parse_hermes` 与 `parse_output` 两处兜底；XML 段会从正文里切掉，正文与调用混排
+也能切开。`scripts/check_structured.py` 的 `[tool_parse]` 段覆盖三协议各自的 XML 形态调用。
+
+### 9.2 上下文：末轮 user 不可裁 + 预留可压
+
+`scripts/openai_server.py` 的 `_chat_prompt_ids_fit()` 重写为「保 system + 保首条真实提问 +
+从尾部尽量多塞」：
+
+- 旧实现 `while … and len(keep) > 1: keep.pop(0)` 会把**唯一的 user 消息**丢掉，渲染出的
+  prompt 没有 user 回合 → Qwen3.5 模板直接 `raise "No user query found in messages."`，
+  其它模板则退化成复读同一个 token；
+- 新实现只从「更老的历史」丢；仍超预算时裁末条消息的正文尾部（不是切 id 流）；
+- **system 永远不丢**：`render([])` 都放不下时抛 400 并说明是客户端系统提示过大——
+  悄悄丢 system 会让 agent 失去全部指令（实测模型只会无限重复工具调用）；
+- 客户端把输出预留顶到窗口上限时（pi 传 `max_completion_tokens=24576`），先压**输出预留**
+  而不是裁历史：完整 prompt 装得下就 `reserve = max_model_len - len(full_ids)`。
+
+### 9.3 pi 的默认系统提示就有 33,916 token
+
+pi（`@earendil-works/pi-coding-agent` 1.6.0）的 coding-assistant 提示词 + 工具说明本身
+≈33.9K token（**与仓库 AGENTS.md 无关**，空目录同样 33.9K；`SYSTEM.md` 只做前缀附加，
+`--system-prompt` 才是替换）。所以：
+
+- 服务端 `--max-model-len` 至少 40K（实测 `40960`：`KV 4278×64=273,792`、启动 65s）；
+- `~/.pi/agent/models.json` 的 `contextWindow` 必须与之一致（写 32768 时 pi 认为 prompt 已
+  撑满窗口 → 只发 `max_completion_tokens=1`，表现为「一次工具调用后就没有下文」）；
+- 34K prefill 在 310P 上冷启动 `TTFT≈88.5 s`，开了前缀缓存后同一系统提示的后续轮次
+  `TTFT 0.5–1 s`（`cache=100%(530/530blk)`）。
+
+provider 配置（`~/.pi/agent/models.json`，`models` 是**数组**）：
+
+```json
+{"providers": {"flashboard": {"name": "FlashEngine 板卡 (310P)",
+  "baseUrl": "http://192.168.16.118:8000/v1", "api": "openai-completions",
+  "apiKey": "board", "authHeader": true,
+  "models": [{"id": "Qwen3.5-9B", "name": "Qwen3.5-9B (310P + DFlash k7)",
+              "reasoning": false, "input": ["text"],
+              "contextWindow": 40960, "maxTokens": 8192,
+              "samplingParams": {"temperature": 0, "top_p": 1}}]}}}
+```
+
+实机验收（基座 Qwen3.5-9B + DFlash k7 + `--max-model-len 40960`，`/data2/fe-structured`）：
+
+| 任务 | 轮次 | 结果 |
+|---|---|---|
+| 列出 `*.toml` | 1 次工具调用 | `a.toml` ✅ |
+| 读取 `a.toml` 的 x | 1 次工具调用 | `1` ✅ |
+| 先列文件、再读「排序第二」的文件 | 2 次工具调用 | `文件名=42` ✅ |
+
+第一轮 `out=35tok finish=tool_calls`、第二轮 `out=3tok E=5.00 finish=stop`，
+`path=spec_graph`、`spec_graph=100%`（投机在工具调用轮同样生效）。

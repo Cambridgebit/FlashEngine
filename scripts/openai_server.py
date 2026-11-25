@@ -100,18 +100,44 @@ def _log(tag, msg):
 
 
 def _open_raw_log(path):
-    """打开模型原始输出日志（JSONL 追加写）。失败只告警，不影响服务。"""
+    """打开模型原始输出日志（JSONL 追加写）。失败只告警，不影响服务。
+
+    日志含完整对话、工具定义与工具返回，属敏感数据：文件不存在时创建并显式设为 0600
+    （不依赖调用方的 umask）。已存在的文件不改权限，避免悄悄收窄运维的既有约定。
+    """
     global _raw_log_path, _raw_log_fh
     if not path:
         return
     try:
+        created = not os.path.exists(path)
         fh = open(path, "a", encoding="utf-8", buffering=1)
+        if created:
+            try:
+                os.chmod(path, 0o600)
+            except OSError as exc:
+                _log("WARN", f"raw log 权限设置失败（{path}: {exc}）")
     except OSError as exc:
         _log("WARN", f"raw output 日志不可用（{path}: {exc}），本次运行不记录原始输出")
         return
     _raw_log_path = path
     _raw_log_fh = fh
-    _log("INFO", f"Raw output 日志: {path}（每请求一行 JSONL）")
+    _log("INFO", f"Raw output 日志: {path}（每请求一行 JSONL，权限 0600）")
+
+
+def _log_raw_input(request_id, endpoint, raw_body):
+    """Record the original JSON before generation, including interrupted requests."""
+    global _raw_log_fh
+    if _raw_log_fh is None:
+        return
+    record = {"event": "input", "request_id": request_id, "t": time.time(),
+              "endpoint": endpoint, "input_raw": raw_body}
+    try:
+        with _raw_log_lock:
+            if _raw_log_fh is not None:
+                _raw_log_fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except (OSError, ValueError) as exc:
+        _raw_log_fh = None
+        _log("WARN", f"raw log 写失败（{_raw_log_path}: {exc}），后续不再记录")
 
 
 def _log_raw(st, output, ct, reason):
@@ -128,6 +154,8 @@ def _log_raw(st, output, ct, reason):
     tpot_ms = ((now - st.t_first) / (ct - 1) * 1000
                if st.t_first is not None and ct > 1 else 0.0)
     record = {
+        "event": "output",
+        "request_id": getattr(st, "raw_request_id", None),
         "t": time.time(),
         "ts": _ts(),
         "rid": st.rid,
@@ -333,6 +361,8 @@ def _metrics_values():
             "flashengine_prefix_cached_blocks_total": cache["cached_blocks"],
             "flashengine_prefix_new_blocks_total": cache["new_blocks"],
         }
+        for key, value in cache.get("evict", {}).items():
+            values[f"flashengine_evict_{key}_total"] = value
         for key, value in runtime["prefill"].items():
             values[f"flashengine_prefill_{key}_total"] = value
         if runtime.get("recurrent"):
@@ -868,8 +898,8 @@ def _run_llm(st, stop, emit):
                 raise RuntimeError(st.error)
             text = _final_generated_text(st, gen, constrained)
             final, _ = _apply_stop(text, stop)
-            if constrained and not final.startswith(prev_text):
-                raise RuntimeError("约束输出改写了已发送的文本前缀")
+            if (constrained or getattr(st, "incremental_protocol", False)) and not final.startswith(prev_text):
+                raise RuntimeError("输出改写了已发送的文本前缀")
             reason = st.finish_reason or "stop"
             send(final[len(prev_text):])
             prev_text = final
@@ -893,6 +923,13 @@ def _run_llm(st, stop, emit):
             prev_text = final
             if hit:
                 break
+            continue
+        if getattr(st, "incremental_protocol", False):
+            full = _decode_protocol_aware(gen).rstrip("\ufffd")
+            if not full.startswith(prev_text):
+                raise RuntimeError("协议输出改写了已发送的文本前缀")
+            send(full[len(prev_text):])
+            prev_text = full
             continue
         pending.extend(new)
         piece = ""
@@ -1158,35 +1195,67 @@ def _truncate_last(messages, enable_thinking, prompt_cap, tools=None,
 
 def _chat_prompt_ids_fit(messages, enable_thinking, prompt_cap, tools=None,
                          template_kwargs=None):
-    """把 chat 请求裁进 ``prompt_cap``：保 system + 最近轮次，tools 也算预算。"""
+    """把 chat 请求裁进 ``prompt_cap``：保 system + 首条提问 + 最近若干条消息。
+
+    多轮 agent 会话超窗口时，两种朴素做法都会出事：只留尾部最新消息，模型看不到
+    原始任务；只留任务，模型看不到工具结果——pi 这类客户端会因此无限重复同一个
+    工具调用（实测每轮丢掉 22 条工具历史 → 模型反复输出同一 ``bash`` 调用）。所以
+    这里保留「首条用户提问」和「最近的尾部消息」，中间较早的轮次丢掉。
+    """
     msgs = normalize_messages(messages)
     n_sys = 0
     while n_sys < len(msgs) and msgs[n_sys].get("role") == "system":
         n_sys += 1
     system, convo = msgs[:n_sys], msgs[n_sys:]
-    keep = list(convo)
-    ids = _template_ids(system + keep, tools=tools, template_kwargs=template_kwargs,
-                        enable_thinking=enable_thinking)
-    while len(ids) > prompt_cap and len(keep) > 1:
-        keep.pop(0)                      # 丢最旧的非 system 消息
-        ids = _template_ids(system + keep, tools=tools,
-                            template_kwargs=template_kwargs,
-                            enable_thinking=enable_thinking)
-    if len(ids) > prompt_cap and keep:
-        fitted, ids = _truncate_last(system + keep, enable_thinking, prompt_cap,
-                                     tools=tools, template_kwargs=template_kwargs)
-        keep[-1] = fitted[-1]
-    if len(ids) > prompt_cap and (keep or system):
-        keep = [keep[-1] if keep else system[-1]]
-        system = []
-        keep, ids = _truncate_last(keep, enable_thinking, prompt_cap,
+
+    def render(keep):
+        return _template_ids(system + keep, tools=tools,
+                             template_kwargs=template_kwargs,
+                             enable_thinking=enable_thinking)
+
+    ids = render(convo)
+    if len(ids) <= prompt_cap:
+        return ids, 0
+
+    def is_query(msg):
+        text = (msg.get("content") or "").lstrip()
+        return msg.get("role") == "user" and not text.startswith("<tool_response>")
+
+    head = next((m for m in convo if is_query(m)), None)
+    tail = []
+    for msg in reversed(convo):
+        if msg is head:
+            continue
+        trial = ([head] if head is not None else []) + [msg] + tail
+        if len(render(trial)) > prompt_cap:
+            break
+        tail.insert(0, msg)
+    keep = ([head] if head is not None else []) + tail
+    if not keep:
+        keep = convo[-1:]
+    ids = render(keep)
+    dropped = len(convo) - len(keep)
+    if len(ids) > prompt_cap:
+        # system 本身装不下时明确报错：悄悄丢掉 system 会让 agent 失去全部指令
+        # （实测 pi 的 system 里带整份 AGENTS.md，34K token，丢完模型只会重复工具调用）。
+        try:
+            sys_only = render([])
+        except Exception:                           # 只有 system 时模板会拒绝渲染
+            sys_only = render([{"role": "user", "content": "."}])
+        if len(sys_only) >= prompt_cap:
+            raise ValueError(
+                f"system 提示本身 {len(sys_only)} token，超出可用 {prompt_cap}："
+                f"客户端自带的系统提示（pi 约 3.4 万 token）加上工具说明后装不进当前窗口，"
+                f"请增大 --max-model-len，或换用更短的客户端系统提示")
+        # 尾部最新消息本身过长：压它的正文尾部，system 必须保留。
+        keep, ids = _truncate_last(system + keep, enable_thinking, prompt_cap,
                                    tools=tools, template_kwargs=template_kwargs)
     if len(ids) > prompt_cap:
         raise ValueError(
             f"上下文窗口不足：system + 最新提问裁剪后仍需 {len(ids)} token，可用 "
             f"{prompt_cap}（请增大 --max-model-len，或调小 --reserve-output / 请求的 "
             f"max_tokens）")
-    return ids, len(convo) - len(keep)
+    return ids, dropped
 
 
 def _completion_prompt_ids(body):
@@ -1295,10 +1364,14 @@ def _assistant_message(content, parsed):
 
 
 def _needs_buffered_stream(tools, response_format):
-    """有 tools / response_format 的请求必须整段缓冲后再发。
+    """有 tools / response_format 的请求按「协议感知」解码（不是逐 token 明文流）。
 
     模型原生协议标记（``<tool_call>`` / ``<function ...>`` / DeepSeek 专用 token）绝不能
-    当 content 流给客户端，否则客户端会在拼装前就看到它们；普通请求仍走原流式路径。
+    当 content 流给客户端。具体分两条路：
+    - **增量流式**（默认命中 hermes + think-off + 无自定义 stop + 无约束）：正文边生成边发，
+      标记一出现就停发（``flashengine.streaming.HermesTextStream``）；
+    - **整段缓冲**：其余协议/配置（xml_function、deepseek_v3、response_format、自定义 stop、
+      禁词或路径约束）先跑完整段再按解析结果发，见 ``_generate`` 的 ``buffered`` 分支。
     """
     return bool(tools) or response_format is not None
 
@@ -1487,7 +1560,8 @@ class Handler(BaseHTTPRequestHandler):
     def _read_body(self):
         n = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(n) if n else b"{}"
-        return json.loads(raw.decode("utf-8"))
+        self._raw_request_body = raw.decode("utf-8")
+        return json.loads(self._raw_request_body)
 
     def _check_auth(self):
         if not _api_key:
@@ -1584,6 +1658,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 self._error("invalid json body", 400)
                 return
+            self._raw_request_id = f"raw-{time.time_ns()}-{threading.get_ident()}"
+            _log_raw_input(self._raw_request_id, path, self._raw_request_body)
             mode = "chat" if path == "/v1/chat/completions" else "completion"
             self._generate(body, mode)
         finally:
@@ -1805,6 +1881,16 @@ class Handler(BaseHTTPRequestHandler):
             if mode == "chat":
                 if not body.get("messages"):
                     raise ValueError("'messages' is required")
+                # 「输出无上限」的客户端（pi 会传 max_completion_tokens=24576）把预留
+                # 顶到 max_model_len 附近，prompt 预算会被压到几 K 而被迫裁历史。完整
+                # prompt 装得下时优先压输出预留（保底 _min_reserve token），不裁历史。
+                full_ids = _template_ids(
+                    normalize_messages(body["messages"]), tools=template_tools,
+                    template_kwargs=template_kwargs, enable_thinking=enable_thinking)
+                _floor = min(_default_reserve, _max_model_len - 1)
+                if len(full_ids) > prompt_cap and len(full_ids) <= _max_model_len - _floor:
+                    reserve = _max_model_len - len(full_ids)
+                    prompt_cap = _max_model_len - reserve
                 prompt_ids, dropped = _chat_prompt_ids_fit(
                     body["messages"], enable_thinking, prompt_cap,
                     tools=template_tools, template_kwargs=template_kwargs)
@@ -1820,6 +1906,14 @@ class Handler(BaseHTTPRequestHandler):
                     _log("WARN", f"completion prompt truncated {dropped} oldest tokens "
                                  f"(prompt<={prompt_cap}tok)")
         except Exception as exc:
+            try:
+                _roles = [m.get("role") for m in (body.get("messages") or [])]
+            except Exception:
+                _roles = []
+            import traceback as _tb
+            _where = " | ".join(_tb.format_exc().strip().splitlines()[-3:])
+            _log("WARN", f"prompt build failed: {exc} | msgs={len(_roles)} roles={_roles[:8]}")
+            _log("WARN", f"  at {_where}")
             self._error(f"prompt build failed: {exc}", 400)
             return
         if not prompt_ids:
@@ -1876,6 +1970,7 @@ class Handler(BaseHTTPRequestHandler):
                 st = _Request(seq, None if auto_continue else max_tokens, rid,
                               t_http=self._t0, auto_continue=auto_continue)
                 st.endpoint = self.path
+                st.raw_request_id = self._raw_request_id
                 st.stream = stream
                 st.client = self.client_address[0]
                 st.temperature = temperature
@@ -1919,6 +2014,14 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
 
         buffered = _needs_buffered_stream(parse_tools, response_format)
+        # 增量流式只在「解码口径确定不会改写正文」时才安全：hermes 协议的调用标记是
+        # 固定字面量，可以边发边拦。挂约束（路径/禁词）时输出由语法机决定，必须整段
+        # 缓冲后按解析结果发，否则客户会先收到模型正文再被告知这是 tool_calls。
+        incremental_tools = (buffered and bool(parse_tools) and response_format is None
+                             and _resolved_protocol == "hermes" and enable_thinking is False
+                             and not stop and constrained is None
+                             and not getattr(engine.config, "enable_constraints", False))
+        st.incremental_protocol = incremental_tools
         try:
             if not stream:
                 text, reason, ct = _run_llm(st, stop, None)
@@ -1939,7 +2042,35 @@ class Handler(BaseHTTPRequestHandler):
             self._cors()
             self.end_headers()
 
-            if buffered:
+            if incremental_tools:
+                from flashengine.streaming import HermesTextStream
+                incremental = HermesTextStream()
+                self._write_sse(_chunk(req_id, model, mode, role=True))
+
+                def emit_safe(delta):
+                    safe = incremental.feed(delta)
+                    if safe:
+                        self._write_sse(_chunk(req_id, model, mode, delta={"content": safe}))
+
+                text, reason, ct = _run_llm(st, stop, emit_safe)
+                parsed = _parse_result(text, parse_tools, response_format)
+                finish = "tool_calls" if parsed and parsed.tool_calls else reason
+                _log_done(st, ct, finish, text)
+                content = (parsed.content or "") if parsed else ""
+                if not content.startswith(incremental.sent):
+                    raise RuntimeError("工具协议解析改写了已发送的正文")
+                remaining = content[len(incremental.sent):]
+                # An invalid or truncated tool candidate must never leak markup.
+                if remaining and "<tool_call" not in remaining and "<function" not in remaining:
+                    self._write_sse(_chunk(req_id, model, mode, delta={"content": remaining}))
+                if parsed and parsed.reasoning_content:
+                    self._write_sse(_chunk(req_id, model, mode,
+                                           delta={"reasoning_content": parsed.reasoning_content}))
+                if parsed and parsed.tool_calls:
+                    for delta in _tool_call_deltas(parsed.tool_calls):
+                        self._write_sse(_chunk(req_id, model, mode, delta=delta))
+                self._write_sse(_chunk(req_id, model, mode, finish_reason=finish))
+            elif buffered:
                 # 工具/结构化请求：先整段缓冲再发。模型原生协议标记（<tool_call> /
                 # <function ...> / DeepSeek 专用 token）绝不能当 content 流出去。
                 text, reason, ct = _run_llm(st, stop, None)
@@ -2059,7 +2190,10 @@ def _build_parser():
     parser.add_argument("--fp16-only", action="store_true",
                         help="FP16 专用守卫：拒绝量化检查点并把计算参数固定为 FP16")
     parser.add_argument("--recurrent-prefix-cache-mb", type=int, default=256,
-                        help="recurrent 前缀状态的主机内存上限，默认 256 MiB；0 关闭")
+                        help="recurrent 前缀状态的缓存上限，默认 256 MiB；0 关闭")
+    parser.add_argument("--recurrent-snapshot-stride", type=int, default=1,
+                        help="每 stride 个 KV 块存一份 GDN 状态快照（默认 1=每个块边界）；"
+                             "小页(16)建议 8，否则 256 MiB 只装 5 份、前缀复用基本失效")
     parser.add_argument("--spec-model", default="")
     parser.add_argument("--spec-num-tokens", type=int, default=3)
     # 多 LoRA：可重复传入；请求体的 model 字段填适配器名即可路由到对应适配器。
@@ -2166,6 +2300,7 @@ def main(argv=None):
         # 结构化约束（工具调用 / JSON Schema）默认开启；掩码在主机侧落，图内采样会关掉。
         enable_path_constraints=_enable_path_constraints,
         recurrent_prefix_cache_bytes=args.recurrent_prefix_cache_mb * 1024 * 1024,
+        recurrent_snapshot_stride=args.recurrent_snapshot_stride,
         fp16_only=args.fp16_only,
     )
     if args.banned_words is not None:
