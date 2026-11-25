@@ -240,12 +240,24 @@ class Ascend310PBackend(BackendBase):
     def normalize_config(self, config) -> None:
         model = config.model_config
         head_dim = getattr(model, "head_dim", model.hidden_size // model.num_attention_heads)
-        preferred = 64 if head_dim > 128 else 128
-        if (config.kvcache_block_size not in (64, 128)
-                or config.kvcache_block_size * head_dim > 16384):
+        size = int(config.kvcache_block_size)
+        # 硬约束只有两条：16 的整数倍（分页算子按 16 行对齐）与
+        # block_size * head_dim <= 16384（NZ 页大小上限）。都满足就尊重调用方
+        # 的显式取值——BS=1 的 Agent 负载把页调小（16）能显著减少尾块碎片；
+        # 不满足（例如默认 256）才回落到与 head_dim 匹配的 preferred。
+        max_size = 16384 // head_dim if head_dim else 0
+        if size % 16 == 0 and size <= max_size:
+            if size not in (64, 128):
+                print(
+                    "[FlashEngine] Ascend 310P KV-cache block size = "
+                    f"{size} (explicit; head_dim={head_dim}, max {max_size}).",
+                    flush=True,
+                )
+        else:
+            preferred = 64 if head_dim > 128 else 128
             print(
                 "[FlashEngine] Ascend 310P KV-cache block size adjusted: "
-                f"{config.kvcache_block_size} -> {preferred}; head_dim={head_dim}.",
+                f"{size} -> {preferred}; head_dim={head_dim}.",
                 flush=True,
             )
             config.kvcache_block_size = preferred

@@ -87,6 +87,12 @@ class LLMEngine(EngineRequests):
             self.model_runner.state_runtime.has_prefix
             if self.model_runner.state_runtime else None
         )
+        if self.model_runner.state_runtime is not None:
+            # KV 块的会话租约同步给 GDN 快照缓存：快照先被淘汰的话，
+            # 即使 KV 块还在，prefix_state_validator 也会把整段前缀判成未命中。
+            self.scheduler.block_manager.lease_listener = (
+                self.model_runner.state_runtime.pin
+            )
         self.scheduler.on_preempt = self._on_preempt_release
         runtime_warmup_t0 = perf_counter()
         self.generate(
@@ -397,6 +403,13 @@ class LLMEngine(EngineRequests):
                 **block_manager.get_prefix_stats(),
                 "used_blocks": len(block_manager.used_block_ids),
                 "total_blocks": len(block_manager.blocks),
+                # 会话租约 / 深度加权驱逐的命中计数（BS=1 Agent 负载观测用）。
+                "evict": block_manager.get_evict_stats(),
+                "lease": {
+                    "ttl_s": block_manager.lease_ttl,
+                    "trunk_blocks": block_manager.lease_trunk_blocks,
+                    "depth_alpha": block_manager.depth_alpha,
+                },
             },
             **runner,
         }

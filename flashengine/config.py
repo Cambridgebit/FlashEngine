@@ -102,6 +102,10 @@ class Config:
     num_kvcache_blocks: int = -1
     enable_prefix_cache: bool = True
     recurrent_prefix_cache_bytes: int = 256 * 1024 * 1024
+    # GDN 前缀快照的块步长：每 stride 个 KV 块存一份状态快照。1 = 每个块边界。
+    # Qwen3.5 每份快照约 49 MiB（24 层 conv+ssm），小页（16）时逐块存会
+    # 让 256 MiB 预算只装 5 份、前缀复用实际退化成 0——故默认 1、可按后端调大。
+    recurrent_snapshot_stride: int = 1
     # ---- 多 LoRA（1 个基座 + N 个适配器同时在线，按请求路由）----
     # 权重栈常驻显存：每个被命中的 Linear 子分片占 max_loras × (r×in + out×r)。
     enable_lora: bool = False
@@ -197,6 +201,8 @@ class Config:
             raise ValueError("max_num_partial_prefills must be positive")
         if self.recurrent_prefix_cache_bytes < 0:
             raise ValueError("recurrent_prefix_cache_bytes must be non-negative")
+        if self.recurrent_snapshot_stride < 1:
+            raise ValueError("recurrent_snapshot_stride must be >= 1")
         if not 1 <= self.tensor_parallel_size <= 8:
             raise ValueError("tensor_parallel_size must be in [1, 8]")
 

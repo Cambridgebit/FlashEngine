@@ -1,5 +1,7 @@
 """注册模型的 recurrent 状态生命周期：主槽、验证行槽与接受后回滚。"""
 
+import time
+
 import torch
 from collections import OrderedDict
 
@@ -37,7 +39,12 @@ class RecurrentStateRuntime:
         self.prefix_bytes = 0
         self.prefix_snapshots = OrderedDict()
         self.prefix_pending = {}
-        self.prefix_stats = {"saved": 0, "restored": 0, "evicted": 0}
+        self.prefix_stats = {"saved": 0, "restored": 0, "evicted": 0, "pinned_evicted": 0}
+        # 主干块的快照租约：KV 块被会话租约保护时，它的 GDN 末态也不能被 LRU 淘汰，
+        # 否则 can_allocate 的 prefix_state_validator 会把整段前缀判成未命中
+        # （实测：KV 块保住了 32 个，但快照被淘汰后命中块数仍是 0）。
+        self.prefix_pins: dict[int, float] = {}
+        self.snapshot_stride = max(1, int(getattr(config, "recurrent_snapshot_stride", 1)))
         self.async_prefix = getattr(self.backend, "supports_async_prefix_snapshots", False)
         # 前缀快照的位置：CUDA 用锁页主机内存做异步 D2H；310P 的 D2H 是阻塞的，
         # 留在设备侧做 D2D（每块边界 49 MiB，实测 ~0.2 ms 级，不拖 prefill）。
@@ -82,9 +89,13 @@ class RecurrentStateRuntime:
             end = start + seq.num_scheduled_tokens
             block_hash = -1
             for index in range(end // block_size):
-                block_hash = BlockManager.compute_hash(seq.block(index), block_hash)
+                block_hash = BlockManager.compute_hash(seq.block(index), block_hash, getattr(seq, "lora_id", 0))
                 position = (index + 1) * block_size
                 block_id = seq.block_table[index]
+                if self.snapshot_stride > 1 and (index + 1) % self.snapshot_stride:
+                    # 只为每 stride 个块边界留快照：Qwen3.5 一份 49 MiB，
+                    # 16 token 一块时逐块存会让预算只够 5 份。
+                    continue
                 if position > start and not self.has_prefix(block_id, block_hash):
                     candidates.append((row, position - start, block_id, block_hash))
         # 限制本轮暂存峰值；优先保留较长前缀的检查点。
@@ -102,6 +113,13 @@ class RecurrentStateRuntime:
             for row in range(len(seqs)))
         context.gdn_prefix_capture = self.capture_prefix_layer
 
+    def pin(self, block_id: int, block_hash: int, expiry: float) -> None:
+        """给某块的前缀快照续租（block_hash 用于确认快照仍属同一前缀）。"""
+        saved = self.prefix_snapshots.get(block_id)
+        if saved is not None and saved[0] != block_hash:
+            return
+        self.prefix_pins[block_id] = expiry
+
     def has_prefix(self, block_id, block_hash):
         saved = self.prefix_snapshots.get(block_id)
         return saved is not None and saved[0] == block_hash
@@ -110,7 +128,7 @@ class RecurrentStateRuntime:
         block_hash = -1
         count = seq.num_cached_tokens // self.config.kvcache_block_size
         for index in range(count):
-            block_hash = BlockManager.compute_hash(seq.block(index), block_hash)
+            block_hash = BlockManager.compute_hash(seq.block(index), block_hash, getattr(seq, "lora_id", 0))
         block_id = seq.block_table[count - 1]
         if not self.has_prefix(block_id, block_hash):
             raise RuntimeError("前缀已获准复用，但 recurrent 末块状态缺失")
@@ -140,7 +158,18 @@ class RecurrentStateRuntime:
             if old is not None:
                 self.prefix_bytes -= self.prefix_entry_bytes
             while self.prefix_bytes + self.prefix_entry_bytes > self.prefix_limit:
-                self.prefix_snapshots.popitem(last=False)
+                victim = None
+                now = time.monotonic()
+                for key in self.prefix_snapshots:
+                    if self.prefix_pins.get(key, 0.0) <= now:
+                        victim = key
+                        break
+                if victim is None:
+                    # 整池都在租约里：牺牲最旧的一份，保住其余主干。
+                    victim = next(iter(self.prefix_snapshots))
+                    self.prefix_stats["pinned_evicted"] += 1
+                self.prefix_snapshots.pop(victim)
+                self.prefix_pins.pop(victim, None)
                 self.prefix_bytes -= self.prefix_entry_bytes
                 self.prefix_stats["evicted"] += 1
             self.prefix_snapshots[block_id] = (block_hash, conv, ssm)
