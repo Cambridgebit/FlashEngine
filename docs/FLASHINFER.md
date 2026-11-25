@@ -1,5 +1,7 @@
 # CUDA FlashInfer 注意力
 
+> **状态**（2026-11-24）：CUDA FlashInfer 适配：TP=1、`supports_spec_graph=False`（投机恒 eager），适用边界明确。
+
 CUDA 默认保留 `flash-attn`：prefill 和图内 decode 使用
 `flash_attn_varlen_func`，eager decode 使用 `flash_attn_with_kvcache`。
 KV 写入由仓库自身的 Triton kernel 完成。
@@ -59,10 +61,19 @@ python3 -m scripts.openai_server /home/yjq040828/vllm-lab/models/Qwen3-0.6B \
 
 ## 回归
 
+> **历史入口**：本节列出的 `scripts.check_*` / `export_*` 已在 2026-09 精简（NATIVE_DEPLOYMENT
+> 的整套部署工具在提交 6371067）中从 main 移除，命令保留作历史记录，当前仓库无法直接执行；
+> 现行入口见 [文档地图](README.md)。
+
 ```bash
-python3 -m scripts.check_cuda_attention /home/yjq040828/vllm-lab/models/Qwen3-0.6B
+# 现行做法：同一负载跑两次，只切 FLASHENGINE_CUDA_ATTENTION=flash_attn|flashinfer，
+# 对比输出文本（贪心逐 token 位等）与 TPS：
+FLASHENGINE_CUDA_ATTENTION=flashinfer python3 -m scripts.benchmark \
+  /home/yjq040828/vllm-lab/models/Qwen3-0.6B --questions bench_data/question.jsonl --max-tokens 64
+# 历史命令（脚本已移除，仅记录）：
+# python3 -m scripts.check_cuda_attention /home/yjq040828/vllm-lab/models/Qwen3-0.6B
 # 审阅分歧 logits 后，显式允许单 ULP 平票翻转：
-python3 -m scripts.check_cuda_attention /home/yjq040828/vllm-lab/models/Qwen3-0.6B \
+# python3 -m scripts.check_cuda_attention /home/yjq040828/vllm-lab/models/Qwen3-0.6B \
   --compare-only --allow-bf16-ties
 # （unittest 套件未随 main 保留：python3 -m unittest discover -s tests -p 'test_flashinfer_metadata.py' -v）
 ```

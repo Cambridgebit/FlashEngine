@@ -1,5 +1,7 @@
 # 多 LoRA 适配（1 基座 × 8 适配器，310P 实测）
 
+> **状态**（2026-11-24）：多 LoRA 实现与 310P 实测（c8 16/16、c4 2.51→16.64 tok/s）；CUDA/CoreX 的 LoRA 批次仍强制 eager，融合权重路径与动态 LoRA 路径不要混谈。
+
 本文件记录 FlashEngine 的多 LoRA 实现与实机验收结果。实现思路对齐 vLLM 的
 punica/SGMV，但更薄：**权重栈 + forward hook + 逐 token 路由**，不修改任何模型
 forward 签名，不影响非 LoRA 路径。

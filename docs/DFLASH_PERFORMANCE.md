@@ -1,5 +1,7 @@
 # Qwen3.5 DFlash CUDA 性能修复
 
+> **状态**（2026-11-24）：DFlash 性能剖分（CUDA 为主）；CoreX/310P 无同口径对照，不能跨后端套用。
+
 ## 结果与口径
 
 本地 RTX 4070 Laptop 8GB / WSL2，Qwen3.5-2B + Qwen3.5-2B-Dflash，
@@ -12,6 +14,10 @@ max_num_seqs=1、prefill 预算=128。题集为仓库 coding、seed=0、8 条，
 | 修复前 DFlash，k=15 | 72.74 / 70.65 | 71.70 | 4.143 |
 | 最终 DFlash，k=15，独立复验 | 134.59 / 134.47 / 134.98 | 134.59 | 4.083 |
 | 同样优化后的普通 Graph | 56.27 / 56.95 / 61.63 | 56.95 | 不适用 |
+
+> 与 [Qwen3.5 适配记录](QWEN35.md) 里 base Graph 28.26 tok/s 的差异来自口径：
+> 那边是 5 条请求 / 66 token 的回归冒烟（KV 用默认预算），本表是 8 题 × 128 token、
+> KV 固定 8 块、prefill 预算 128 的正式口径。两表不可混用。
 
 按这组中位数，DFlash 较修复前提高 **87.7%**，较优化后的普通 Graph 为 **2.36×**。
 首轮请求 TTFT 中位数从 214.95ms 降到 49.18ms。
@@ -87,7 +93,9 @@ CoreX/310P 保留参考 GDN/attention 路径；共享 host 元数据优化不依
 | `FLASHENGINE_CUDA_GDN=auto|torch|triton` | auto 启用 CUDA 递推/短卷积/Norm/状态提交；torch 回参考式 |
 | `FLASHENGINE_CUDA_GDN_PREFILL=0|1` | FlashAttention auto=1，FlashInfer auto=0；强制 FI=1 不推荐 |
 | `FLASHENGINE_CUDA_DFLASH_ATTENTION=auto|sdpa|flash_attn` | FlashAttention 模式 auto 用 varlen GQA；FI 保留 SDPA |
-| `FLASHENGINE_SPEC_GREEDY_GRAPH=0|1` | 默认 1；0 使用原完整采样图 |
+| `FLASHENGINE_SPEC_GREEDY_GRAPH=0|1` | 默认 1；0 使用原完整采样图。**注意**：greedy 图的捕获还要求 `capture_full`
+（`engine/model_runner.py:2072-2073, 2114`）——默认窄上下文桶存在时不捕整宽图，因此默认配置下
+这个开关等于不生效；要测它须同时设 `FLASHENGINE_DFLASH_CTX_FULL=1` |
 | `FLASHENGINE_DECODE_GREEDY_GRAPH=0|1` | 默认 1；0 使用原完整采样图 |
 
 按本机已测最佳配置启动：
@@ -103,6 +111,9 @@ FLASHENGINE_CUDA_ATTENTION=flash_attn python3 -m scripts.openai_server \
 ```
 
 精确复现实验探针（固定 8 KV 块；不是 HTTP 吞吐）：
+
+> **历史入口**：`scripts.probe_dflash_perf` 已从 main 移除，命令保留作历史记录；现行对表入口见
+> [文档地图](README.md)。
 
 ```bash
 python3 -m scripts.probe_dflash_perf /home/yjq040828/vllm-lab/models/Qwen3.5-2B \

@@ -1,5 +1,7 @@
 # Qwen3.5 系列文本推理
 
+> **状态**（2026-11-24）：Qwen3.5 文本适配与 310P 实测（4B/8B/9B + DFlash k7）；CoreX 无真机、Qwen3.5 MoE 仅 tiny 夹具。
+
 当前支持 Qwen3.5 dense 和 MoE 的文本生成，目标注册名为 `qwen3_5` / `qwen3_5_moe`。
 读取多模态检查点的 `text_config` 或纯文本配置，跳过视觉塔和 MTP。
 不支持图像/视频输入。普通推理和匹配的 DFlash 草稿适配 CUDA、CoreX、Ascend 310P。
@@ -100,7 +102,8 @@ k 曲线（4B）：每行验证成本线性 ≈ **4.7ms/行**；E 在 k≈7 后�
 已落地全位等微优化（`g_exp` 整段一次、rank-1 就地 `add_`、`has_initial` 零张量复用、
 conv1d 输入/权重各一次 fp32 转换）：层内 rows seg=8 1574→1565us、decode 911→896us；
 端到端无投机 15.7→15.8、k7 36.6→36.8（E=4.304 逐位不变）；三处位等校验（conv1d 三形状、
-rows/decode 输出 + ssm/conv 双状态池）与 check_qwen35 四用例 5/5 全过。
+rows/decode 输出 + ssm/conv 双状态池）与当时的 `check_qwen35` 四用例 5/5 全过（该脚本已从 main 移除，
+这些记录无法用现行脚本一键复现，需按 [文档地图](README.md) 的现行入口重跑固定 prompt 对比）。
 
 图内逐算子目录（NPUGraph、链式、310P）：
 
@@ -148,6 +151,9 @@ python3 -m scripts.openai_server /home/yjq040828/vllm-lab/models/Qwen3.5-2B \
 本地环境：Ubuntu-22.04 / RTX 4070 Laptop 8GB，torch 2.11.0、transformers 5.15，
 真实模型目录 Qwen3.5-2B 与 Qwen3.5-2B-Dflash，bf16。
 
+> **历史入口**：`scripts.check_qwen35*` 已从 main 移除，下面的命令保留作历史记录，当前无法执行；
+> 现行对表入口是 `scripts.benchmark` / `scripts.openai_server`（见 [文档地图](README.md)）。
+
 ```bash
 # （unittest 套件未随 main 保留：python3 -m unittest discover -s tests -v）
 python3 -m scripts.check_qwen35 /home/yjq040828/vllm-lab/models/Qwen3.5-2B \
@@ -160,6 +166,11 @@ HF 文本参考、base eager/Graph、DFlash eager/Graph、FlashInfer base Graph/
 另一次 coding 两条/输出32 的 eager 冒烟 E=5.333。
 
 原完整 unittest 为 47/47 通过（未随 main 保留）。回归集串行五请求、66 个实际输出 token、各请求墙钟求和（包含 prefill）：
+
+口径提醒：下表是**回归集冒烟**（5 条请求、共 66 个实际输出 token、KV 用默认预算），
+数字偏小且对题集敏感；同一台机器的正式 8 题 × 128 token 口径见
+[DFlash 性能修复](DFLASH_PERFORMANCE.md)（base Graph 56.95、DFlash 134.59 tok/s），
+两表不可直接相减或相比。
 
 | 路径 | token/s |
 |---|---:|
@@ -178,7 +189,9 @@ HF 文本参考、base eager/Graph、DFlash eager/Graph、FlashInfer base Graph/
 310P 短卷积和 KV 页大小。wheel 本地构建通过。
 
 工件保存在 `bench_results/qwen35-check/`（Git 忽略）；`--compare-only` 可读取已有工件。
-Qwen3.5 MoE 只有微型 CPU 结构/权重契约验证，未运行真实 MoE 权重。
+Qwen3.5 MoE 的验收强度：CPU 结构/权重契约 + **CUDA 上 64.6MB 公开 tiny 检查点 5/5**
+（HF 参考 4/4，其中一步是 BF16 平票翻转），**没有运行真实 35B-A3B 权重**，也没有它的
+已训练 DFlash 草稿的 E/TPS 数据；310P/CoreX 的 MoE 实机仍缺（见 [Qwen3.5 MoE](QWEN35_MOE.md)）。
 
 参考：[Transformers Qwen3.5](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5/modeling_qwen3_5.py)、
 [Qwen3.5-2B 配置](https://huggingface.co/Qwen/Qwen3.5-2B/blob/main/config.json)。

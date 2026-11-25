@@ -1,5 +1,7 @@
 # Ascend 310P Graph、EAGLE3 与 DFlash 适配说明
 
+> **状态**（2026-11-24）：310P 图规格与实机修复记录。分页 DFlash 图已跑通；DSpark 共用该路径但未做独立验收。
+
 本文说明 FlashEngine 针对 Atlas 300V Pro / Ascend 310P 所做的推理加速适配，重点描述普通
 decode、EAGLE3 和 DFlash 的算子路径、KV-cache 布局、NPUGraph 捕获方法，以及它们与
 vLLM-Ascend 310P 路径的对应关系。
@@ -101,7 +103,8 @@ Weights will be converted while loading.
 
 ### 3.2 KV-cache 约束
 
-- `kvcache_block_size` 只允许 64 或 128；其他值自动改为 128；
+- `kvcache_block_size` 只允许 64 或 128；其他值（或 `block_size * head_dim > 16384`）自动改：
+  `head_dim > 128` → 64，否则 128（`backends/ascend.py:243` `preferred = 64 if head_dim > 128 else 128`）；
 - 要求 `block_size * head_dim <= 128 * 128`；
 - 每层 K/V 都由 `empty_with_format(..., FRACTAL_NZ)` 分配；
 - 最后一个物理 block 永久作为 graph dummy block，不交给 BlockManager；
@@ -275,7 +278,8 @@ CoreX/CUDA 原有 DFlash 使用按序列分配的稠密上下文 KV 和通用 SD
 
 ### 6.1 DFlash 算法语义
 
-DFlash draft 通常有 5 层，block size 通常为 16：
+DFlash draft 的层数由 checkpoint 决定（Qwen3-8B 草稿 5 层、全 full；Qwen3.5 草稿常见 6 层 =
+5 滑窗 + 1 full），block size 通常为 16：
 
 - 1 行 anchor；
 - 15 行 mask query；
@@ -441,7 +445,8 @@ int32 graph buffer，不在 attention 调用内部临时 `.to()`。
 
 - 310P speculative decoding 只支持 TP=1；
 - 310P 强制 fp16；
-- 当前 target model 为 dense Qwen3；
+- target model 已覆盖 dense Qwen3、Qwen3-MoE（30B-A3B，W8A8）与 Qwen3.5 dense/MoE；
+  「只有 dense Qwen3」是 2026-10 首验时的状态，**EAGLE3 仍只在 dense Qwen3 上有 E 记录**；
 - FlashEngine 没有 vLLM 的异步调度重叠，因此即使算子与图路径对齐，吞吐仍可能存在 host
   scheduling 差距；
 - 不同 CANN/torch-npu 版本对 SplitFuse v2、compressed mask 和 graph-task update 的支持不同，

@@ -1,5 +1,7 @@
 # FlashAttention Graph 采样修复
 
+> **状态**（2026-11-24）：CUDA 图内采样与设备 RNG。文中「CoreX/310P 无实机」是当时状态，310P 后续已单独验证，见 [能力状态](STATUS.md)。
+
 ## 原因
 
 报错来自 `flashengine/layers/sampler.py`，不是 FlashAttention 注意力 kernel。
@@ -58,7 +60,8 @@ gpu_mem_util=0.80。输出吞吐 **136.21 token/s**，TTFT 中位数 **37.17 ms*
 cd /mnt/d/Materials/AVIC/FlashEngine
 source /home/yjq040828/vllm-env/bin/activate
 # （unittest 套件未随 main 保留：python3 -m unittest discover -s tests -v）
-python3 -m scripts.check_cuda_attention /home/yjq040828/vllm-lab/models/Qwen3-0.6B \
+# 历史入口：scripts.check_cuda_attention 已从 main 移除，命令保留作记录。
+# python3 -m scripts.check_cuda_attention /home/yjq040828/vllm-lab/models/Qwen3-0.6B \
   --allow-bf16-ties
 ```
 

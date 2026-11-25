@@ -1,5 +1,7 @@
 # Qwen3-ASR-1.7B 适配设计（内部契约文档）
 
+> **状态**（2026-11-24）：ASR 设计文档。文中「CoreX 未验证」已过时——2026-11-09 已在真机冒烟（CER 0/0），当前状态见 [能力状态](STATUS.md)。
+
 状态：**实现中**（2026-11-04）。本文是多方并行开发的接口契约，先于代码存在；
 完成后摘要进 `docs/QWEN3_ASR.md`（用户向）与 `docs/SUPPORT_MATRIX.md`。
 
@@ -67,7 +69,9 @@ mrope 代码**，`position_ids=None` → 标准 `arange`。即 text_config 里�
 
 ### 3.1 `flashengine/asr_processor.py`（owner: asr-ref）
 
-纯 CPU、无 torch 依赖的目标（numpy 即可，可选用 torch 实现 STFT）：
+纯主机侧、不依赖任何后端算子的实现（STFT 用 `torch.stft` 在 CPU 上跑，wav 解码与重采样
+是纯 numpy/标准库）——**不是**「无 torch 依赖」：mel 必须走 torch 才能与 HF feature
+extractor 逐位一致（见 `flashengine/asr_processor.py` 的 `_log_mel_torch`）。
 音频 → (mel, input_ids, audio_span)。
 
 ```python
@@ -93,7 +97,9 @@ class AsrProcessor:
 - prompt 结构（官方 `apply_transcription_request`）：`system(可选)` + `user: <|audio_start|><|audio_pad|>×N<|audio_end|>`
   + `assistant:` 前缀（`language <NAME><asr_text>` 强制语言；默认空 → 模型自己输出 `language <XX><asr_text>`）；
 - 直接复用 tokenizer 的 chat_template（`tokenizer_config.json` / `chat_template.json`），不要手写 ChatML；
-- wav 读取用标准库 `wave` + numpy；非 16 kHz 需重采样（线性/`np.interp` 足够，或复用 `librosa` 若已装）。
+- wav 读取用标准库 `wave` + numpy；非 16 kHz 必须重采样，实现为 **Blackman 窗 sinc 低通 +
+  多相抽取**（`asr_processor.resample_audio`）——线性插值/`np.interp` 会把 8 kHz 以上能量
+  折叠回带内（mel 最大差 0.1 量级），不可用。
 
 ### 3.2 `flashengine/models/qwen3_asr.py`（owner: asr-model）
 
@@ -111,8 +117,10 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
 实现约束：
 - 文本骨干**复用** `flashengine/models/qwen3.py`（`Qwen3Model` / `Qwen3DecoderLayer` / `Qwen3Attention` /
   `Qwen3MLP` / `RMSNorm`），音频部分纯 `torch.nn`（`nn.Conv2d` / `nn.LayerNorm` / `nn.Linear`），
-  **禁止**任何后端专属算子（三后端通吃）。注意力用 `F.scaled_dot_product_attention`
-  按窗口做（padding + bool mask，`is_causal=False`），不允许调用 flash-attn / ixformer。
+  **禁止**任何后端专属算子（三后端通吃）。注意力**刻意不用** `F.scaled_dot_product_attention`：
+  310P（torch_npu）与 CoreX（ixformer）对 SDPA 的支持面不一致，实现在
+  `qwen3_asr.py:_window_attention` 里显式 matmul + fp32 softmax（窗口内已压平无 padding，
+  不需要 mask）；音频塔规模小（30s ≈ 390 token / 4 窗口 / 24 层），代价可忽略。
 - 中文注释、无新增第三方依赖。
 - 需要给 `Qwen3Model.forward` 增加 `inputs_embeds` 入口（或 ASR 子类自带 embed 后调用 layers），
   改动必须**不改变纯文本路径的现有行为**（`qwen3.py` 现有测试/E 锚点不能漂）。
@@ -164,6 +172,8 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
 2. **端到端转写**（CUDA 4070 8GB，`enforce_eager=True, max_model_len=1024, gpu_mem_util=0.85`）：
    - prompt 构造：`AsrProcessor.build()` 的 `input_ids` 与 HF 手工模板（`apply_chat_template` +
      `proc(text=, audio=)`）**逐位一致**：asr_en `214/214`、asr_zh `70/70`；asr_zh 的 mel **逐位相同**。
+     （`docs/QWEN3_ASR.md` 的表格记 en prompt 为 211 tok，与本表的 214 属不同模板口径，未复核，
+     两处都以各自命令的实际输入为准。）
    - 引擎输出（`LLM.generate(... temperature=0, max_tokens=64)`）：
      - asr_zh（auto）→ `甚至出现交易几乎停滞的情况。`（解析 `language=Chinese`）
      - asr_en（强制 English）→ `Uh huh. Oh yeah, yeah. He wasn't even that big when I started
@@ -179,9 +189,12 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
      `aicpu exception` 并污染流），已在 `qwen3_asr.py` 内修掉：`time_steps` 改闭式常量、
      音频塔/投影在 CPU 构造后搬设备、长度类 int 运算留主机。数字与命令见
      [`docs/QWEN3_ASR.md`](QWEN3_ASR.md) §4.2。
-   - `corex`：音频塔为纯 torch 算子（显式 matmul+softmax，**不用** `F.scaled_dot_product_attention`、
-     不依赖 flash-attn / ixformer / triton），权重加载与 `index_copy` 走通用路径，因此代码应当可跑，
-     但**仍未在真机验证**；`docs/SUPPORT_MATRIX.md` 里 CoreX 行保持"未验证"标注。
+   - `corex`：✅ 已实测（2026-11-09，Iluvatar 32GB 板卡 / corex 4.4.0 / fp16 / 图模式）——
+     中英文两条样本转写正确、CER 0.0%/0.0%，TTFT mean 231.3 ms、RTF 聚合 0.1004、
+     TPS 聚合 30.01（5 次重复中位 30.18）。音频塔为纯 torch 算子（显式 matmul+softmax，
+     不依赖 flash-attn / ixformer / triton）。**覆盖强度 = B（单场景两条样本）**：
+     server、长跑、块复用、并发均未验证。另注：CoreX 上 KV 池必须零初始化
+     （`BackendBase.zero_init_kv_cache`），否则 decode 输出退化。
 4. **纯文本回归**：Qwen3-1.7B 文本模型 smoke 通过（`'我叫李明，是某大学的计算机专业学生…'`，
    `eos_ids=(151645,151643)`），ASR 改动对纯文本路径零影响（`_model_forward` 无音频时按原签名调用）。
 5. **分块/批量回归**（`C:\Users\yjq040828\AppData\Local\Temp\fe_asr_chunk.py`，单进程一次启动，

@@ -1,5 +1,7 @@
 # Python oracle 与独立 C++ 部署仓
 
+> **状态**（2026-11-24）：独立 C++ 仓（candidate）的部署入口与门禁；未达正式 OCI 交付。
+
 **三后端源码增量**：独立仓 `docs/BACKEND_PARITY_SOURCE.md` 记录新 310P Qwen3.5/EAGLE3/Quark 参考执行和公共 chunked-prefill 配置/观测；CoreX 共用 CUDA 模型层。按用户要求本轮未构建、未测试，旧 build 内二进制未更新。历史报告不覆盖这次源码，不能据此宣布后端可部署或性能达标。
 
 ## 当前落地
@@ -13,6 +15,11 @@ Python/C++ 冻结输入、严格 CUDA 行为和 ABBA 基准见 [基准与数值�
 ## 离线工具
 
 以下命令从 Python 仓根目录以模块方式运行。只允许本地模型路径。输出工件拒绝覆盖，失败报告不得原地改成通过。
+
+> **历史入口**：下面这段命令里的 `scripts.export_bundle` / `export_oracle` / `sync_cpp_contracts` /
+> `check_native_replay` / `check_native_server` 与 `tests/test_deployment.py` 已在提交 6371067 中
+> 移除，**本仓库当前无法重新生成或校验 bundle**；命令保留作历史记录，需要这条链路时回到该提交。
+> 现存 `tests/` 只剩主机侧单测（chunk GDN、LoRA 合并、recurrent 前缀、hermes 流式）。
 
 ```bash
 # 仅主机单元测试，不导入设备运行时

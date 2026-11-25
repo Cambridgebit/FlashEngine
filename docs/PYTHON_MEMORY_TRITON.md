@@ -1,5 +1,7 @@
 # Python 显存管理与 Triton 调用接口
 
+> **状态**（2026-11-24）：显存预算与 Triton 入口说明；未接真实 Triton Server，CoreX/310P 多卡仍未验收。
+
 本轮只为 Python FlashEngine 提供显存规划、请求生命周期和外部 Triton Python Backend 适配入口。
 不实现 Triton Server、CV 模型后端、跨模型调度或 ensemble。外部 Triton 可以分别加载本适配器及其他模型。
 
@@ -126,7 +128,8 @@ CPU 实例不表示引擎在 CPU 推理。NPU ID 不能取 NVIDIA GPU instance I
 
 ```bash
 python3 -B -m unittest discover -s tests -v
-python3 -B -m scripts.check_python_memory /models/Qwen3-0.6B \
+# 历史入口：scripts.check_python_memory 已从 main 移除（命令保留作记录）。
+# python3 -B -m scripts.check_python_memory /models/Qwen3-0.6B \
   --backend cuda --cycles 2 --rounds 3 --memory-budget-mib 4096 \
   --device-reserve-mib 512 --output bench_results/python-memory/dense.json
 ```

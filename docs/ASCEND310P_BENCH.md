@@ -1,5 +1,7 @@
 # 310P 板卡测试配置速查（2026-10-16 整理）
 
+> **状态**（2026-11-24）：同批历史的自测配置速查（2026-10-16）。配置仍可用，性能数字属历史口径。
+
 本文件汇总 310P 实机的常规测试配置，用于自测复现（历史一次性脚本已于 2026-10-16 清理，
 日志保留在板卡 `/data2/*.log`）。方法与指标口径见 [`AGENTS.md`](../AGENTS.md) 与
 [`docs/QWEN35.md`](QWEN35.md)；支持清单见 [`docs/SUPPORT_MATRIX.md`](SUPPORT_MATRIX.md)。
@@ -90,6 +92,9 @@ format should be ND, actual format is FRACTAL_NZ` → aicore 507015（异步不�
 Coder 的批量档因此缺失。排查与尝试过的规避见 AGENTS.md「310P W8A8 实机首测」。
 
 ## 正确性验收（check_qwen35 四用例，严格逐 token 一致）
+
+> **历史入口**：`scripts.check_qwen35` 已从 main 移除，下面命令保留作历史记录；现行做法是对同一
+> prompt 用 `scripts.benchmark` 抓输出文本、逐 token 对比（见 [文档地图](README.md)）。
 
 ```bash
 bash /data2/fe_py_t5.sh -m scripts.check_qwen35 /data/Qwen3.5-4B \

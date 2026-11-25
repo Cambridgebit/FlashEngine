@@ -1,8 +1,11 @@
 # DFlash / DSpark block speculative decoding
 
-The current engine supports DFlash and DSpark draft checkpoints for the dense
-Qwen3 target model. Qwen3.5 and DFlash2 are intentionally not part of the
-current support surface.
+> **状态**（2026-11-24）：DFlash/DSpark 机制说明，随实现更新；加速比与 E 以 [能力状态](STATUS.md) 为准。
+
+当前引擎支持 **dense Qwen3 / Qwen3-MoE / Qwen3.5 dense/MoE** 目标模型配 DFlash 草稿，
+以及 Qwen3 配 DSpark 草稿；唯一被显式拒绝的形态是 **DFlash2**（`NotImplementedError`）。
+声明面以 `flashengine/support_matrix.py` 为准（启动即校验），本文下方英文段落是 2026-09
+仅支持 dense Qwen3 时的原文，保留作为历史记录。
 
 ## Architecture boundary
 

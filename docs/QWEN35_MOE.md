@@ -1,5 +1,7 @@
 # Qwen3.5 MoE 文本适配与小模型验收
 
+> **状态**（2026-11-24）：Qwen3.5 MoE：CUDA 用 64.6MB 公开 tiny 检查点验收；310P/CoreX 的 MoE 实机仍缺，tiny 通过不证明真实模型可装下显存。
+
 目标注册名为 `qwen3_5_moe`，覆盖 `Qwen3_5MoeForConditionalGeneration` 的文本部分
 和 `Qwen3_5MoeForCausalLM`。读取外层 `text_config` 或纯文本配置，视觉塔与 MTP 不加载。
 当前为 fp16/bf16、TP=1；普通生成与 DFlash 接口复用 Qwen3.5 混合注意力引擎。
@@ -42,11 +44,14 @@
 | CUDA / FlashAttention | 打包实际上下文，原生 causal + window_size；支持整轮 Graph |
 | CUDA / FlashInfer | 草稿用通用稠密掩码；投机仍 eager，原有限制不变 |
 | CoreX | 通用稠密 KV + 显式掩码；目标 KV 仍 HND |
-| 310P | 全局非因果草稿保留 NZ/paged SplitFuse；窗口或因果草稿改走稠密掩码，目标 KV 仍 NZ |
+| 310P | 全局非因果与窗口/因果草稿都走 NZ/paged SplitFuse（窗口靠逐层裁页 + 末页掩码），目标 KV 仍 NZ |
 
-310P 的分页草稿内核当前没有逐层窗口接口，不能给它传一个全零 mask 冒充滑窗。
-窗口路径同时切换池分配、草稿写入和 prefix 快照机制，启动摘要会注明 masked 路径。
-该兼容路径优先保证语义；大模型/长上下文的性能仍需板卡测量。
+**310P 现已具备逐层窗口能力（2026-11 修复后）**：`backends/ascend.py:855 prepare_dflash_paged_window`
+按 `lengths/rows/window` 把块表收窄到窗口所需页数、保留首个不完整页并按 query 行生成 -inf 掩码
+（causal 用 `delta >= 0`，滑窗再叠 `delta < window`）；由能力位 `supports_dflash_paged_mask` 门控
+（需要 legacy SplitFuse 算子），算子缺失时才回落到稠密掩码草稿，启动摘要会注明走哪条。
+窗口路径同时切换池分配、草稿写入和 prefix 快照机制，语义由固定 prompt 逐 token 对比守护。
+「分页内核没有逐层窗口接口」是修复前的状态；当年 4B 的 36.8→32.8 tok/s 落差属于切换路径前的历史数字。
 
 ```bash
 python3 -m scripts.openai_server /path/to/Qwen3.5-35B-A3B \

@@ -1,5 +1,7 @@
 # Qwen3-ASR-1.7B 语音转写（实验性）
 
+> **状态**（2026-11-24）：ASR 三后端实测记录（CUDA/310P A 级、CoreX 两条样本冒烟）与 310P 构建期陷阱；server 转写端点已验证。
+
 Qwen3-ASR-1.7B 是 Qwen 官方语音识别模型（30 种语言 + 22 种中文方言），
 本仓通过目标模型适配器 `qwen3_asr` 接入其 Thinker（文本解码）+ 音频塔（mel → 音频隐层）
 结构，支持**离线命令行转写**与 **OpenAI 兼容的 `/v1/audio/transcriptions` 端点**。
@@ -85,7 +87,7 @@ PYTHONPATH=$PWD ~/vllm-env/bin/python3 -m scripts.asr_benchmark MODEL \
 | `--language` | 强制语种（如 `Chinese`/`English`）；缺省让模型自动检测 |
 | `--system-prompt` | 可选 system 提示（热词/上下文） |
 | `--batch-size` | 每批并发请求数，默认 1；`--max-num-seqs` 缺省跟随它 |
-| `--warmup` | 预热批次数（默认 1，不计指标） |
+| `--warmup` | 预热条数：取**前 N 条音频**各跑一遍并丢弃统计（默认 1，0 关闭）。不是「批次数」 |
 | `--max-tokens` | 每条音频输出上限，默认 256（官方推荐） |
 | `--reference-jsonl` | 参考转写；缺省自动用 `bench_data/asr/reference.jsonl`（存在时） |
 | `--save-jsonl` | 把每条转写/指标落盘 |
@@ -111,8 +113,9 @@ PYTHONPATH=$PWD ~/vllm-env/bin/python3 -m scripts.asr_benchmark MODEL \
 
 - **音频解码/重采样**统一走 `flashengine.asr_processor` 的 `load_audio(path)` /
   `decode_wav_bytes(data)`：带抗混叠低通的多相重采样（48k→16k 直接抽点会把 8kHz 以上
-  能量折叠回带内，mel 最大差 0.1 量级）。脚本内保留纯标准库实现仅作导入兜底；
-  server 端 multipart 的 `file` 字节走同一个 `decode_wav_bytes`，两边口径一致。
+  能量折叠回带内，mel 最大差 0.1 量级）。脚本内**不再**保留第二套解码实现（早期草稿里的
+  「纯标准库兜底」已删除，避免两条路径口径漂移）；server 端 multipart 的 `file` 字节同样走
+  `decode_wav_bytes`，两边口径一致。
 
 ### 参考转写 JSONL
 
@@ -232,18 +235,21 @@ curl -s -H "Authorization: Bearer sk-test" http://127.0.0.1:8000/v1/audio/transc
 |---|---|---|---|---|---|---|---|---|
 | asr_zh.wav | 4.20s | 10 | 67.5–89.6ms | 0.415–0.484s | 0.099–0.115 | 20.7–24.1 | `甚至出现交易几乎停滞的情况。` | 0.0% |
 | asr_en.wav | 15.05s | 48 | 90.2–92.0ms | 1.78–2.08s | 0.118–0.139 | 23.0–27.0 | `Uh huh. Oh yeah, yeah. He wasn't even that big when I started listening to him. But and his solo music didn't do overly well. But he did very well when he started writing for other people.` | 0.0% |
-| 合计 | 19.26s | 58 | mean 78.8–90.8 / p95 89.0–91.9ms | mean 1.10–1.28s | **0.114–0.133**（聚合） | 22.6–26.4（聚合） | — | **0.0% / 0.0%**（mean/corpus） |
+| 合计 | 19.26s | 58 | mean 78.8–90.8 / p95 89.0–91.9ms | mean 1.10–1.28s | **0.114–0.141**（聚合） | 21.4–26.4（聚合） | — | **0.0% / 0.0%**（mean/corpus） |
 
 - RTF 是「墙钟 / 音频秒数」；小音频（zh 4.2s）被固定开销拉高，长音频（en 15s）更接近稳态。
 - **精简后复测**（删掉验收脚本与兜底分支，同一命令）：zh TTFT 82.3ms / RTF 0.1156 / TPS 20.58；en TTFT 109.6ms / RTF 0.1477 / TPS 21.59；合计 TTFT mean 96.0ms / p95 108.3ms、RTF(聚合) 0.1407、TPS(聚合) 21.41、CER 0.0% / 0.0%——转写文本与精简短一致，CER 不变。
-  区间来自两次独立运行的 GPU 频率/热态波动（4070 Laptop 持续负载会降频，属预期，勿当回归）。
+  区间来自**三次**独立运行的 GPU 频率/热态波动（4070 Laptop 持续负载会降频，属预期，勿当回归）：
+  首次 0.114–0.133 / 22.6–26.4，精简后复测 0.1407 / 21.41，汇总表按三次取并集。
+  对表时必须连 RTF/TPS 一起看，单看一个数会以为回归。
 - 非 eager（`--eager` 去掉、`max-model-len 2048`）同机稳态：zh TTFT 100.6ms / RTF 0.0588 /
   TPS 40.5；en TTFT 81.2ms / RTF 0.0522 / TPS 61.1——但首个请求含图捕获/冷启动（wall 6.48s），
   先跑一条 warmup 再采数。
 - 参考转写来源 = transformers 自带的 Qwen3ASR 实现（`thinker.*` 权重映射后 greedy 解码），与引擎输出只差标点
   （引擎 en 用 `.`、HF 参考用 `,`），归一化去标点后 CER=0。
 - prompt/token 规模：zh prompt 70 tok（音频 token 55）、en prompt 211 tok（音频 token 196）；
-  每 1 秒音频 ≈ 12.5 个音频 token，故 30s 音频 ≈ 375 音频 token + 模板，仍在 1024 窗口内。
+  每 1 秒音频 ≈ 13 个音频 token（zh 55/4.2s、en 196/15.05s），故 30s 音频 ≈ 390 音频 token +
+  模板（约 214），仍在 1024 窗口内；但 8GB 卡建议按 30s 分块而非单条超长。
 
 8GB 显存注意：默认 `--gpu-mem-util 0.85 --max-model-len 2048 --max-num-seqs 1`；
 OOM 时依次降 `--gpu-mem-util 0.8`、加 `--eager`、`--batch-size 1`。桌面/WSL 显存波动

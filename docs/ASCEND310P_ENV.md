@@ -1,5 +1,7 @@
 # Ascend 310P 运行环境与依赖
 
+> **状态**（2026-11-24）：环境搭建记录：容器 `vllm018`（CANN 9.0.T3）+ torch_npu 可用；CANN 9.1 镜像在本板驱动下无法初始化设备（`E30006` / `507033`），故 vLLM-Ascend 0.23 对照仍缺。
+
 本文记录 FlashEngine 在华为 Ascend 310P（Atlas 300I Duo / 200I Pro）上运行所需的**完整依赖**、
 **实测版本**，以及**为什么不需要 vLLM / vLLM-Ascend**。可直接参照
 [`requirements-ascend.txt`](../requirements-ascend.txt) 安装。
@@ -46,8 +48,11 @@ def linear(self, x, weight, bias=None):
 - 该算子并非由 `vllm_ascend.ops.linear` 注册（它只定义 `Ascend*LinearMethod`）；
   `torch.ops.vllm.unquantized_gemm` 的注册在 `vllm_ascend/patch/worker/patch_unquantized_gemm.py`，
   需 vLLM-Ascend 平台插件在 worker 侧打补丁后才存在。
-- **实测**：无论是否 import `vllm_ascend.ops.linear`，`torch.ops.vllm.unquantized_gemm` 均为 `None`；
-  引擎日志恒为 `GEMM=torch-fallback`。这与 `docs/ASCEND310P_OPS.md` 的算子表一致——
+- **实测**：手动 `import vllm_ascend.ops.linear` 本身**不会**注册该算子，`torch.ops.vllm.unquantized_gemm` 仍为
+  `None`。但引擎默认起一个后台线程等平台插件打补丁（`backends/ascend.py:113-138` 的
+  `_start_vllm_gemm_import`，`_gemm_op()` 在用前 join ≤120s）：补丁到位就拿 `unquantized_gemm`、
+  不到位才以 `GEMM=torch-fallback` 收尾。`FLASHENGINE_VLLM_GEMM=0` 才会完全跳过这条后台导入。
+  与 `docs/ASCEND310P_OPS.md` 的算子表一致——
   FlashEngine 的 QKV / O / Gate+Up / Down / LM Head 全部使用 `F.linear`（权重预转 FRACTAL_NZ）。
 
 ### 剥离验证（开发板实测）

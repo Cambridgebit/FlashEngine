@@ -1,5 +1,7 @@
 # Engine runtime contracts
 
+> **状态**（2026-11-24）：运行时架构说明，随代码更新；不含性能结论。
+
 The engine resolves hardware and speculative-decoding choices once during
 `Config` construction. Runtime code consumes capabilities and strategy
 objects; backend and speculative method names are presentation metadata only.
@@ -35,10 +37,13 @@ The order is part of the memory and graph contract:
 
 ## Stable host-side observation
 
-`LLMEngine.runtime_snapshot()` is the sole read interface for benchmark and
-server metrics. It returns engine/configuration data, scheduler gauges, KV and
-prefix-cache counters, prefill-path counters, graph counters, speculative
-acceptance counters and draft-prefix snapshot counters.
+`LLMEngine.runtime_snapshot()` is the shared read interface behind benchmark
+metrics and the server's `/v1/stats` and `/metrics`. It returns engine/configuration
+data, scheduler gauges, KV and prefix-cache counters, prefill-path counters, graph
+counters, speculative acceptance counters and draft-prefix snapshot counters.
+It is **not** the only read path: `scripts/openai_server.py` also calls
+`engine.scheduler.get_stats()` directly when it needs per-window deltas, so any new
+counter must be added to both views or the two will drift.
 
 `reset_measurement_stats()` starts a new measurement window without erasing
 graph capture success/failure. `EngineObserver` reports scheduling before the

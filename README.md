@@ -230,7 +230,14 @@ bench_data/                                    # 英文、中文、Agent 共享�
 docs/                                          # 架构、后端、算法与基准说明
 ```
 
-常用文档：[支持矩阵](docs/SUPPORT_MATRIX.md)、[引擎架构](docs/ENGINE_RUNTIME.md)、[310P 算子](docs/ASCEND310P_OPS.md) 与 [310P 图规格](docs/ASCEND310P_GRAPH_SPEC.md)、[Qwen3.5 适配](docs/QWEN35.md)、[EAGLE3](docs/EAGLE3.md)、[DFlash / DSpark](docs/DFlash.md)、[显存管理与 Triton 接口](docs/PYTHON_MEMORY_TRITON.md)。
+文档入口：[**能力状态**](docs/STATUS.md)（唯一实测状态源：什么真跑通了、强到什么程度、哪些不能宣称）
+与 [文档地图](docs/README.md)（四层结构与维护规则）。声明支持看 [支持矩阵](docs/SUPPORT_MATRIX.md)
+（代码侧 `flashengine/support_matrix.py`，启动即校验）——**声明支持 ≠ 能跑出收益**。
+
+常用专题：[引擎架构](docs/ENGINE_RUNTIME.md)、[310P 算子](docs/ASCEND310P_OPS.md) 与
+[310P 图规格](docs/ASCEND310P_GRAPH_SPEC.md)、[Qwen3.5 适配](docs/QWEN35.md)、
+[EAGLE3](docs/EAGLE3.md)、[DFlash / DSpark](docs/DFlash.md)、[结构化解码与工具调用](docs/STRUCTURED_DECODING.md)、
+[显存管理与 Triton 接口](docs/PYTHON_MEMORY_TRITON.md)。
 
 ## 使用须知
 

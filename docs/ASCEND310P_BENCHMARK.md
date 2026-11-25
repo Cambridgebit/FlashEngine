@@ -1,5 +1,7 @@
 # 310P 综合基准报告（2026-10-16）
 
+> **状态**（2026-11-24）：历史基准台账（2026-10-16，seqs=1 串行）。其中 **W8A8 + DFlash 实测 E≈1（无加速）**、**W8A8 MoE 长 prefill 算子崩溃**，引用这两组数字前先看 [能力状态](STATUS.md)。
+
 13 组模型/草稿组合的实机基准。协议与复现命令见 [`ASCEND310P_BENCH.md`](ASCEND310P_BENCH.md)；
 数据源日志：板卡 `/data2/mega_bench.log`、`/data2/mega_bench_30b_rerun.log`。
 
@@ -9,7 +11,8 @@
   贪心（temp=0）、think-off、无前缀缓存、单序列（`--max-num-seqs 1`）
 - 指标：**稳态解码 TPS**（排除 TTFT/prefill）、**E**（投机接受长度）、**TTFT**（进程内，
   mean/median，不含排队）、**TPOT**（首 token 后每 token 时延）、agg = Output token throughput（含 prefill）
-- 环境：310P / CANN 9.0.T3 / torch_npu 2.10.0.post4；代码 `f7cd8f9`。
+- 环境：310P / CANN 9.0.T3 / torch_npu 2.9.0.post2.dev20260401（与本文件「合并后回归」及
+  [环境](ASCEND310P_ENV.md) 一致；此前误记 2.10.0.post4）；代码 `f7cd8f9`。
   Qwen3.5 系 = t5 venv（transformers 5.16 + `FLASHENGINE_VLLM_GEMM=0`）；Qwen3/Coder 系 = 系统 python
 - 密度协议：8B/4B/9B/W8A8-8B = `mml2048 / util0.5`；30B/Coder/W8A8-30B = `mml1024 / util0.85`
 
@@ -34,6 +37,18 @@
 † 相对同模型 fp16 的量化增益（8B：15.4/10.9；Coder：30.4/22.4）。
 ‡ 第 9 组本次撞上游离慢态（6.7 / 16.0，TTFT 亦膨胀），表中取当日上午同代码复现值 22.2；
 加速比按 26.4/22.2 计。判读规则见 [ASCEND310P_BENCH.md](ASCEND310P_BENCH.md)。
+
+**跨会话复现区间（勿当成矛盾）**：同一配置在不同会话测过多次，E 逐位相同、TPS 随板卡热态浮动：
+
+| 配置 | 各次 TPS | E |
+|---|---|---|
+| Qwen3-8B 无投机 | 10.7 / 10.9 / 11.0 | — |
+| Qwen3-8B + DFlash(k15) | 37.6 / 38.3 / 39.0 | 4.878（三次一致） |
+| Qwen3-8B-W8A8 串行 | 15.4 / 15.5 | — |
+
+Coder 的量化增益在两个口径下不同：本表 `fp16 22.4 → w8a8 30.4 = 1.36×`（`mml1024 / util0.85`），
+[ASCEND310P_BENCH.md](ASCEND310P_BENCH.md) 记的是 `19.0 → 30.3 = 1.59×`（另一档 BASE30B 配置）。
+两者都对，**报加速比时必须带基线配置**，不要混用分母。
 
 ## 分模型结论
 
@@ -157,7 +172,9 @@
   k=10 最快（24.9，2.62×）**，k=15 只有 23.1。E 随 k 单调上升（9B k15 的 E=5.100 最高），
   但每轮验证成本上升更快，E 最高不等于吞吐最高。业务上线应按自身负载扫 k。
 - 全部 12 组均为 `captures_ok=2`、`replay_rate=100%`、`eager_rounds=0`、`sampling_fallbacks=0`：
-  `captures_ok=2` 是窄列宽优化多捕获的一张 256 列图，短序列走它、长序列回落整宽图。
+  `captures_ok=2` 的口径是**同一 bs 下按上下文宽度桶捕获的图个数**（`engine/model_runner.py:196-202`
+  的 `_df_ctx_buckets`）：桶集含两个宽度就捕两张，`FLASHENGINE_DFLASH_CTX_FULL=1` 才会额外捕整宽图。
+  早期把它记成「多捕一张 256 列图」不准确——256 是探针里被选中的桶宽，不是捕获数量的来源。
 - **与 2026-10-16 表对比**：4B +DFlash(k7) 32.8 → **34.6**（+5.5%）；9B +DFlash(k15)
   22.5 → **23.1**（+2.7%）。差异与 `docs/QWEN35_OPT.md` 里三组配对 A/B 的中位 +5.5% 一致，
   9B 绝对增量小于 4B，因为其每轮时间更多被权重读取占据。

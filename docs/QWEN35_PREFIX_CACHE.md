@@ -1,9 +1,12 @@
 # Qwen3.5 普通与 DFlash 前缀缓存
 
+> **状态**（2026-11-24）：前缀缓存机制与 CUDA 2B 实测。310P 的 GDN 快照后来改为 D2D 并实测（同 34K 前缀冷 2358ms → 热 836ms），文中「310P 未实机」为历史状态。
+
 Qwen3.5 dense/MoE 文本模型默认开启 prefix cache，普通推理和 DFlash 使用同一机制。
 匹配依据仍是聊天模板编码后、从输入开头连续相同的 token 完整块。
 固定提示词放在 system 或 user 都可命中；输入中间相同的片段不能单独复用。
-本轮 CUDA 实机为 Qwen3.5-2B，MoE/CoreX/310P 走共享实现，新增缓存尚未实机验收。
+本轮 CUDA 实机为 Qwen3.5-2B；MoE/CoreX 走共享实现但未实机验收。**310P 已实机**：GDN 状态快照
+改设备侧 D2D 后，34K 前缀冷 2358 ms → 热 836 ms（输出逐字相同）。
 
 ## 同时复用三种状态
 
@@ -17,7 +20,8 @@ GDN prefill 在所需完整块边界分段递推，并截取对应的卷积 raw 
 无需保存逐 token 的巨大状态轨迹，也无需将整个目标模型按块反复执行。
 全部 GDN 层完成后才发布快照；失败前向的半成品不参与后续命中。
 CUDA 使用锁页 CPU 快照和异步拷贝，在发布前统一同步一次。
-CoreX/310P 保守使用同步 CPU 拷贝，后端差异由能力位控制。
+310P 改为**设备侧 D2D 快照**（`backends/ascend.py:225 prefix_snapshots_on_device=True`，
+默认 256 MiB、只保末块状态），CoreX 仍是同步 CPU 拷贝；差异由能力位控制，不是按后端名判断。
 
 `BlockManager.prefix_state_validator` 只校验命中末块状态。
 中间 GDN 快照被淘汰，但末块状态仍在时，仍可复用全部连续 KV 前缀。
@@ -62,6 +66,10 @@ CoreX/310P 仍受各自 prefix attention/SplitFuse 能力门约束。
 server `/metrics` 和 `/v1/stats` 暴露 `flashengine_recurrent_prefix_*` 指标；
 benchmark 打印 `Recurrent prefix snapshots`，原有 KV 与草稿命中统计保留。
 `reset_measurement_stats()` 仅重置计数，不清空快照。
+
+> **历史入口**：本节列出的 `scripts.check_*` / `export_*` 已在 2026-09 精简（NATIVE_DEPLOYMENT
+> 的整套部署工具在提交 6371067）中从 main 移除，命令保留作历史记录，当前仓库无法直接执行；
+> 现行入口见 [文档地图](README.md)。
 
 ```bash
 # 小状态主机契约，不加载模型
