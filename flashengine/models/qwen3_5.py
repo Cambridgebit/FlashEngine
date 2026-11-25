@@ -8,6 +8,9 @@ TargetModelAdapter 选择文本配置和层输出 aux；RecurrentStateRuntime �
 conv/SSM 主槽、投机行槽与接受后回滚。只有 full_attention 层分配分页 KV。
 """
 
+import os
+from collections.abc import Callable
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -23,6 +26,20 @@ from flashengine.models.qwen3_moe import Qwen3MoeSparseMoeBlock, Qwen3MoeForCaus
 from flashengine.backends import get_backend
 from flashengine.utils.context import get_context
 from flashengine.utils.loader import default_weight_loader
+
+# GDN 递推的两遍扫描（chunk-parallel scan）：把逐 chunk 的状态递推改写成
+#   s_{c+1} = M_c s_c + N_c （M_c = a_c I - kg_c kcd_c，N_c = kg_c value_c）
+# 第一遍对全部 chunk 批量算出 M/N/输出项，第二遍只做 80 次小型矩阵递推。
+# 数值上与逐 chunk 版等价（都是 fp32 同序矩阵乘），但下发次数从 ~8/chunk 降到 ~1/chunk。
+# 默认启用；设置 FLASHENGINE_GDN_SCAN=0 可回退逐 chunk 递推。
+_GDN_SCAN = os.environ.get("FLASHENGINE_GDN_SCAN", "1") != "0"
+# 单个扫描分组的 chunk 数上限：分组只影响（M/N/state 的）中间张量显存，不影响正确性。
+# 128 chunk = 8,192 token，中间张量约 2×270 MB；40K 输入会被切成 5 组，靠组间状态串接。
+_GDN_SCAN_GROUP = int(os.environ.get("FLASHENGINE_GDN_SCAN_GROUP", "128") or 128)
+# GDN 内部小矩阵乘的数据精度：fp32（历史默认，310P 上 128×128 的 fp32 乘法无 cube 加速）
+# 或 fp16（操作数降到 fp16、累加仍在 fp32，纯速度换精度）。溢出风险由 l2norm/decay<=1 约束。
+_GDN_MM_HALF = os.environ.get("FLASHENGINE_GDN_MM", "fp32").lower() == "fp16"
+_GDN_STATE_DTYPE = torch.float16 if _GDN_MM_HALF else torch.float32
 
 # Qwen3.5 packed 权重重映射（repo 格式：检查点子串 → (参数子串, 分片号)）。
 # qkv/gate_up 与 qwen3.py 相同；GDN 条目对应 vllm qwen3_5.py
@@ -44,6 +61,17 @@ PACKED_MODULES_MAPPING = {
 _SKIP_PREFIXES = ("mtp.", "model.mtp.", "model.visual.", "visual.")
 # 多模态壳内 text 权重前缀（index.json 实测：model.language_model.layers.N.* 等）。
 _TEXT_PREFIX = "model.language_model."
+
+
+def _gdn_mm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """GDN 内部矩阵乘：可选把操作数降到 fp16（结果仍回到输入精度）。
+
+    310P 的 cube 只对 fp16 生效，fp32 的 64×64 / 64×128 小矩阵乘实际是向量核在跑；
+    fp16 操作数 + fp32 累加在实测里数值稳定（decay ≤ 1、q/k 已 l2norm）。
+    """
+    if _GDN_MM_HALF and a.dtype == torch.float32:
+        return (a.half() @ b.half()).float()
+    return a @ b
 
 
 def _l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
@@ -78,6 +106,9 @@ def chunk_gated_delta_rule(
     chunk_size: int = 64,
     initial_state: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = True,
+    *,
+    state_checkpoints: tuple[int, ...] = (),
+    capture_state: Callable[[int, torch.Tensor], torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """分块 Gated Delta Rule 递归（prefill 金标准，纯 torch）。
 
@@ -90,7 +121,11 @@ def chunk_gated_delta_rule(
     输入：query/key/value [1, L, H, D]（模型 dtype）；g/beta [1, L, H]（g fp32）。
     输出：(core_attn_out [L, H, V] 模型 dtype, final_state [H, K, V] fp32)。
     chunk 大小 64 = transformers 默认参数（FLA_CHUNK_SIZE）。
+    state_checkpoints 是调用内的 chunk 末端偏移。capture_state 保存状态，
+    并返回下一 chunk 使用的状态，以保留分段路径的缓存精度舍入。
     """
+    if state_checkpoints and capture_state is None:
+        raise ValueError("state_checkpoints require capture_state")
     initial_dtype = query.dtype
     if use_qk_l2norm_in_kernel:
         # q/k 逐头 L2 归一化在输入 dtype 内进行，随后整批升 fp32（与原版同序）
@@ -125,34 +160,79 @@ def chunk_gated_delta_rule(
     g = g.cumsum(dim=-1)
     decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
     # 求解 (I - L) w = v_beta 的前向替换循环（原版逐行移植，含 clone 语义）
-    attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
-    for i in range(1, chunk_size):
+    attn = -(_gdn_mm(k_beta, key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
+    # 短 prefill 的末尾补零行在严格下三角矩阵中恒为零，无需求解；
+    # 多 chunk 时保留完整求解，避免改变任何真实行的运算顺序。
+    for i in range(1, min(chunk_size, sequence_length)):
         row = attn[..., i, :i].clone()
         sub = attn[..., :i, :i].clone()
         attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
     attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
-    value = attn @ v_beta
-    k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
+    value = _gdn_mm(attn, v_beta)
+    k_cumdecay = _gdn_mm(attn, k_beta * g.exp().unsqueeze(-1))
     last_recurrent_state = (
         torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim, dtype=value.dtype, device=value.device)
         if initial_state is None
         else initial_state.to(value).unsqueeze(0)  # 差异②：[H, K, V] → [1, H, K, V]
     )
-    core_attn_out = torch.zeros_like(value)
-    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1)
+    n_chunks = total_sequence_length // chunk_size
+    checkpoints = set(state_checkpoints)
+    if _GDN_SCAN:
+        # 两遍扫描：① 全部 chunk 批量算出 M_c / N_c / R_c / P_c；② 只做 chunk 间状态递推。
+        #   s_{c+1} = M_c s_c + N_c
+        #   out_c   = R_c + P_c s_c
+        # 其中（value 已是 W v_beta）：
+        #   M_c = exp(g_c[-1]) I - kg_c kcd_c, N_c = kg_c value_c,
+        #   R_c = attn0_c value_c,          P_c = q_c exp(g_c) - attn0_c kcd_c
+        decay_end = g[:, :, :, -1].exp()                                    # [1,H,NC]
+        kg = (key * (g[:, :, :, -1, None] - g).exp().unsqueeze(-1)).transpose(-1, -2)  # [1,H,NC,K,CS]
+        eye_k = torch.eye(k_head_dim, dtype=value.dtype, device=value.device)
+        mm = (decay_end[..., None, None] * eye_k - _gdn_mm(kg, k_cumdecay)).contiguous()
+        nn = _gdn_mm(kg, value)
+        attn0 = (_gdn_mm(query, key.transpose(-1, -2)) * decay_mask).contiguous()    # [1,H,NC,CS,CS]
+        rr = _gdn_mm(attn0, value)
+        pp = (query * g.exp().unsqueeze(-1) - _gdn_mm(attn0, k_cumdecay)).contiguous()
+        # 分组：组内批量算 M/N 并递推，组间只传状态。分组上限决定中间张量（M、state）
+        # 的显存峰值，超长输入靠多组串接，正确性与单组完全一致。
+        group = max(1, _GDN_SCAN_GROUP)
+        core_attn_out = torch.empty_like(value)
+        state = last_recurrent_state
+        for start in range(0, n_chunks, group):
+            stop = min(start + group, n_chunks)
+            width = stop - start
+            g_mm = mm[:, :, start:stop]
+            g_nn = nn[:, :, start:stop]
+            states = torch.empty(
+                batch_size, num_heads, width, k_head_dim, v_head_dim,
+                dtype=value.dtype, device=value.device,
+            )
+            for i in range(width):
+                states[:, :, i] = state
+                state = _gdn_mm(g_mm[:, :, i], state) + g_nn[:, :, i]
+                offset = (start + i + 1) * chunk_size
+                if offset in checkpoints:
+                    state = capture_state(offset, state.squeeze(0)).unsqueeze(0)
+            core_attn_out[:, :, start:stop] = rr[:, :, start:stop] + _gdn_mm(pp[:, :, start:stop], states)
+        last_recurrent_state = state
+    else:
+        core_attn_out = torch.zeros_like(value)
 
-    # 逐 chunk 递推（状态跨 chunk 传递；chunk 内向量批量计算）
-    for i in range(0, total_sequence_length // chunk_size):
-        q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
-        attn = q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]
-        v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state
-        v_new = v_i - v_prime
-        attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
-        core_attn_out[:, :, i] = attn_inter + attn @ v_new
-        last_recurrent_state = (
-            last_recurrent_state * g[:, :, i, -1, None, None].exp()
-            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
-        )
+        # 逐 chunk 递推（状态跨 chunk 传递；chunk 内向量批量计算）
+        for i in range(0, n_chunks):
+            q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
+            attn = _gdn_mm(q_i, k_i.transpose(-1, -2)) * decay_mask[:, :, i]
+            v_prime = _gdn_mm(k_cumdecay[:, :, i], last_recurrent_state)
+            v_new = v_i - v_prime
+            attn_inter = _gdn_mm(q_i * g[:, :, i, :, None].exp(), last_recurrent_state)
+            core_attn_out[:, :, i] = attn_inter + _gdn_mm(attn, v_new)
+            last_recurrent_state = (
+                last_recurrent_state * g[:, :, i, -1, None, None].exp()
+                + _gdn_mm((k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2), v_new)
+            )
+            offset = (i + 1) * chunk_size
+            if offset in checkpoints:
+                last_recurrent_state = capture_state(
+                    offset, last_recurrent_state.squeeze(0)).unsqueeze(0)
 
     core_attn_out = core_attn_out.reshape(core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1])
     core_attn_out = core_attn_out[:, :, :sequence_length]
@@ -457,8 +537,21 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 k = _l2norm(k).float().contiguous()
             checkpoints = (ctx.gdn_prefix_checkpoints[i]
                            if ctx.gdn_prefix_checkpoints is not None else ())
-            # 只在完整块边界截取中间状态，不构造逐 token 的巨大状态轨迹。
-            ends = sorted(set((*checkpoints, seq_len)))
+            # 对齐的快照可在同一次 chunk rule 中截取。超长序列保留原有分段以限制工作区。
+            inline_checkpoints = ()
+            if (checkpoints and not fused and seq_len <= 8192
+                    and all(offset % 64 == 0 for offset in checkpoints if offset < seq_len)):
+                inline_checkpoints = tuple(offset for offset in checkpoints if offset < seq_len)
+
+            def capture_state(offset, state):
+                stored_state = state.to(self.ssm_cache.dtype)
+                ctx.gdn_prefix_capture(
+                    self.prefix_layer_index, i, offset,
+                    x_ext[0, :, offset:offset + state_len], stored_state)
+                # 与分段路径一致，下一段读回缓存 dtype 舍入后的状态。
+                return stored_state.to(state.dtype)
+
+            ends = sorted(set((*checkpoints, seq_len)).difference(inline_checkpoints))
             begin = 0
             for end in ends:
                 initial = init_l[i] or begin > 0
@@ -474,7 +567,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                         q[begin:end].unsqueeze(0), k[begin:end].unsqueeze(0),
                         v[begin:end].unsqueeze(0), g[begin:end].unsqueeze(0),
                         beta[begin:end].unsqueeze(0),
-                        initial_state=self.ssm_cache[slot] if initial else None)
+                        initial_state=self.ssm_cache[slot] if initial else None,
+                        state_checkpoints=inline_checkpoints,
+                        capture_state=capture_state)
                     self.ssm_cache[slot] = final_state.to(self.ssm_cache.dtype)
                 core[s0 + begin:s0 + end] = o_i.to(core.dtype)
                 if end in checkpoints:
